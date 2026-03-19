@@ -1,0 +1,750 @@
+Got it. I’ll keep it clear, strict, and production-focused.
+
+You want a real project definition for an agent-based platform where playbooks drive the agent, and the platform must analyze:
+	•	capacity
+	•	resilience
+	•	incidents
+	•	upstream services
+	•	downstream services
+
+Below is the clean version in three parts:
+	1.	Problem Statement
+	2.	Solution Definition
+	3.	Detailed Roadmap
+
+⸻
+
+1. Problem Statement
+
+Enterprise applications do not fail or degrade in isolation. Their behavior is shaped by:
+	•	infrastructure utilization
+	•	log and error patterns
+	•	incidents raised by operations
+	•	upstream traffic behavior
+	•	downstream dependency health
+	•	resilience controls implemented in code
+	•	actual resilience behavior under fault conditions
+
+Today, these are usually observed in separate tools:
+	•	Prometheus for metrics
+	•	Splunk for logs
+	•	ServiceNow for incidents
+	•	Git for code scanning
+	•	Net Havoc for resilience testing
+
+Because these signals are fragmented, teams face major problems:
+
+1.1 Incomplete capacity decisions
+
+A service may appear over-utilized, but the actual reason may be:
+	•	heavy upstream traffic,
+	•	repeated retries from callers,
+	•	slow downstream systems,
+	•	poor timeout or circuit-breaker handling.
+
+So looking only at CPU and memory gives wrong conclusions.
+
+1.2 Incomplete resilience understanding
+
+A service may have resilience code patterns in Git, but:
+	•	the configuration may be weak,
+	•	the controls may not be applied on critical paths,
+	•	the service may still fail during real disruptions.
+
+So code presence alone is not enough.
+
+1.3 Hidden service-chain impact
+
+Many incidents originate in one service but surface in another.
+For example:
+	•	a downstream DB slows down,
+	•	the middle service retries excessively,
+	•	an upstream service times out,
+	•	incidents get raised against the wrong app.
+
+Without upstream/downstream awareness, the wrong team gets blamed and the wrong action is taken.
+
+1.4 Lack of actionable operating intelligence
+
+Raw dashboards and point tools provide data, but not coordinated, evidence-backed decisions.
+Engineering teams need a system that can:
+	•	gather context,
+	•	reason over dependencies,
+	•	choose the correct operating playbook,
+	•	execute the playbook,
+	•	and publish trustworthy findings.
+
+Final Problem Statement
+
+Build a production-grade agent platform that uses playbooks to analyze application capacity, incidents, resilience posture, and upstream/downstream dependencies, then produce evidence-backed engineering findings and recommendations per application and per service chain.
+
+⸻
+
+2. Solution Definition
+
+2.1 What you are building
+
+You are building a playbook-driven engineering agent platform.
+
+This is not just a dashboard.
+This is not just a rules engine.
+This is not just a report generator.
+
+It is an agentic decision system.
+
+The system should:
+	•	collect signals from all source systems
+	•	assemble a unified application context
+	•	understand upstream and downstream dependencies
+	•	choose the appropriate playbook
+	•	execute that playbook step by step
+	•	optionally trigger resilience validation
+	•	produce findings, scores, evidence, and recommendations
+
+⸻
+
+2.2 What the agent operates on
+
+The agent must operate on application context, not raw source data.
+
+A proper application context should include:
+	•	application identity
+	•	service ownership
+	•	environment
+	•	Prometheus utilization history
+	•	Splunk log/error patterns
+	•	ServiceNow incident patterns
+	•	Git-scanned resilience attributes
+	•	Net Havoc validation results
+	•	upstream services
+	•	downstream services
+	•	dependency risk indicators
+	•	freshness/confidence of data
+
+This context is the input to playbook execution.
+
+⸻
+
+2.3 What a playbook means in this project
+
+In your project, a playbook is an executable operating workflow for the agent.
+
+A real playbook should define:
+	•	when it should trigger
+	•	what inputs it needs
+	•	what checks it performs
+	•	how it reasons
+	•	what evidence it must collect
+	•	what outputs it must produce
+	•	whether it triggers additional workflows
+
+So a playbook is not just:
+
+if cpu > 80 then mark overutilized
+
+It is more like:
+
+for this application, gather last 30 days utilization, correlate incidents, inspect dependency pressure, determine whether the issue is local or propagated, assess resilience posture, decide whether a resilience validation run is needed, and publish an evidence-backed finding.
+
+That is the correct model.
+
+⸻
+
+2.4 Major functional capabilities
+
+A. Capacity intelligence
+
+The platform should determine:
+	•	under-utilized apps
+	•	over-utilized apps
+	•	unstable apps
+	•	apps with incident-linked capacity risk
+	•	apps affected by dependency-induced stress
+
+B. Resilience intelligence
+
+The platform should determine:
+	•	whether resilience patterns exist in code
+	•	what attributes are implemented
+	•	whether those attributes are sufficient
+	•	whether resilience was validated dynamically
+	•	where resilience gaps exist
+
+C. Dependency intelligence
+
+The platform should determine:
+	•	which upstream services influence load patterns
+	•	which downstream services influence latency/errors
+	•	whether an app’s issue is local or dependency-driven
+	•	which service chains are most operationally fragile
+
+D. Reporting intelligence
+
+The platform should produce:
+	•	app-level findings
+	•	dependency-aware findings
+	•	risk summaries
+	•	evidence-backed recommendations
+	•	audit-friendly playbook outputs
+
+⸻
+
+2.5 Production operating model
+
+The flow should be:
+	1.	collect data
+	2.	normalize and map it to the right application
+	3.	assemble application and dependency context
+	4.	evaluate triggers
+	5.	select playbooks
+	6.	execute playbooks
+	7.	store findings and evidence
+	8.	publish reports and APIs
+
+That is the production model.
+
+⸻
+
+3. Detailed Roadmap
+
+Now I’ll give you the actual roadmap in the correct sequence.
+
+⸻
+
+Phase 1: Define the Operating Model
+
+Goal
+
+Lock how the agent behaves before building connectors or logic.
+
+What to do
+
+Define clearly:
+	•	what counts as an application
+	•	what counts as a service
+	•	how upstream and downstream are represented
+	•	what the agent is allowed to do
+	•	what a playbook can do
+	•	what outputs are mandatory
+	•	who the audience is for findings
+
+You must finalize the playbook contract here.
+
+Each playbook should have:
+	•	name
+	•	purpose
+	•	trigger conditions
+	•	required inputs
+	•	optional inputs
+	•	execution steps
+	•	decision rules
+	•	evidence requirements
+	•	output schema
+	•	severity model
+	•	audit metadata
+
+Also define whether the agent is:
+	•	advisory only,
+	•	advisory + test-triggering,
+	•	or later action-triggering under controls.
+
+Deliverables
+	•	problem statement approved
+	•	scope approved
+	•	playbook contract approved
+	•	output contract approved
+	•	governance boundaries approved
+
+Why this phase matters
+
+If this is not defined first, the system becomes an uncontrolled set of scripts.
+
+⸻
+
+Phase 2: Build the Application Registry
+
+Goal
+
+Create a trusted identity model for every application and dependency.
+
+What to do
+
+Create a registry that maps:
+	•	app name
+	•	service name
+	•	owning team
+	•	environment
+	•	repo URL
+	•	Prometheus identifiers
+	•	Splunk identifiers
+	•	ServiceNow mapping
+	•	Net Havoc target mapping
+	•	upstream services
+	•	downstream services
+
+This registry is critical because all correlation depends on correct mapping.
+
+You also need a method to mark:
+	•	mapping confidence
+	•	missing mappings
+	•	exceptions
+	•	manually curated overrides
+
+Deliverables
+	•	canonical application registry
+	•	service/dependency registry
+	•	source-system mapping model
+	•	confidence and override mechanism
+
+Why this phase matters
+
+Without a registry, the agent cannot reason reliably across tools.
+
+⸻
+
+Phase 3: Build Source Connectors
+
+Goal
+
+Establish reliable data ingestion from all systems.
+
+What to do
+
+Build production-grade connectors for:
+	•	Prometheus
+	•	Splunk
+	•	ServiceNow
+	•	Git
+	•	Net Havoc
+	•	dependency metadata source if available
+
+Connectors should support:
+	•	retries
+	•	pagination
+	•	authentication handling
+	•	error handling
+	•	idempotent execution
+	•	logging
+	•	observability
+
+Do not put business rules inside connectors.
+Connectors should only fetch and hand off.
+
+Deliverables
+	•	working source integrations
+	•	raw payload ingestion
+	•	scheduling support
+	•	connector monitoring
+
+Why this phase matters
+
+If source access is unstable, everything above it becomes unreliable.
+
+⸻
+
+Phase 4: Build Normalization Layer
+
+Goal
+
+Turn raw data into trusted internal entities.
+
+What to do
+
+Normalize raw source data into standard platform entities, such as:
+	•	application
+	•	dependency
+	•	metric window
+	•	incident
+	•	log/error summary
+	•	resilience attribute
+	•	resilience validation result
+	•	playbook run
+	•	finding evidence
+
+Define rules for:
+	•	time-window alignment
+	•	naming normalization
+	•	duplicate removal
+	•	incident filtering
+	•	stale data flags
+	•	confidence scoring
+
+Deliverables
+	•	normalized schemas
+	•	common data contracts
+	•	deduplication rules
+	•	evidence objects
+
+Why this phase matters
+
+The agent cannot work directly on inconsistent source formats.
+
+⸻
+
+Phase 5: Build Topology and Dependency Layer
+
+Goal
+
+Make upstream/downstream analysis real.
+
+What to do
+
+Create a topology model that supports:
+	•	direct upstream dependencies
+	•	direct downstream dependencies
+	•	multi-hop dependency chains
+	•	dependency type classification
+	•	dependency criticality
+	•	confidence of topology discovery
+
+Topology should include things like:
+	•	caller services
+	•	APIs
+	•	databases
+	•	queues
+	•	caches
+	•	batch dependencies if relevant
+
+The system should support identifying:
+	•	load propagation
+	•	latency propagation
+	•	failure propagation
+	•	retry amplification
+	•	incident propagation
+
+Deliverables
+	•	application dependency graph
+	•	upstream/downstream traversal
+	•	topology confidence model
+	•	dependency impact model
+
+Why this phase matters
+
+This is what prevents wrong root-cause classification.
+
+⸻
+
+Phase 6: Build Context Assembly Layer
+
+Goal
+
+Create one decision-ready context per application.
+
+What to do
+
+Build a service that assembles all relevant information into a unified object.
+
+For each app, context should include:
+	•	application metadata
+	•	recent utilization profile
+	•	recent log/error profile
+	•	incident summary
+	•	upstream dependency state
+	•	downstream dependency state
+	•	resilience posture from Git
+	•	resilience validation history
+	•	missing data indicators
+	•	freshness indicators
+	•	confidence indicators
+
+Also create service-chain context, not just app context, so the agent can reason across multi-service paths.
+
+Deliverables
+	•	app context model
+	•	service-chain context model
+	•	context assembly service
+	•	freshness/confidence flags
+
+Why this phase matters
+
+The agent should operate on context, not on five raw systems.
+
+⸻
+
+Phase 7: Build the Playbook Engine
+
+Goal
+
+Create the actual execution mechanism of the agent.
+
+What to do
+
+Build a playbook engine that supports:
+	•	playbook registration
+	•	trigger evaluation
+	•	playbook selection
+	•	step execution
+	•	evidence capture
+	•	output generation
+	•	execution history
+	•	audit logging
+
+The engine must support playbooks in categories such as:
+	•	capacity playbooks
+	•	incident-correlation playbooks
+	•	dependency-impact playbooks
+	•	resilience posture playbooks
+	•	resilience validation playbooks
+	•	reporting playbooks
+
+Deliverables
+	•	playbook runtime
+	•	execution framework
+	•	evidence collector
+	•	audit trail
+	•	playbook versioning model
+
+Why this phase matters
+
+This is the heart of the agent.
+
+⸻
+
+Phase 8: Build Capacity Playbooks
+
+Goal
+
+Make the capacity domain work end to end.
+
+What to do
+
+Create playbooks for:
+	•	baseline utilization assessment
+	•	under-utilization detection
+	•	over-utilization detection
+	•	incident-aware capacity assessment
+	•	upstream-driven load analysis
+	•	downstream-driven saturation analysis
+	•	repeated stress pattern identification
+
+The agent should be able to decide:
+	•	whether the app is wasteful
+	•	whether the app is stressed
+	•	whether the stress is local
+	•	whether the stress is dependency-induced
+	•	whether incidents validate the concern
+
+Deliverables
+	•	first production capacity playbooks
+	•	app-level capacity findings
+	•	dependency-aware capacity findings
+
+Why this phase matters
+
+This creates the first real business value.
+
+⸻
+
+Phase 9: Build Resilience Posture Playbooks
+
+Goal
+
+Make static resilience analysis work end to end.
+
+What to do
+
+Create Git/code-based playbooks that identify:
+	•	retry logic
+	•	timeout controls
+	•	circuit breakers
+	•	fallback mechanisms
+	•	bulkhead controls
+	•	relevant configuration attributes
+
+These playbooks should determine:
+	•	whether resilience exists
+	•	where it exists
+	•	how complete it is
+	•	what is missing on critical paths
+
+Deliverables
+	•	resilience posture playbooks
+	•	app-level posture findings
+	•	dependency-path posture findings
+
+Why this phase matters
+
+This reveals what the code claims to protect.
+
+⸻
+
+Phase 10: Build Resilience Validation Playbooks
+
+Goal
+
+Validate resilience behavior dynamically.
+
+What to do
+
+Create playbooks that determine:
+	•	when to trigger Net Havoc tests
+	•	what kind of fault to inject
+	•	which dependencies to target
+	•	how to observe recovery
+	•	how to classify outcome
+
+These playbooks should validate whether:
+	•	timeout works,
+	•	retry causes amplification,
+	•	circuit breaking protects upstreams,
+	•	recovery behavior is acceptable,
+	•	service-chain resilience is adequate.
+
+Deliverables
+	•	Net Havoc execution playbooks
+	•	resilience validation findings
+	•	recovery/impact evidence
+
+Why this phase matters
+
+This validates real behavior, not just code presence.
+
+⸻
+
+Phase 11: Build Cross-Domain Decision Playbooks
+
+Goal
+
+Combine capacity, incidents, dependencies, and resilience.
+
+What to do
+
+Create playbooks that reason across all dimensions.
+
+Examples:
+	•	over-utilized app with repeated incident history and weak timeout controls
+	•	stable app locally but stressed by upstream burst patterns
+	•	downstream API causing latency propagation across multiple services
+	•	under-utilized app with strong resilience posture but poor dependency chain health
+
+These playbooks should create the highest-value conclusions.
+
+Deliverables
+	•	cross-domain playbooks
+	•	risk-ranked findings
+	•	service-chain recommendations
+
+Why this phase matters
+
+This turns separate analyses into true engineering intelligence.
+
+⸻
+
+Phase 12: Build Reporting and Publication Layer
+
+Goal
+
+Publish evidence-backed outputs for different audiences.
+
+What to do
+
+Create reporting outputs for:
+	•	engineering teams
+	•	service owners
+	•	platform teams
+	•	management
+
+Reports should include:
+	•	app summary
+	•	dependency summary
+	•	utilization conclusion
+	•	resilience conclusion
+	•	incident correlation
+	•	service-chain impact
+	•	evidence references
+	•	recommendations
+	•	severity/risk level
+
+Expose through:
+	•	APIs first
+	•	dashboard later if needed
+
+Deliverables
+	•	reporting API
+	•	structured report model
+	•	evidence-linked findings
+
+Why this phase matters
+
+Without a strong output model, the platform won’t be adopted.
+
+⸻
+
+Phase 13: Governance, Controls, and Hardening
+
+Goal
+
+Make the platform production-safe.
+
+What to do
+
+Add:
+	•	role-based access
+	•	secret management
+	•	execution approvals for risky playbooks
+	•	full audit history
+	•	retries and failure recovery
+	•	health monitoring of the platform itself
+	•	playbook versioning
+	•	rollback capability
+	•	observability dashboards for the agent
+
+Also define:
+	•	operational support model
+	•	runbooks for connector failures
+	•	incident handling for the platform itself
+
+Deliverables
+	•	hardened production platform
+	•	supportability model
+	•	operational controls
+	•	audit and compliance readiness
+
+Why this phase matters
+
+A real enterprise agent must be governed, not just built.
+
+⸻
+
+4. Recommended Build Order
+
+This is the strict sequence:
+	1.	define operating model
+	2.	define playbook contract
+	3.	build app registry
+	4.	build connectors
+	5.	build normalization
+	6.	build topology layer
+	7.	build context assembly
+	8.	build playbook engine
+	9.	build capacity playbooks
+	10.	build resilience posture playbooks
+	11.	build resilience validation playbooks
+	12.	build cross-domain playbooks
+	13.	build reporting APIs
+	14.	harden for production
+
+⸻
+
+5. What You Should Not Do
+
+Do not start with UI.
+Do not start with ML.
+Do not start with dashboards.
+Do not hardcode decisions into connectors.
+Do not treat playbooks as static threshold files.
+Do not ignore upstream/downstream context.
+Do not publish findings without evidence objects.
+
+⸻
+
+6. Final Clear One-Line Definition
+
+This project is a playbook-driven agent platform that assembles application and dependency context from multiple enterprise systems, reasons over capacity and resilience, validates behavior where required, and publishes evidence-backed findings for production decision-making.
+
+If you want, the next best step is for me to convert this into a release roadmap like:
+	•	Release 1
+	•	Release 2
+	•	Release 3
+
+so it becomes easier to present to leadership or architects.
