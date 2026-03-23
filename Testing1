@@ -1,0 +1,407 @@
+Capacity Planning and Resiliency Test Engineering
+
+Implementation Blueprint (Reconstructed and Refined from source notes)
+
+Source date captured in notes: 2026-03-19
+
+ 
+
+Document purpose
+
+This document converts the photographed working notes into a clean, presentation-ready blueprint while preserving the original intent, structure, and key statements.
+Where the source notes were visually noisy or had minor wording inconsistencies, the wording has been normalized for readability without changing meaning.
+ 
+
+
+
+1. Target Outcomes
+Build two production-grade, playbook-driven solutions:
+
+• Capacity Planning
+• Resiliency Test Engineering (PTAAS: Playbook/Test-As-A-Service)
+Solution
+
+Target outcome
+
+Capacity Planning
+
+Ingest the last 3 months of Prometheus, Splunk, and incident data (ServiceNow details). Analyze CPU average and p99, along with supporting metrics, and classify services as under-utilized, over-utilized, or unstable / dependency-induced stress. Produce evidence-backed recommendations at component level.
+
+Resiliency Test Engineering (PTAAS)
+
+Discover resilience capabilities implemented in components. Evaluate what is allocated vs what is actually needed, especially OCP resources and controls. Execute resilience tests through Net Havoc playbooks. Publish validated resilience posture and gaps.
+
+ 
+
+2. Shared Platform Architecture
+This is the foundation layer shared by both solution domains.
+
+Category
+
+Details
+
+Source Systems
+
+Prometheus (metrics); Splunk (logs/errors); ServiceNow (incidents/major incidents); Git/SCM (resilience pattern discovery); Net Havoc (fault injection and test results); CMDB/Service Catalog (ownership and application metadata).
+
+Connector Layer
+
+Normalizes access to each source, handles ingestion, authentication, query templates, and evidence collection.
+
+Application Context and Topology Layer
+
+App/service registry; upstream/downstream dependency graph across API, DB, queue, and cache; service-chain context assembly. The source notes explicitly mark dependency graph discussion as still needed.
+
+Playbook Engine
+
+Trigger evaluation; playbook selection; step execution with evidence capture; risk scoring and recommendation generation.
+
+Outputs
+
+Findings API; Evidence API; Action API (advisory initially); dashboards and reports.
+
+ 
+
+Important architecture note from source
+
+Upstream and downstream service analysis is not optional. It is a required part of both capacity diagnosis and resilience validation.
+Dependency graph and service-chain context must be assembled before playbook decisions are trusted in production.
+ 
+
+3. Solution A - Capacity Planning
+3.1 Domain Architecture
+Prometheus metrics + Splunk logs/errors + ServiceNow incidents + topology + OCP capacity metadata feed a Capacity Context Builder, which drives a Capacity Playbook Set and produces capacity findings and recommendations.
+
+Component
+
+Purpose
+
+Context Builder Inputs
+
+Prometheus metrics, Splunk logs/errors, ServiceNow incidents, topology context, and OCP capacity metadata.
+
+Capacity Playbook Set
+
+Baseline utilization; under-utilization; over-utilization; dependency-induced stress; incident-aware capacity risk.
+
+Primary Output
+
+Capacity findings and recommendations.
+
+ 
+
+3.2 Capacity Workflow (End-to-End)
+Step 1: Collect 90-day windows
+
+• CPU usage (%), requests/limits, throttling, memory (supporting), and restarts.
+• Request volume, latency p95/p99, and error rates.
+• Splunk exceptions, timeout patterns, and retry signatures.
+• Incident counts and severity.
+Step 2: Build baseline
+
+• For each app/service/environment, compute CPU average (daily and weekly), CPU p95/p99, peak-to-median ratio, and day-of-week / hour-of-day seasonality.
+Step 3: Classify utilization
+
+• Under-utilized candidate: sustained low average CPU, low p99, and low error/incident risk.
+• Over-utilized candidate: high average or high p99 plus throttling, latency, or error signals.
+• Unstable candidate: wide volatility, incident spikes, and dependency risk markers.
+Step 4: Dependency-aware diagnosis
+
+• Trace upstream burst traffic and retry amplification.
+• Trace downstream latency and DB bottlenecks.
+• Determine whether stress origin is local or propagated.
+Step 5: Produce recommendation package
+
+• Right-size requests/limits.
+• Adjust HPA/VPA policies.
+• Tune retry and timeout behavior.
+• Recommend service-chain remediation actions where dependency effects are observed.
+Step 6: Track outcomes
+
+• Compare pre- and post-recommendation KPIs for closed-loop learning.
+3.3 Capacity Decision Rules (Initial)
+Source note
+
+The notes state that the current rules use low data for development and can be customized later.
+ 
+
+Rule
+
+Logic
+
+Rule CP-UNDER-01 (Under-utilized)
+
+Conditions for 4+ weeks: CPU average < 25%; CPU p99 < 45%; no sustained incident-linked performance impact. Action: recommend reducing CPU request/limit by a safe step (10-20%).
+
+Rule CP-OVER-01 (Over-utilized)
+
+Conditions for 2+ weeks: CPU average > 70% OR CPU p99 > 90%, plus at least one of throttling threshold breach, latency p99 breach, or error spike. Action: recommend scaling and bottleneck analysis.
+
+Rule CP-DEP-01 (Dependency-induced)
+
+Conditions: local CPU/latency spikes correlate with downstream latency/error spikes; upstream request burst or retry amplification is observed. Action: flag local scaling-only action as insufficient and recommend chain-level fixes.
+
+ 
+
+3.4 Required Data Points (Capacity Planning)
+Category
+
+Details
+
+Identity and ownership
+
+app_id, service_id, environment, criticality tier, owning team (BAM), support group (ServiceNow support group, BAM).
+
+Infrastructure capacity
+
+cpu_request, cpu_limit, memory_request, memory_limit; replicas (min/max/current); HPA target and behavior; node pool / zone placement (optional but useful).
+
+Runtime metrics (Prometheus)
+
+cpu_usage_pct_avg, cpu_usage_pct_p95, cpu_usage_pct_p99, cpu_throttling_ratio, memory_working_set_avg/p95, request_rate (RPS), latency_ms_p95/p99, error_rate_4xx/5xx, restart_count, OOM kills.
+
+Log-derived signals (Splunk)
+
+timeout_count, retry_count and retry amplification factor, circuit_breaker_open_events (if logged), DB connection pool saturation messages, exception class frequency.
+
+Incident signals (ServiceNow)
+
+incident_count_60d, major_incident_count_60d, MTTA/MTTR, incident tags linked to capacity/performance.
+
+Dependency / topology
+
+upstream_services[] with call volume contribution; downstream_services[] with latency/error contribution; dependency_type (API, DB, MQ, cache); chain criticality and edge confidence.
+
+ 
+
+3.5 Capacity Outputs
+• capacity_classification: UNDER UTILIZED | OVER UTILIZED | STABLE | UNSTABLE
+• root_cause_type: LOCAL | UPSTREAM DRIVEN | DOWNSTREAM DRIVEN | MIXED
+• risk_score (0-100)
+• recommendation_set[] with expected impact and confidence
+• evidence_refs[] (metric queries, log excerpts, incident links)
+4. Solution B - Resiliency Test Engineering (RTAAS)
+Important note from source
+
+The team needs to understand exactly which capabilities are available through Net Havoc APIs.
+The solution also depends on trustworthy upstream/downstream path discovery, not only code scanning.
+ 
+
+4.1 Domain Architecture
+Git static scan + runtime telemetry + Net Havoc capabilities + topology critical paths + OCP allocation/config feed a Resilience Context Builder, which drives a Resiliency Playbook Set and produces resilience findings, a gap backlog, and scorecards.
+
+Component
+
+Purpose
+
+Context Builder Inputs
+
+Git static scan, runtime telemetry, Net Havoc capabilities, topology critical paths, OCP allocation/config.
+
+Resiliency Playbook Set
+
+Capability discovery; sufficiency assessment; test selection; Net Havoc execution; recovery validation.
+
+Primary Outputs
+
+Resilience findings, gap backlog, and scorecards.
+
+ 
+
+4.2 RTAAS Workflow (End-to-End)
+Step 1: Discover implemented capabilities
+
+• Static scan from Git/config for patterns such as timeout, retry, circuit breaker, fallback, bulkhead, rate limit, and idempotency.
+Step 2: Map capabilities to components and critical paths
+
+• For each service and key dependency path, identify which patterns are present.
+• Identify which paths are still unprotected.
+Step 3: Determine what is needed vs allocated
+
+• Base the assessment on criticality, SLOs, failure modes, and traffic profile.
+• Check whether configured resilience is sufficient.
+• Check whether OCP resource requests/limits align to resilience objectives.
+Step 4: Select playbooks and run tests in Net Havoc
+
+• Fault scenarios by dependency type include API latency injection, API error injection, DB slowdown / unavailable, queue lag / backpressure, and pod restart / kill chaos events where allowed.
+Step 5: Validate behavior and classify outcome
+
+• Did timeout trigger correctly?
+• Did retry amplify failure?
+• Did circuit breaker protect upstreams?
+• Was fallback graceful?
+• Did service recover within target time?
+Step 6: Publish actionable outputs
+
+• Gap list with severity and ownership.
+• Test evidence with pass/fail and recovery timelines.
+• Prioritized remediation backlog.
+4.3 Resilience Decision Rules (Initial)
+Rule
+
+Logic
+
+Rule RE-DISC-01 (Capability missing on critical path)
+
+If a critical dependency path lacks timeout, circuit breaker, or fallback protections, mark it as a high-risk gap.
+
+Rule RE-SUFF-01 (Capability present but insufficient)
+
+If a pattern exists but thresholds or configuration do not meet SLO failure budgets, mark as medium/high risk depending on blast radius.
+
+Rule RE-VAL-01 (Dynamic validation failure)
+
+If a Net Havoc scenario fails the recovery objective, create a remediation recommendation and a mandatory retest.
+
+Resource alignment rule from notes
+
+If OCP requests/limits do not support graceful degradation under load/fault, recommend reallocation and autoscaling policy tuning.
+
+ 
+
+4.4 Required Data Points (Resiliency Engineering)
+Category
+
+Details
+
+Service criticality and objectives
+
+service_tier, business criticality, SLOs (availability/latency), error budget, RTO/RPO where applicable.
+
+Capability inventory (static)
+
+has_timeout with timeout_ms; has_retry with retry_count and backoff_strategy; has_circuit_breaker with open_threshold and half_open_policy; has_fallback with fallback_type; has_bulkhead with isolation boundaries; has_rate_limiter with policy; idempotency support.
+
+Runtime resilience signals
+
+timeout_trigger_count, retry_attempts_total, circuit_breaker_open_rate, fallback_invocation_rate, degraded_mode_duration.
+
+Net Havoc test metadata
+
+scenario_id, fault_type, target_component, start/end time, expected_behavior vs observed_behavior, pass/fail, blast_radius, recovery_time_sec, evidence artifacts (logs, traces, metric snapshots).
+
+OCP / K8s controls
+
+cpu/memory requests-limits, liveness/readiness/startup probe configs, HPA/VPA configs and stabilization windows, pod disruption budget (PDB), anti-affinity/topology spread settings if used.
+
+Dependency awareness
+
+critical upstreams/downstreams, single-point-of-failure markers, chain-level resilience score.
+
+ 
+
+4.5 Resiliency Outputs
+• resilience_score (0-100)
+• capability_coverage_score (0-100)
+• validation_score (0-100)
+• critical_gap_count and prioritized_gap_list[]
+• recommended_playbooks[] and retest_plan
+• evidence_refs[]
+5. Cross-Domain Intelligence (Capacity + Resilience)
+High-value combined insights captured in the notes:
+
+• Over-utilized + weak timeout/retry strategy -> scaling alone will not stabilize the service.
+• Under-utilized but low resilience coverage -> cost-optimized but operationally fragile.
+• Capacity spikes explained by downstream failure plus retry amplification -> fix dependency behavior first, then right-size.
+• Recurrent incidents where resilience tests fail the same pattern -> mandatory governance gate before release.
+6. Production Requirements
+6.1 Robustness
+• Idempotent ingestion and replay support.
+• Partial-source failure tolerance with degraded-confidence output.
+• Strong audit trail for each playbook step and decision.
+• RBAC plus approval gates for disruptive tests.
+6.2 Efficiency
+• Incremental data pulls using watermark-based extraction.
+• Pre-aggregated time windows for CPU and latency statistics.
+• Caching of topology and static capability scans.
+• Asynchronous playbook execution with prioritized queues.
+6.3 Scalability
+• Horizontal scaling for connectors and playbook workers.
+• Partitioning by app/service/environment.
+• High-volume metrics stored in time-series storage, with findings in relational/document stores.
+• Event-driven trigger model for near-real-time anomaly handling.
+7. API Contracts (Minimum Set)
+Method
+
+Endpoint
+
+GET
+
+/applications/{appId}/context
+
+GET
+
+/applications/{appId}/capacity/findings
+
+GET
+
+/applications/{appId}/resilience/findings
+
+POST
+
+/playbooks/execute
+
+GET
+
+/playbooks/{runId}
+
+GET
+
+/evidence/{evidenceId}
+
+POST
+
+/resilience/tests/trigger
+
+GET
+
+/resilience/tests/{testRunId}/results
+
+ 
+
+8. Clarification Notes Captured in the Source
+Source
+
+Captured clarification
+
+Prometheus
+
+Collect real-time infrastructure metrics such as CPU, memory, request rates, latency, and related operational indicators.
+
+Splunk
+
+Ingest and analyze logs/errors to identify timeout patterns, retry amplification, exception classes, and other failure signatures.
+
+ServiceNow
+
+Track incident history, severity, MTTA/MTTR, and correlate incident patterns with service degradation.
+
+Git/SCM
+
+Scan codebases and configuration for implemented resilience patterns such as timeout, retry, circuit breaker, fallback, bulkhead, and rate limiting.
+
+Net Havoc
+
+Execute controlled fault-injection tests such as latency, errors, and unavailability against approved targets.
+
+CMDB/Service Catalog
+
+Maintain authoritative ownership, criticality tier, and application metadata.
+
+ 
+
+Runtime telemetry - why it matters
+
+The source notes define runtime telemetry as live operational data collected during service execution that proves whether resilience controls are being activated in practice, not just defined in code.
+Examples listed: timeout trigger count, retry attempts total, circuit breaker open rate, fallback invocation rate, and degraded mode duration.
+ 
+
+Topology critical paths - why they matter
+
+These are the key upstream-service-to-downstream dependency chains that, if broken, would cause business impact.
+Examples explicitly noted: Payment API -> Transaction Service -> Payment DB; Order Service -> Inventory Service -> Warehouse System.
+The notes state that Net Havoc testing should focus on these critical paths.
+ 
+
+9. Closing View
+Taken together, the blueprint defines a single platform that continuously interprets operational evidence, identifies capacity risk, validates resilience behavior, and produces advisory outputs with evidence and ownership. The strongest theme across the notes is that service behavior cannot be judged in isolation: upstream/downstream context, OCP allocation, incidents, and observed runtime behavior all need to be combined before a production recommendation is trusted.
