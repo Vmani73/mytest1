@@ -1,1 +1,415 @@
-{"prompt":"# Production-grade Copilot master prompt for MQ Topology Intelligence\n\n## Executive summary\nThis report provides a single paste-ready “master prompt” that instructs a Copilot-style coding assistant to implement a deterministic, auditable MQ Topology Intelligence & Simplification Platform with no LLM-driven topology decisions.\nThe prompt is intentionally explicit because GitHub’s Copilot guidance emphasises being specific, providing concrete examples, and avoiding ambiguity for complex tasks. citeturn0search0turn0search11\nFor CSV ingestion and round-tripping, it mandates strict schema mapping and validation around pandas `read_csv`/`to_csv` so the system can accept UNSPECIFIED schemas while preserving unknown columns. citeturn1search0turn1search1\nFor topology analysis, it requires a canonical NetworkX graph model with strongly connected components for cycle reporting/removal and shortest-path lengths for hop calculations, plus node-link JSON export for interoperability. citeturn0search6turn4search1turn4search0\nFor APIs, it follows FastAPI’s documented patterns for multipart uploads (`UploadFile`) and response validation (`response_model`), including the `python-multipart` requirement for form-data file uploads. citeturn0search2turn0search5turn1search3\nFinally, it makes correctness testable by requiring pytest-based unit/integration/idempotency tests and production packaging via pyproject scripts with CI in GitHub Actions. citeturn1search6turn3search4turn2search2\n\n## Paste-ready Copilot prompt\n```text\nMQ TOPOLOGY INTELLIGENCE & SIMPLIFICATION PLATFORM — SINGLE MASTER PROMPT (en-IN)\nDate context: 2026-03-26 IST (Asia/Kolkata)\n\nYou are a coding assistant acting as a senior staff-level Python engineer. Implement a complete, production-grade repository that solves the hackathon: ingest an authoritative IBM MQ topology (as CSVs), analyse it, and generate a simplified, compliant target-state topology with automation-ready artefacts.\n\nA. Operating rules (non-negotiable)\nA1. Deterministic: no randomness. Stable ordering everywhere (CSV row order, JSON key order, graph export ordering). Never iterate over sets/dicts without sorting.\nA2. Non-hallucinating: core topology decisions MUST be deterministic rules + graph algorithms only. NO LLM, NO “AI reasoning” in the decision engine. (Optional: you may use an LLM ONLY to paraphrase already-determined decisions into human-friendly prose; this must be strictly separated behind an interface and disabled by default.)\nA3. Auditable: every change must be logged (JSONL) with timestamp_utc, rule_id, before/after, rationale, and risk reduction statement.\nA4. Configurable: thresholds, weights, naming templates, and tie-breakers must be config-driven via YAML (defaults.yaml). Do not hardcode them in logic.\nA5. Schema-flexible: input CSV schema is UNSPECIFIED. Implement schema mapping with schema_map.yaml; fail fast if canonical required fields cannot be mapped. Preserve unknown columns round-trip.\nA6. No clarifying questions: if something is UNSPECIFIED, pick a safe default, mark it explicitly as “UNSPECIFIED” in README/DESIGN, and proceed.\n\nB. Mandatory enterprise constraints and rule_ids (map 1:1; implement unit tests per rule_id)\nConstraint text (verbatim intent) -> rule_id:\nC1. “Exactly one queue manager per application (1 QM per AppID). Applications connect only to their own queue manager.” -> RULE_C1_ONE_QM_PER_APP\nC2. “Producers write using remote queue definitions on their own QM and send via XMIT queues to the destination QM.” -> RULE_C2_REMOTE_QUEUE_AND_XMIT\nC3. “Queue managers communicate via sender/receiver channel pairs with deterministic naming: fromQM.toQM / toQM.fromQM.” -> RULE_C3_CHANNEL_PAIR_NAMING\nC4. “Introduce channels only when required; no unnecessary channels in target.” -> RULE_C4_CHANNELS_ONLY_IF_REQUIRED\nC5. “Consumers read from local queues on their own QM; these local queues receive data from their channel.” -> RULE_C5_CONSUMER_LOCAL_QUEUE_ONLY\nC6. “No orphan/unused MQ objects in target state.” -> RULE_C6_NO_UNUSED_OBJECTS\n\nC. Required deliverables (must exist in repo; tests must validate presence)\nC1. Target-state CSV dataset: write out the same set of CSV files as ingested (same filenames, same column sets/order where possible, unknown columns preserved, new rows have blanks for unknown columns).\nC2. Complexity scoring: compute as-is and target scores + full breakdown table + reduction%.\nC3. Visualisations: as-is and target graphs at least at:\n    - QM-to-QM level\n    - Full object level (apps/QMs/queues/channels)\n    Export: PNG + SVG (static) and JSON graph export; also interactive HTML via PyVis (required by spec here).\nC4. Decision log: audit/decision_log.jsonl and audit/decision_summary.json. Provide a human-review diff: audit/diff.md and audit/diff.json.\nC5. API: FastAPI app with endpoints /upload, /analyze, /generate-target, /export.\nC6. CLI: installable command `mqti` with subcommands validate/analyze/generate/visualize/score/export/demo.\nC7. Tests: unit + integration + property-style tests (idempotency + determinism) and a sample messy dataset with expected target outputs checked byte-for-byte.\nC8. Docs: README.md, DESIGN.md (must map each rule_id to constraints + implementation + tests), and a judge runbook.\nC9. Packaging: pyproject.toml, Dockerfile, GitHub Actions CI workflow, and scripts/package_zip.py that creates dist/mqti_hackathon_submission.zip containing repo + generated artefacts.\n\nD. Tech stack constraints (required libraries)\n- Python 3.11+\n- FastAPI (file upload endpoints), Pydantic models for validation/serialization\n- pandas for CSV ingestion/writing\n- NetworkX for graph model and algorithms\n- Jinja2 for report templating (HTML/MD)\n- Graphviz (Python graphviz package + system graphviz binary) for PNG/SVG; PyVis for interactive HTML from NetworkX\n- pytest for testing\n- ruff (or flake8) for lint; choose one and configure in pyproject.toml\n- pyyaml for YAML config/schema_map/overrides\n\nE. Repository file list (MUST create all; add more if needed)\n- pyproject.toml  (packaging + deps + [project.scripts] for `mqti`)\n- README.md\n- DESIGN.md\n- Dockerfile\n- .dockerignore\n- .gitignore\n- .github/workflows/ci.yml\n- .github/copilot-instructions.md (short stable constraints summary for ongoing Copilot usage)\n- src/mqti/__init__.py\n- src/mqti/errors.py\n- src/mqti/logging.py\n- src/mqti/config/defaults.yaml\n- src/mqti/config/schema_map.example.yaml\n- src/mqti/config/overrides.example.yaml\n- src/mqti/models.py\n- src/mqti/schema.py\n- src/mqti/io/csv_reader.py\n- src/mqti/io/csv_writer.py\n- src/mqti/graph/builder.py\n- src/mqti/graph/export.py\n- src/mqti/analysis/anomalies.py\n- src/mqti/analysis/complexity.py\n- src/mqti/rules/base.py\n- src/mqti/rules/constraints.py\n- src/mqti/transform/assign_qm.py\n- src/mqti/transform/canonicalize.py\n- src/mqti/transform/minimize.py\n- src/mqti/transform/cycles.py\n- src/mqti/audit/log.py\n- src/mqti/audit/diff.py\n- src/mqti/report/templates/report.md.j2\n- src/mqti/report/templates/report.html.j2\n- src/mqti/report/generate.py\n- src/mqti/visualize/graphviz.py\n- src/mqti/visualize/pyvis.py\n- src/mqti/api/main.py\n- src/mqti/api/auth.py\n- src/mqti/api/routes.py\n- src/mqti/cli/main.py\n- scripts/package_zip.py\n- scripts/demo.sh\n- data/sample_messy/*.csv\n- data/expected_target/*.csv\n- tests/unit/*.py\n- tests/integration/*.py\n\nF. Inputs: canonical CSV filenames, canonical required fields, and schema mapping\nF1. Canonical filenames (safe defaults; UNSPECIFIED in hackathon, configurable via schema_map.yaml):\n- queue_managers.csv\n- applications.csv\n- app_qm_connections.csv\n- queues.csv\n- channels.csv\n- flows.csv\n- regions.csv (optional)\n\nF2. Canonical required fields (minimum)\nqueue_managers.csv:\n- qm_id (string, unique, required)\n- region (string, optional but recommended)\napplications.csv:\n- app_id (string, unique, required)\n- region (optional)\napp_qm_connections.csv:\n- app_id (required)\n- qm_id (required)\nqueues.csv:\n- queue_name (required)\n- qm_id (required)\n- queue_type (required enum: local|remote|xmit)\n- target_qm_id and target_queue_name required when queue_type=remote\nchannels.csv:\n- channel_name (required)\n- from_qm_id (required)\n- to_qm_id (required)\n- channel_type (required enum: sender|receiver)\nflows.csv:\n- producer_app_id (required)\n- consumer_app_id (required)\n- business_event (optional; default UNSPECIFIED_EVENT)\n- consumer_local_queue (optional; derived if missing)\n\nF3. Schema mapping approach (must implement)\n- schema_map.yaml maps:\n  - actual filenames -> canonical dataset names\n  - actual columns -> canonical columns\n- Reader must:\n  - load raw CSV\n  - rename columns to canonical\n  - keep a mapping so writer can restore original column names on output\n  - preserve unknown columns round-trip by merging them back when writing\n- Fail fast if canonical required fields cannot be mapped.\n\nF4. Example schema_map.yaml (must include file and column mapping)\nversion: 1\nfiles:\n  queue_managers:\n    filename: queue_managers.csv\n    columns:\n      qm_id: qm_id\n      region: region\n      metadata_json: metadata_json\n  applications:\n    filename: applications.csv\n    columns:\n      app_id: app_id\n      app_name: app_name\n      region: region\n  app_qm_connections:\n    filename: app_qm_connections.csv\n    columns:\n      app_id: app_id\n      qm_id: qm_id\n  queues:\n    filename: queues.csv\n    columns:\n      queue_name: queue_name\n      qm_id: qm_id\n      queue_type: queue_type\n      target_qm_id: target_qm_id\n      target_queue_name: target_queue_name\n      xmit_queue_name: xmit_queue_name\n  channels:\n    filename: channels.csv\n    columns:\n      channel_name: channel_name\n      from_qm_id: from_qm_id\n      to_qm_id: to_qm_id\n      channel_type: channel_type\n  flows:\n    filename: flows.csv\n    columns:\n      producer_app_id: producer_app_id\n      consumer_app_id: consumer_app_id\n      business_event: business_event\n      consumer_local_queue: consumer_local_queue\n\nG. Deterministic naming templates (config-driven; defaults MUST match)\nQueue manager: QM_<APP_ID>\nConsumer local queue: LQ_<CONSUMER_APP_ID>_<BUSINESS_EVENT>\nProducer remote queue: RQ_<PRODUCER_APP_ID>_TO_<CONSUMER_APP_ID>_<BUSINESS_EVENT>\nXMIT queue: XMIT_<FROM_QM_ID>_TO_<TO_QM_ID>\nSender channel: <FROM_QM_ID>.TO.<TO_QM_ID>\nReceiver channel: <TO_QM_ID>.FROM.<FROM_QM_ID>\n\nH. Canonical NetworkX graph model (must implement exactly)\nUse a directed graph. Use stable node identifiers.\nNode types and primary keys:\n- Application: \"app:<app_id>\"\n- QueueManager: \"qm:<qm_id>\"\n- Queue: \"q:<qm_id>:<queue_name>\"\n- Channel: \"ch:<from_qm_id>:<to_qm_id>:<channel_type>:<channel_name>\"\nEdge types (as edge attribute \"type\"):\n- connects_to: app -> qm (as-is)\n- owns: qm -> queue\n- flow: app(producer) -> app(consumer) (from flows.csv)\n- routes_to: qm -> qm (derived required connectivity from flows + channels)\n\nGraph export:\n- Provide NetworkX node-link JSON export suitable for JS tooling.\n- Export both full graph and QM-only graph.\n\nI. Algorithmic steps (must implement; core logic deterministic)\nI1. Ingest\n- Load CSVs with pandas, apply schema_map if provided else use safe-default canonical schema.\n- Validate: required columns, referential integrity, enums, uniqueness constraints. Produce a list of violations (rule_id-scoped).\n- Preserve unknown columns for round-trip.\n\nI2. Build as-is graph\n- Build nodes/edges (apps, qms, queues, channels, flows).\n- Compute inventory counts.\n- Detect anomalies: duplicates, missing refs, orphans, unused objects (definition below).\n\nI3. Validate constraints on as-is\n- Implement validators that return structured violations:\n  fields: violation_id, rule_id, severity, object_ref, message, suggested_fix.\n- Include validators for RULE_C1..RULE_C6 (even if “expected to fail” on as-is).\n\nI4. Assign exactly one QM per app (RULE_C1_ONE_QM_PER_APP)\nDeterministic selection:\n- Candidate QMs = all qm_id in app_qm_connections for the app.\n- If exactly 1: assign it.\n- If >1: compute deterministic score per candidate:\n  score = (1000 * owned_queue_count_on_qm)\n        + (100  * same_region_match)    # 1 if app.region == qm.region else 0 (if either missing => 0)\n        - (10   * disruption_penalty)   # see below\nWhere:\n- owned_queue_count_on_qm = count of rows in queues.csv with qm_id=candidate (any type) [as-is inventory].\n- disruption_penalty = number of consumer-local-queues currently on this QM for this app IF the app is a consumer; else 0.\nTie-breakers in order:\n1) higher score\n2) higher owned_queue_count_on_qm\n3) same_region_match == 1\n4) lexicographically smallest qm_id\nIf candidate set empty: create QM using template QM_<APP_ID> and add to queue_managers in target; log this creation.\n\nLog the assignment decision in audit log with:\n- rule_id, app_id, candidate_scores, chosen_qm_id, why\n\nI5. Canonicalise each producer->consumer flow (RULE_C2, RULE_C3, RULE_C5)\nFor each flow row (P,C,E):\n- Determine QM_P = assigned QM of P; QM_C = assigned QM of C.\n- Ensure consumer local queue exists on QM_C:\n  name = consumer_local_queue if provided else template LQ_C_E\n  queues.csv row: (queue_name=name, qm_id=QM_C, queue_type=local)\n- Ensure producer remote queue exists on QM_P:\n  name = producer_remote_queue if provided else template RQ_P_TO_C_E\n  queues.csv row: (queue_name=name, qm_id=QM_P, queue_type=remote, target_qm_id=QM_C, target_queue_name=<consumer local queue>, xmit_queue_name=<xmit queue>)\n- Ensure XMIT queue exists on QM_P:\n  name = template XMIT_QM_P_TO_QM_C\n  queues.csv row: (queue_name=name, qm_id=QM_P, queue_type=xmit)\n- Ensure exactly one channel pair exists for QM_P -> QM_C, but ONLY if at least one flow requires it:\n  Sender: <QM_P>.TO.<QM_C> (from_qm_id=QM_P, to_qm_id=QM_C, channel_type=sender)\n  Receiver: <QM_C>.FROM.<QM_P> (from_qm_id=QM_C, to_qm_id=QM_P, channel_type=receiver)\n- Do NOT create per-queue channels.\n\nI6. Channel minimisation (RULE_C4_CHANNELS_ONLY_IF_REQUIRED)\n- Required directed QM edges = set of (QM_P, QM_C) for all flows where QM_P != QM_C.\n- Target channels must be exactly:\n  - one sender per required edge\n  - one receiver per required edge\n- Remove any channels not in required set.\n- For non-standard channel names that represent a required edge:\n  - If option rename_nonstandard_objects=true: rename to canonical template OR create new canonical and remove old; document your approach and make it deterministic.\n\nI7. Cycle detection and elimination (SCC-based)\n- Build QM-level directed graph with edges from required set plus any existing channel edges (as-is analysis).\n- Detect SCCs (size>1) to report cycles.\n- Elimination policy:\n  - Never remove a required edge (needed by at least one flow).\n  - Remove only non-required edges (e.g., legacy channels) to break cycles.\n  - If an SCC remains because all edges are required, mark it as “unavoidable due to flows” and keep.\n- Export cycle analysis summary to report.\n\nI8. Unused object detection and removal (RULE_C6_NO_UNUSED_OBJECTS)\nDefinition: an object is “used in target” if:\n- QM is assigned to any application OR is required for any flow (created QM for app).\n- Local queue is referenced as consumer queue by at least one flow (directly or derived).\n- Remote queue corresponds to at least one flow.\n- XMIT queue corresponds to at least one required QM edge.\n- Channel corresponds to required QM edge.\nRemove everything else from target output. Ensure referential integrity and no orphans.\n\nI9. Complexity scoring (implement EXACTLY)\nCompute metrics for as-is and for target.\nDefinitions:\n- channel_count: total rows in channels.csv (sender+receiver count separately)\n- multi_qm_app_violations: count apps with >1 connected qms (as-is); target must be 0\n- avg_routing_hops: average over flows of shortest_path_length(QM_P,QM_C) in QM graph built from channels; if QM_P==QM_C => 0. If no path exists => violation and fail generation.\n- cycle_scc_count: number of SCCs with size>1 in QM graph\n- unused_object_count: count objects not used per definition above (target must be 0)\n- fanout_penalty: sum over QMs max(0, out_degree - FANOUT_THRESHOLD)\n- fanin_penalty: sum over QMs max(0, in_degree - FANIN_THRESHOLD)\n- total_mq_objects: (#QMs + #queues + #channels)\nExact weighted formula:\nComplexityScore =\n(5 * channel_count)\n+ (4 * multi_qm_app_violations)\n+ (3 * avg_routing_hops)\n+ (3 * cycle_scc_count)\n+ (2 * unused_object_count)\n+ (2 * fanout_penalty)\n+ (2 * fanin_penalty)\n+ (1 * total_mq_objects)\nDefaults in defaults.yaml:\n- FANOUT_THRESHOLD = 5\n- FANIN_THRESHOLD = 5\n- weights exactly as above (but allow override)\n\nProvide an illustrative example in README:\nExample (illustrative only):\nchannel_count=10, multi_qm_app_violations=2, avg_routing_hops=1.5, cycle_scc_count=1, unused_object_count=3, fanout_penalty=0, fanin_penalty=1, total_mq_objects=50\nScore = 5*10 + 4*2 + 3*1.5 + 3*1 + 2*3 + 2*0 + 2*1 + 1*50 = 50+8+4.5+3+6+0+2+50 = 123.5\n\nI10. Audit trail and human-in-the-loop overrides\n- decision_log.jsonl: one JSON per event with fields:\n  change_id (uuid), timestamp_utc (ISO8601), rule_id, action (CREATE|REMOVE|RENAME|ASSIGN|KEEP), object_type, object_key, before, after, rationale, risk_reduction, reversible (bool)\n- diff export:\n  - diff.json: structured (added/removed/changed)\n  - diff.md: human-readable summary\n- overrides.yaml support:\n  - allow pinning app_id -> qm_id\n  - allow preserve/remove specific objects by key\n  - validate overrides; if override would violate RULE_C1..C6, reject with explicit error.\n\nI11. Idempotency\n- Run generate-target twice on same inputs; outputs (CSV bytes + JSON exports) must be identical.\n- Provide a test that asserts byte-for-byte identity for outputs directory.\n- Enforce stable sorting:\n  - queue_managers sorted by qm_id\n  - applications by app_id\n  - connections by app_id,qm_id\n  - queues by qm_id,queue_type,queue_name\n  - channels by from_qm_id,to_qm_id,channel_type,channel_name\n  - flows by producer_app_id,consumer_app_id,business_event\n\nJ. Output artefacts and directories\nCreate the following on analyze/generate:\n- reports/as_is/report.md and report.html\n- reports/target/report.md and report.html\n- reports/*/graph_full.json and graph_qm.json\n- reports/*/topology_full.svg and topology_full.png\n- reports/*/topology_qm.svg and topology_qm.png\n- reports/*/topology_interactive.html (PyVis)\n- audit/decision_log.jsonl, audit/decision_summary.json, audit/diff.md, audit/diff.json\n- exports/target_csv/<same csv filenames as input>\n\nK. API specification (FastAPI; implement exact request/response models; include auth placeholder)\nAuth placeholder:\n- Require header X-API-Key for all endpoints; non-empty => allowed; missing/empty => 401. Document as placeholder only.\n\nPOST /upload\n- multipart/form-data; accept multiple CSV files; field names match canonical filenames (queue_managers, applications, app_qm_connections, queues, channels, flows)\n- optional: schema_map (yaml), overrides (yaml)\nResponse JSON:\n{\n  \"upload_id\": \"<uuid>\",\n  \"files_received\": [\"queue_managers.csv\", \"...\"],\n  \"warnings\": []\n}\n\nPOST /analyze\nRequest JSON: { \"upload_id\": \"<uuid>\" }\nResponse JSON includes:\n{\n  \"inventory\": {\"queue_managers\": n, \"applications\": n, \"queues\": n, \"channels\": n, \"flows\": n},\n  \"violations\": [{\"violation_id\":\"...\",\"rule_id\":\"RULE_C1...\",\"severity\":\"ERROR|WARN\",\"object_ref\":\"...\",\"message\":\"...\",\"suggested_fix\":\"...\"}],\n  \"complexity\": {\"as_is\":{\"score\":x,\"breakdown\":{...}}},\n  \"artifacts\": {\"graph_qm_json\":\"...path...\",\"topology_qm_svg\":\"...path...\"}\n}\n\nPOST /generate-target\nRequest JSON:\n{\n  \"upload_id\": \"<uuid>\",\n  \"options\": {\n    \"rename_nonstandard_objects\": true,\n    \"remove_unused\": true\n  }\n}\nResponse JSON:\n{\n  \"target_id\":\"<uuid>\",\n  \"complexity\": {\n    \"as_is\": {\"score\":...,\"breakdown\":{...}},\n    \"target\": {\"score\":...,\"breakdown\":{...}},\n    \"reduction_percent\": ...\n  },\n  \"constraints\": {\"all_enforced\": true, \"remaining_warnings\": []},\n  \"exports\": {\"target_csv_dir\":\"...\",\"zip\":\"...\"}\n}\n\nGET /export\nQuery params: id=<upload_id|target_id>, type=csv|graph_json|viz_svg|viz_png|decision_log|report_html|report_md|zip, which=<as_is|target>\nReturn file streaming response.\n\nL. CLI specification (argparse; installable as `mqti`)\nCommands:\n- mqti validate --input-dir <dir> [--schema-map schema_map.yaml]\n- mqti analyze --input-dir <dir> --out-dir reports/as_is [--schema-map ...]\n- mqti generate --input-dir <dir> --out-dir reports/target --exports-dir exports/target_csv [--overrides overrides.yaml] [--rename-nonstandard true|false]\n- mqti score --input-dir <dir>\n- mqti visualize --input-dir <dir> --out-dir <dir>\n- mqti export --target-dir <dir> --format zip\n- mqti demo (runs scripts/demo.sh)\nEach command prints JSON summary to stdout and returns non-zero on failure.\n\nM. CI/CD and packaging\nM1. pyproject.toml must define dependencies and CLI entrypoint (mqti = mqti.cli.main:main). Use [project.scripts].\nM2. Dockerfile must install system graphviz and run:\n- uvicorn (API)\n- CLI usage from container\nM3. GitHub Actions workflow must run:\n- ruff lint\n- pytest\n- build package\nM4. scripts/package_zip.py must create dist/mqti_hackathon_submission.zip containing:\n- source code\n- sample + expected data\n- generated artefacts from running demo (reports, exports, audit)\n- README + DESIGN + runbook + demo script\n\nN. Sample messy dataset (create exactly) AND expected outputs (create exactly; tests compare byte-for-byte)\nCreate data/sample_messy/ with these exact CSVs (including extra columns to prove “preserve unknown columns”):\n\ndata/sample_messy/queue_managers.csv\nqm_id,region,owner_team,metadata_json\nQM_APP_A,IN-WEST,TEAM_PAYMENTS,\"{\"\"env\"\":\"\"dev\"\"}\"\nQM_APP_B,IN-WEST,TEAM_PAYMENTS,\"{\"\"env\"\":\"\"dev\"\"}\"\nQM_APP_C,IN-SOUTH,TEAM_RISK,\"{\"\"env\"\":\"\"dev\"\"}\"\nQM_UNUSED,IN-WEST,TEAM_UNKNOWN,\"{\"\"env\"\":\"\"dev\"\"}\"\n\ndata/sample_messy/applications.csv\napp_id,app_name,region,criticality\nAPP_A,\"Payments Producer\",IN-WEST,HIGH\nAPP_B,\"Payments Consumer+Forwarder\",IN-WEST,HIGH\nAPP_C,\"Audit Service\",IN-SOUTH,MEDIUM\n\ndata/sample_messy/app_qm_connections.csv\napp_id,qm_id,connection_type\nAPP_A,QM_APP_A,client\nAPP_A,QM_APP_B,client\nAPP_B,QM_APP_B,client\nAPP_C,QM_APP_C,client\n\ndata/sample_messy/queues.csv\nqueue_name,qm_id,queue_type,target_qm_id,target_queue_name,xmit_queue_name,description\nLQ_APP_B_ORDER_CREATED,QM_APP_B,local,,,,order created inbound\nLQ_APP_C_AUDIT,QM_APP_C,local,,,,audit inbound\nLQ_APP_A_UNUSED,QM_APP_A,local,,,,unused local\nLQ_STALE_UNUSED,QM_UNUSED,local,,,,orphan local\nRQ_A2B_OLD,QM_APP_A,remote,QM_APP_B,LQ_APP_B_ORDER_CREATED,XMIT_BADNAME,legacy remote queue\nXMIT_BADNAME,QM_APP_A,xmit,,,,legacy xmit\nRQ_WEIRD,QM_APP_B,remote,QM_APP_C,LQ_APP_C_AUDIT,XMIT_OLD,legacy remote queue\nXMIT_OLD,QM_APP_B,xmit,,,,legacy xmit\n\ndata/sample_messy/channels.csv\nchannel_name,from_qm_id,to_qm_id,channel_type,protocol\nQM_APP_A.TO.QM_APP_B,QM_APP_A,QM_APP_B,sender,tcp\nQM_APP_B.FROM.QM_APP_A,QM_APP_B,QM_APP_A,receiver,tcp\nQM_APP_B.TO.QM_APP_C,QM_APP_B,QM_APP_C,sender,tcp\nQM_APP_C.FROM.QM_APP_B,QM_APP_C,QM_APP_B,receiver,tcp\nCHAN_LEGACY_UNUSED,QM_UNUSED,QM_APP_B,sender,tcp\nQM_APP_C.TO.QM_APP_A,QM_APP_C,QM_APP_A,sender,tcp\nQM_APP_A.FROM.QM_APP_C,QM_APP_A,QM_APP_C,receiver,tcp\n\ndata/sample_messy/flows.csv\nproducer_app_id,consumer_app_id,business_event,consumer_local_queue,notes\nAPP_A,APP_B,ORDER_CREATED,LQ_APP_B_ORDER_CREATED,pays->cons\nAPP_B,APP_C,AUDIT_EVENT,LQ_APP_C_AUDIT,fwd->audit\n\nCreate data/expected_target/ with exact expected outputs after generate-target with rename_nonstandard_objects=true and remove_unused=true:\n\ndata/expected_target/queue_managers.csv\nqm_id,region,owner_team,metadata_json\nQM_APP_A,IN-WEST,TEAM_PAYMENTS,\"{\"\"env\"\":\"\"dev\"\"}\"\nQM_APP_B,IN-WEST,TEAM_PAYMENTS,\"{\"\"env\"\":\"\"dev\"\"}\"\nQM_APP_C,IN-SOUTH,TEAM_RISK,\"{\"\"env\"\":\"\"dev\"\"}\"\n\ndata/expected_target/applications.csv\napp_id,app_name,region,criticality\nAPP_A,\"Payments Producer\",IN-WEST,HIGH\nAPP_B,\"Payments Consumer+Forwarder\",IN-WEST,HIGH\nAPP_C,\"Audit Service\",IN-SOUTH,MEDIUM\n\ndata/expected_target/app_qm_connections.csv\napp_id,qm_id,connection_type\nAPP_A,QM_APP_A,client\nAPP_B,QM_APP_B,client\nAPP_C,QM_APP_C,client\n\ndata/expected_target/queues.csv\nqueue_name,qm_id,queue_type,target_qm_id,target_queue_name,xmit_queue_name,description\nLQ_APP_B_ORDER_CREATED,QM_APP_B,local,,,,order created inbound\nLQ_APP_C_AUDIT,QM_APP_C,local,,,,audit inbound\nRQ_APP_A_TO_APP_B_ORDER_CREATED,QM_APP_A,remote,QM_APP_B,LQ_APP_B_ORDER_CREATED,XMIT_QM_APP_A_TO_QM_APP_B,\nXMIT_QM_APP_A_TO_QM_APP_B,QM_APP_A,xmit,,,,\nRQ_APP_B_TO_APP_C_AUDIT_EVENT,QM_APP_B,remote,QM_APP_C,LQ_APP_C_AUDIT,XMIT_QM_APP_B_TO_QM_APP_C,\nXMIT_QM_APP_B_TO_QM_APP_C,QM_APP_B,xmit,,,,\n\ndata/expected_target/channels.csv\nchannel_name,from_qm_id,to_qm_id,channel_type,protocol\nQM_APP_A.TO.QM_APP_B,QM_APP_A,QM_APP_B,sender,tcp\nQM_APP_B.FROM.QM_APP_A,QM_APP_B,QM_APP_A,receiver,tcp\nQM_APP_B.TO.QM_APP_C,QM_APP_B,QM_APP_C,sender,tcp\nQM_APP_C.FROM.QM_APP_B,QM_APP_C,QM_APP_B,receiver,tcp\n\ndata/expected_target/flows.csv\nproducer_app_id,consumer_app_id,business_event,consumer_local_queue,notes\nAPP_A,APP_B,ORDER_CREATED,LQ_APP_B_ORDER_CREATED,pays->cons\nAPP_B,APP_C,AUDIT_EVENT,LQ_APP_C_AUDIT,fwd->audit\n\nO. Tests (must implement; include expected assertions)\nO1. Unit tests (pytest)\n- test_RULE_C1_ONE_QM_PER_APP_enforced: after generate, each app connects to exactly one QM and only its own.\n- test_RULE_C2_REMOTE_QUEUE_AND_XMIT: for each cross-QM flow, producer QM has remote queue and corresponding XMIT.\n- test_RULE_C3_CHANNEL_PAIR_NAMING: channel names match templates.\n- test_RULE_C4_CHANNELS_ONLY_IF_REQUIRED: no channels exist for QM_UNUSED or for non-required QM pairs.\n- test_RULE_C5_CONSUMER_LOCAL_QUEUE_ONLY: consumers’ queues are local and on consumer QM.\n- test_RULE_C6_NO_UNUSED_OBJECTS: unused_object_count == 0 and no objects reference missing parents.\n\nO2. Integration tests\n- end-to-end on sample dataset:\n  - generated CSVs are byte-identical to data/expected_target/*.csv\n  - complexity(target) < complexity(as_is)\n  - decision_log.jsonl exists and has at least one entry per change category (ASSIGN, CREATE, REMOVE, RENAME)\n- API tests:\n  - upload -> analyze -> generate-target -> export zip happy path\n  - missing X-API-Key => 401\n- CLI tests (smoke):\n  - mqti analyze works with tmp_path output dirs\n  - mqti generate produces expected outputs in tmp_path\n\nO3. Property-style tests (no extra deps)\n- determinism: run generate twice; compare SHA256 of each exported file is identical.\n- idempotency: run generate on its own output; no additional changes; decision log shows “no-op” or empty diff.\n\nP. Performance and scalability requirements\n- Avoid O(N^2) joins; use pandas merge/groupby where relevant.\n- Avoid enumerating all simple cycles; use SCC detection on QM graph.\n- For avg_routing_hops: compute shortest paths per unique source using BFS once per source and reuse; do not do all-pairs for large graphs.\n- Provide documented complexity notes in DESIGN.md (Big-O normal case: O(V+E) per major pass on QM graph).\n\nQ. Security basics (API)\n- Validate content-type and file extension for uploads (CSV/YAML only).\n- Store uploads in per-upload_id directory; prevent path traversal; do not trust file names.\n- Limit file size (UNSPECIFIED; safe default: 20MB per file) and row count (UNSPECIFIED; safe default: 5 million rows) with clear error messages.\n- Auth placeholder: X-API-Key required but no real auth integration.\n\nR. Documentation requirements\n- README.md: quickstart, CLI/API usage, demo, artefacts, constraints overview, UNSPECIFIED defaults list.\n- DESIGN.md: architecture, module overview, detailed rule_id mapping, pseudocode, data model, and test mapping.\n- Include an architecture diagram in DESIGN.md (Mermaid) and also export a Graphviz DOT diagram under docs/architecture.dot rendered to SVG in CI if possible.\n\nS. Final output from you (the assistant) after generating code\n- Print a complete file tree of created files.\n- If you can run commands: run `ruff check .` and `pytest -q` and show outputs; otherwise print the exact commands to run and expected success output.\n- Run scripts/demo.sh (or print commands) and confirm it produces:\n  reports/, exports/, audit/, and dist/mqti_hackathon_submission.zip\nEND OF PROMPT.\n```\n\n## Rationale for major prompt sections\n- The prompt is explicit about inputs/outputs and provides concrete examples because Copilot guidance says specificity, examples, and avoiding ambiguity are key for high-quality generation on complex tasks. citeturn0search0turn0search11  \n- The API section mirrors official entity[\"organization\",\"FastAPI\",\"python web framework\"] patterns for multipart file uploads and typed response validation, including the documented `python-multipart` requirement and `response_model` usage. citeturn0search2turn0search5turn1search3  \n- The graph and optimisation section is anchored on entity[\"organization\",\"NetworkX\",\"python graph library\"] SCC detection and shortest-path tooling and uses node-link JSON export, matching official documentation for these functions. citeturn0search6turn4search1turn4search0  \n- CSV round-tripping and schema flexibility are defined using entity[\"organization\",\"pandas\",\"python data analysis library\"] read/write APIs so the implementation can reliably ingest, normalise, and reproduce CSVs while preserving unknown columns. citeturn1search0turn1search1  \n- Determinism is made testable by requiring parametrised unit tests and temp-dir based integration runs (expected outputs + idempotency), consistent with official entity[\"organization\",\"pytest\",\"python testing framework\"] mechanisms; packaging and CI are standardised using pyproject scripts and GitHub Actions guidance. citeturn1search6turn1search2turn3search4turn2search2  \n\n## Risks and mitigations checklist\n- **Risk: context limits** in a single large prompt can cause missed files or incomplete tests. **Mitigation:** require a fixed file list, an acceptance checklist, and a file-tree confirmation step after generation; also include `.github/copilot-instructions.md` to keep invariants persistent. citeturn0search4  \n- **Risk: brittle outputs** if ordering is not stabilised (idempotency failures). **Mitigation:** mandate stable sorting rules and byte-for-byte expected outputs plus determinism tests.  \n- **Risk: environment drift** (e.g., Graphviz binary missing) breaks visualisation builds. **Mitigation:** include Graphviz installation in Dockerfile and run CI in a container-friendly setup; Graphviz usage is documented for rendering to SVG/PNG. citeturn2search0turn2search3  \n- **Risk: schema mismatch** with real hackathon data. **Mitigation:** strict schema_map support with fail-fast validation, round-trip preservation of unknown fields, and a documented “UNSPECIFIED defaults” section. citeturn1search0  "}
+You are a coding assistant acting as a senior staff-level Python engineer and production systems architect.
+
+GOAL
+Implement the entire “MQ Topology Intelligence & Simplification Platform” for a hackathon. It must ingest authoritative MQ topology CSV files, analyse violations and complexity, and generate an enterprise-compliant target-state topology plus exports, visualisations, audits, API, CLI, tests, and packaging.
+
+NON-NEGOTIABLE GLOBAL RULES
+1) Deterministic: no randomness. Same inputs => byte-identical outputs. Stable ordering everywhere. Never iterate over sets/dicts without sorting.
+2) Non-hallucinating: topology decisions MUST be rule-engine + graph algorithms only. Do NOT use an LLM to decide assignments/routing/creation/removal. LLM (optional) may ONLY generate human-readable summaries from deterministic logs; must be OFF by default.
+3) Auditable: every change MUST be logged with timestamp_utc, rule_id, before/after, rationale, and risk_reduction.
+4) Config-driven: naming templates, weights, thresholds, and behaviour flags MUST be in YAML config; no magic numbers in code.
+5) Schema-flexible: input schema is UNSPECIFIED. Implement schema mapping to canonical fields and preserve unknown columns.
+6) Production-grade: strict validation, clear error messages, structured logging, safe file handling, and basic API security placeholder.
+7) No clarifying questions: if something is UNSPECIFIED, select safe defaults, clearly mark “UNSPECIFIED” in docs, and proceed.
+
+OUTPUTS REQUIRED FROM YOU (the coding assistant)
+- Generate the full repo with all required files.
+- Print a repo file-tree after generation.
+- If you can execute commands: run lint + tests + demo + zip packaging; else print exact commands and expected outputs.
+
+================================================================================
+SECTION A — Mandatory enterprise constraints and rule_ids
+================================================================================
+For each constraint: implement enforcement + validations + unit tests, and reference the rule_id in logs.
+
+C1. “Exactly one queue manager per application; applications connect only to their own QM.” -> RULE_C1_ONE_QM_PER_APP
+C2. “Producers write using remote queue definitions on their own QM and send via XMIT queues.” -> RULE_C2_REMOTE_QUEUE_AND_XMIT
+C3. “QM-to-QM communication via sender/receiver channel pairs with deterministic naming.” -> RULE_C3_CHANNEL_PAIR_NAMING
+C4. “Channels introduced only when required; no unnecessary channels in target.” -> RULE_C4_CHANNELS_ONLY_IF_REQUIRED
+C5. “Consumers read only from local queues on their own QM.” -> RULE_C5_CONSUMER_LOCAL_QUEUE_ONLY
+C6. “No orphan/unused MQ objects in target state.” -> RULE_C6_NO_UNUSED_OBJECTS
+
+================================================================================
+SECTION B — Inputs: authoritative CSVs (schema UNSPECIFIED)
+================================================================================
+B1) Canonical dataset filenames (safe defaults; remappable via schema_map.yaml):
+- queue_managers.csv
+- applications.csv
+- app_qm_connections.csv
+- queues.csv
+- channels.csv
+- flows.csv
+- regions.csv (optional)
+
+B2) Canonical required fields (minimum). If unmappable, fail fast with a precise error.
+queue_managers:
+- qm_id (required, unique)
+- region (optional; default "")
+applications:
+- app_id (required, unique)
+- app_name (optional; default "")
+- region (optional; default "")
+app_qm_connections:
+- app_id (required)
+- qm_id (required)
+queues:
+- queue_name (required)
+- qm_id (required)
+- queue_type (required enum: local|remote|xmit)
+- target_qm_id (required iff queue_type=remote)
+- target_queue_name (required iff queue_type=remote)
+- xmit_queue_name (optional; if missing derive deterministically)
+channels:
+- channel_name (required)
+- from_qm_id (required)
+- to_qm_id (required)
+- channel_type (required enum: sender|receiver)
+flows:
+- producer_app_id (required)
+- consumer_app_id (required)
+- business_event (UNSPECIFIED -> default "UNSPECIFIED_EVENT")
+- consumer_local_queue (optional; derived if missing)
+
+B3) CSV safe defaults (document as UNSPECIFIED defaults)
+- delimiter: ","
+- encoding: "utf-8"
+- dtype=str for all columns
+- keep_default_na=False and na_filter=False to preserve empty strings (document rationale)
+- per-file size limit: UNSPECIFIED default 20MB
+- per-file row limit: UNSPECIFIED default 5,000,000
+
+B4) Schema mapping approach (REQUIRED)
+Implement schema_map.yaml to map filenames and column names to canonical fields and to enable round-trip output with original filenames/columns.
+- Preserve unknown columns: do not drop; store as “extras” and round-trip into outputs.
+- Preserve unknown datasets: copy forward unchanged unless explicitly excluded.
+
+Example schema_map.yaml (create src/mqti/config/schema_map.example.yaml):
+version: 1
+files:
+  queue_managers:
+    filename: queue_managers.csv
+    columns: {qm_id: qm_id, region: region, metadata_json: metadata_json}
+  applications:
+    filename: applications.csv
+    columns: {app_id: app_id, app_name: app_name, region: region}
+  app_qm_connections:
+    filename: app_qm_connections.csv
+    columns: {app_id: app_id, qm_id: qm_id}
+  queues:
+    filename: queues.csv
+    columns:
+      queue_name: queue_name
+      qm_id: qm_id
+      queue_type: queue_type
+      target_qm_id: target_qm_id
+      target_queue_name: target_queue_name
+      xmit_queue_name: xmit_queue_name
+      extra_json: extra_json
+  channels:
+    filename: channels.csv
+    columns: {channel_name: channel_name, from_qm_id: from_qm_id, to_qm_id: to_qm_id, channel_type: channel_type}
+  flows:
+    filename: flows.csv
+    columns: {producer_app_id: producer_app_id, consumer_app_id: consumer_app_id, business_event: business_event, consumer_local_queue: consumer_local_queue}
+
+================================================================================
+SECTION C — Deterministic naming templates (config-driven)
+================================================================================
+Defaults (must be in defaults.yaml; configurable):
+QueueManager: QM_<APP_ID>
+Local Queue: LQ_<CONSUMER_APP_ID>_<BUSINESS_EVENT>
+Remote Queue: RQ_<PRODUCER_APP_ID>_TO_<CONSUMER_APP_ID>_<BUSINESS_EVENT>
+XMIT Queue: XMIT_<FROM_QM_ID>_TO_<TO_QM_ID>
+Sender Channel: <FROM_QM_ID>.TO.<TO_QM_ID>
+Receiver Channel: <TO_QM_ID>.FROM.<FROM_QM_ID>
+
+Provide a sanitiser (UNSPECIFIED defaults):
+- uppercase A-Z0-9_ only; replace others with "_"
+- max length 48; deterministic truncation with hash suffix if needed
+Document these defaults.
+
+================================================================================
+SECTION D — Canonical NetworkX graph model
+================================================================================
+Build two graphs:
+1) FullGraph: nodes = Applications, QMs, Queues, Channels; edges = connects_to, owns, flow, routes_to.
+2) QMGraph: nodes = QMs only; edges = required routing QM_P -> QM_C for each flow.
+
+Stable node IDs:
+- app:<app_id>
+- qm:<qm_id>
+- queue:<qm_id>:<queue_name>
+- channel:<from_qm_id>:<to_qm_id>:<channel_type>:<channel_name>
+
+Edge attribute "type" must be one of: connects_to, owns, flow, routes_to.
+
+Export graphs in node-link JSON:
+- reports/as_is/graph_full.json and graph_qm.json
+- reports/target/graph_full.json and graph_qm.json
+
+================================================================================
+SECTION E — Deterministic algorithm (implement EXACTLY)
+================================================================================
+E1) Ingestion and validation
+- Read CSVs using pandas with the safe defaults.
+- Apply schema_map if provided.
+- Validate required columns, enums, uniqueness, and referential integrity.
+- Produce a structured violations list:
+  violation_id, rule_id, severity (ERROR|WARN), object_ref, message, suggested_fix
+
+E2) Build as-is graphs and inventory
+- Build FullGraph and QMGraph from as-is.
+- Inventory summary counts and anomaly detection.
+
+E3) RULE_C1_ONE_QM_PER_APP deterministic assignment with tie-breakers
+For each app_id:
+- candidates = connected qms in app_qm_connections (dedupe)
+- if len(candidates)==1: assign
+- if len(candidates)>1: score each candidate:
+  score = (1000 * owned_queue_count_on_qm)
+        + (100  * same_region_match)
+        - (10   * disruption_penalty)
+
+Definitions:
+- owned_queue_count_on_qm = count of queues rows where qm_id=candidate
+- same_region_match = 1 if app.region == qm.region else 0 (missing => 0)
+- disruption_penalty = count of local queues on candidate whose name starts with "LQ_<APP_ID>_" (UNSPECIFIED heuristic; document)
+
+Tie-break order:
+1) higher score
+2) higher owned_queue_count_on_qm
+3) same_region_match==1
+4) lexicographically smallest qm_id
+
+If no candidates:
+- create QM_<APP_ID>, add to queue_managers, connect app->qm.
+
+Log every decision with all candidate scores.
+
+E4) RULE_C2/RULE_C3/RULE_C5 canonical producer->consumer transformation
+For each flow (P,C,E):
+- QM_P = assigned QM of P; QM_C = assigned QM of C
+- Ensure consumer local queue exists on QM_C:
+  LQ = flow.consumer_local_queue if present else LQ_<C>_<E>
+  Create local queue if missing.
+- Ensure XMIT exists on QM_P:
+  XMIT = XMIT_<QM_P>_TO_<QM_C>
+- Ensure remote queue exists on QM_P:
+  RQ = RQ_<P>_TO_<C>_<E>
+  remote queue must store target_qm_id=QM_C, target_queue_name=LQ, and xmit_queue_name=XMIT
+- Ensure channel pair exists only when QM_P != QM_C:
+  sender: <QM_P>.TO.<QM_C>   (from=QM_P,to=QM_C,type=sender)
+  receiver: <QM_C>.FROM.<QM_P> (from=QM_C,to=QM_P,type=receiver)
+- NEVER create per-queue channels. Exactly one channel pair per QM ordered pair.
+
+E5) RULE_C4 channel minimisation
+- required_edges = set of (QM_P,QM_C) for flows where QM_P!=QM_C
+- Target channels must be exactly:
+  - one sender per required edge
+  - one receiver per required edge
+- Remove channels not required.
+- If rename_nonstandard_objects=true (default):
+  - deterministically normalise names (rename or create-canonical+remove-old; choose one, document, and implement deterministically).
+
+E6) SCC-based cycle analysis and elimination
+- Compute SCCs on QMGraph. SCC size>1 => cycle.
+- Remove ONLY non-required/legacy edges (channels not in required_edges) to reduce cycles.
+- Never remove a required edge.
+- If SCC persists due to required edges, mark UNAVOIDABLE_DUE_TO_FLOWS.
+
+E7) RULE_C6 unused object detection and removal
+Used in target means:
+- QMs assigned to an app
+- local queues referenced/derived for flows
+- remote queues for flows
+- XMIT queues for required_edges
+- channel pairs for required_edges
+
+Remove everything else. Ensure no orphans.
+
+E8) Idempotency and determinism
+- Sort every output dataset deterministically.
+- Generate target twice => byte-identical exports.
+- Generate target from its own outputs => no-op (diff empty).
+
+================================================================================
+SECTION F — Complexity scoring (EXACT formula)
+================================================================================
+Compute for as-is and target:
+
+channel_count = number of channel rows (sender+receiver counted separately)
+multi_qm_app_violations = count apps connected to >1 qms (as-is); target must be 0
+avg_routing_hops = average shortest directed path length between QM_P and QM_C on QMGraph per flow (QM_P==QM_C -> 0; no path -> ERROR)
+cycle_scc_count = number of SCCs with size>1 on QMGraph
+unused_object_count = count unused objects (target must be 0)
+fanout_penalty = sum over QMs max(0, out_degree - FANOUT_THRESHOLD)
+fanin_penalty = sum over QMs max(0, in_degree - FANIN_THRESHOLD)
+total_mq_objects = num_qms + num_queues + num_channels
+
+Defaults:
+FANOUT_THRESHOLD=5
+FANIN_THRESHOLD=5
+
+ComplexityScore =
+(5 * channel_count)
++ (4 * multi_qm_app_violations)
++ (3 * avg_routing_hops)
++ (3 * cycle_scc_count)
++ (2 * unused_object_count)
++ (2 * fanout_penalty)
++ (2 * fanin_penalty)
++ (1 * total_mq_objects)
+
+Export breakdown JSON + Markdown table in report.
+
+================================================================================
+SECTION G — Deliverables: artefacts and formats (must generate)
+================================================================================
+For BOTH as-is and target:
+- reports/<as_is|target>/report.md and report.html (Jinja2)
+- reports/<as_is|target>/graph_full.json and graph_qm.json (node-link JSON)
+- reports/<as_is|target>/topology_full.svg + topology_full.png (Graphviz)
+- reports/<as_is|target>/topology_qm.svg + topology_qm.png (Graphviz)
+- reports/<as_is|target>/topology_interactive.html (PyVis)
+
+Audit outputs:
+- audit/decision_log.jsonl
+- audit/decision_summary.json
+- audit/diff.json + audit/diff.md
+- overrides.yaml support + validation
+
+CSV exports:
+- exports/target_csv/<same filenames as input after mapping>
+
+Packaging:
+- dist/mqti_hackathon_submission.zip containing code + sample data + generated artefacts + runbook
+
+================================================================================
+SECTION H — APIs and CLI
+================================================================================
+API security placeholder:
+- Require X-API-Key header for all endpoints; any non-empty accepted; missing/empty => 401 (document as placeholder only).
+
+FastAPI endpoints:
+POST /upload (multipart/form-data)
+- fields: queue_managers, applications, app_qm_connections, queues, channels, flows
+- optional: schema_map (yaml), overrides (yaml)
+Response:
+{ "upload_id":"<uuid>", "files_received":[...], "warnings":[] }
+
+POST /analyze
+Request: { "upload_id":"<uuid>" }
+Response: includes inventory, violations, complexity(as_is), artefact paths
+
+POST /generate-target
+Request:
+{ "upload_id":"<uuid>", "options": { "rename_nonstandard_objects": true, "remove_unused": true } }
+Response: includes target_id, complexity(as_is+target), reduction_percent, exports
+
+GET /export
+Query params: id=<upload_id|target_id>, which=as_is|target, type=csv|graph_json|viz_svg|viz_png|decision_log|report_html|report_md|zip
+Return file download.
+
+CLI (installable `mqti`):
+- mqti validate --input-dir <dir> [--schema-map schema_map.yaml]
+- mqti analyze --input-dir <dir> --out-dir reports/as_is
+- mqti generate --input-dir <dir> --out-dir reports/target --exports-dir exports/target_csv [--overrides overrides.yaml] [--rename-nonstandard true|false]
+- mqti visualize --input-dir <dir> --out-dir <dir>
+- mqti score --input-dir <dir>
+- mqti export --target-dir <dir> --format zip
+- mqti demo (runs scripts/demo.sh)
+
+================================================================================
+SECTION I — Testing (pytest) and verification contracts
+================================================================================
+Unit tests (parametrised) — at least one per rule_id:
+- test_RULE_C1_ONE_QM_PER_APP_enforced
+- test_RULE_C2_REMOTE_QUEUE_AND_XMIT_created
+- test_RULE_C3_CHANNEL_PAIR_NAMING_templates
+- test_RULE_C4_CHANNELS_ONLY_IF_REQUIRED_minimised
+- test_RULE_C5_CONSUMER_LOCAL_QUEUE_ONLY
+- test_RULE_C6_NO_UNUSED_OBJECTS
+
+Integration test (end-to-end):
+- run generate on data/sample_messy; assert output CSVs are byte-identical to data/expected_target (golden)
+- assert target complexity score < as-is
+- assert audit logs exist and contain changes
+
+Property-style tests (no extra deps required):
+- determinism: run generate twice => SHA256 of each output file matches
+- idempotency: generate using its own target outputs => diff empty and no changes
+
+API tests:
+- missing X-API-Key => 401
+- happy path upload->analyze->generate->export works
+
+CLI smoke tests:
+- analyze/generate work with tmp_path output dirs
+
+================================================================================
+SECTION J — Sample dataset and expected outputs (golden)
+================================================================================
+Create EXACT sample data in data/sample_messy/ and EXACT expected outputs in data/expected_target/ and test byte-for-byte.
+
+Provide sample_messy:
+- includes multi-QM app
+- includes unused QM and objects
+- includes legacy nonstandard queues/channels
+- includes extra/unknown columns that must be preserved
+
+Provide expected_target:
+- fixed to one QM per app
+- canonical RQ + XMIT + channel pairs
+- unused objects removed
+- channels only for required edges
+
+(Use the sample dataset from the prompt request itself; include the exact CSV snippets in the repo.)
+
+================================================================================
+SECTION K — File structure (exact list with purpose)
+================================================================================
+Create repo with all required files (minimum):
+- pyproject.toml (deps, build, ruff, pytest, console script mqti)
+- Dockerfile (installs system graphviz; runs uvicorn; supports CLI)
+- .github/workflows/ci.yml (ruff + pytest + build)
+- .github/copilot-instructions.md (repo-wide invariants)
+- README.md, DESIGN.md, JUDGE_RUNBOOK.md
+- src/mqti/... (schema, io, graph, rules, transform, analysis, audit, report, visualise, api, cli)
+- scripts/demo.sh, scripts/package_zip.py
+- data/sample_messy, data/expected_target
+- tests/unit, tests/integration
+
+In DESIGN.md include:
+- architecture diagram (Mermaid) + Graphviz DOT diagram generation
+- rule_id mapping to each module + unit test name
+- complexity formula + definitions
+- performance notes (SCC cycles; BFS per source for hops; avoid all-pairs)
+
+================================================================================
+SECTION L — Human-in-the-loop overrides
+================================================================================
+Implement overrides.yaml:
+- can pin app_id -> qm_id
+- can preserve/remove specific object keys
+Validate overrides; reject if violates RULE_C1..RULE_C6.
+
+================================================================================
+SECTION M — Acceptance criteria (must pass)
+================================================================================
+1) pip install -e . installs mqti
+2) mqti analyze produces as-is artefacts (json/svg/png/html/report)
+3) mqti generate produces target artefacts + exports + audit logs
+4) generated target CSVs match expected_target exactly
+5) unit tests cover RULE_C1..RULE_C6
+6) target complexity < as-is on sample dataset
+7) determinism + idempotency tests pass
+8) API tests pass; missing X-API-Key => 401
+9) Docker build passes; CI passes
+10) dist ZIP exists and contains required artefacts
+
+FINAL INSTRUCTIONS (must comply)
+- Generate the full repository and ALL files described.
+- Print a file tree after generation.
+- Run: ruff check . ; pytest -q ; bash scripts/demo.sh ; python scripts/package_zip.py
+  If you cannot execute, print these commands and explain expected outputs and where artefacts are created.
+END.
