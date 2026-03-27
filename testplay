@@ -1,0 +1,518 @@
+Here is the production-ready playbook in plain text format, ready for copy-paste. All markdown has been removed; sections are indicated with clear headers.
+
+---
+
+SSIS TO ADF MIGRATION PLAYBOOK – PRODUCTION READY v2.0
+
+1. OBJECTIVE
+
+Design a deterministic, verifiable system that:
+
+- Parses SSIS artifacts (.dtsx, .dtproj, .ispac, .params, .conmgr, SQL scripts, config files)
+- Produces a strict, schema-validated JSON output containing:
+  - Facts – extracted directly from artifacts with evidence links
+  - Plan – derived migration strategy, mappings, and target ADF/Terraform resources
+- Generates an Azure Data Factory (ADF) migration plan and corresponding Terraform (azurerm) deployment intent
+- Eliminates hallucination – every output entity must be traceable to source evidence
+- Ensures consistent output across runs (deterministic sorting and IDs)
+- Provides full validation coverage and clear failure modes
+
+2. EXECUTION CONTRACT
+
+2.1 STRICT FLOW
+
+DISCOVER → EXTRACT → NORMALIZE → CLASSIFY → MAP → VALIDATE → EMIT
+
+- Do not skip steps
+- Do not merge steps
+- Do not emit before VALIDATE
+
+2.2 ZERO HALLUCINATION RULE
+
+Every output entity (facts, plan, unsupported items) must include the following evidence fields:
+
+  "source_file": "path/to/artifact",
+  "source_type": "dtsx|ispac|conmgr|...",
+  "evidence_pointer": "XPath|line|component_id",
+  "evidence_confidence": 1.0
+
+If evidence cannot be located → DO NOT EMIT the entity; log an error in validation.errors.
+
+2.3 DETERMINISM
+
+- Sort order: path → object_type → name → id
+- ID generation: SHA256(path + object_type + native_id)
+- Same input → same output (IDs, ordering, structure)
+
+2.4 STRICT SEPARATION OF FACTS AND PLAN
+
+- Facts – extracted directly from artifacts (e.g., package names, tasks, connections)
+- Plan – derived from facts (e.g., migration mode, target ADF activities, Terraform resources)
+- Never mix the two categories in a single object.
+
+2.5 NO FREE TEXT MAPPING
+
+All mappings (control flow, data flow, etc.) must be objects with explicit properties. Free‑text strings (e.g., notes) are allowed only for human‑readable explanations, never for machine‑interpreted decisions.
+
+2.6 AMBIGUITY RULE
+
+If any entity or decision cannot be determined with confidence ≥ 0.8:
+
+- Set decision_status = "needs_human_review"
+- Provide reason_code from a controlled list
+- Include evidence_pointer pointing to the ambiguous location
+- Do not guess a mapping or mode
+
+2.7 SECRET HANDLING
+
+For connection managers, variables, or parameters that may contain secrets:
+
+- secret_extraction_status must be one of:
+  - not_present – no secret detected
+  - suppressed – secret present but redacted in output
+  - encrypted – secret is encrypted in source (e.g., EncryptSensitiveWithUserKey)
+  - externalized – secret is stored in Azure Key Vault or parameter file
+
+Secrets must not appear in any output field unless explicitly allowed by the target (e.g., Key Vault reference).
+
+3. MIGRATION STRATEGY
+
+Each package is classified into one of three modes:
+
+  lift_and_shift   - Contains script tasks, unsupported components, or complex logic that makes native rewrite risky
+                     Target: Azure‑SSIS Integration Runtime
+
+  adf_native       - Simple flow using only supported data flows, no scripts, and can be directly mapped to ADF pipelines
+                     Target: Azure Integration Runtime
+
+  hybrid           - Mixed workload – part of the package can be native, part must run on SSIS IR
+                     Target: Combination of ADF native and SSIS IR activities
+
+Default mode (if classification fails) = hybrid with decision_status = "needs_human_review".
+
+4. INPUT ARTIFACTS
+
+Supported artifact types:
+
+- .dtsx – package file (XML)
+- .dtproj – project file
+- .ispac – project deployment file (zip)
+- .params – project/package parameters
+- .conmgr – connection manager
+- .sql – SQL scripts referenced by tasks
+- Config files (.dtsConfig, .xml)
+
+Any artifact not parsed will be recorded in analysis_metadata.unparsed_artifacts[] with a reason.
+
+5. JSON OUTPUT STRUCTURE
+
+The output must adhere to this schema:
+
+{
+  "analysis_metadata": { ... },
+  "facts": { ... },
+  "plan": { ... },
+  "validation": { ... }
+}
+
+All fields are required.
+
+6. ANALYSIS METADATA
+
+{
+  "playbook_version": "2.0",
+  "analysis_timestamp_utc": "2025-03-28T10:00:00Z",
+  "scan_id": "<uuid>",
+  "artifact_inventory": {
+    "total": 0,
+    "parsed": 0,
+    "unparsed": []
+  },
+  "determinism": {
+    "ordering": "path_name_id",
+    "id_strategy": "sha256"
+  }
+}
+
+7. FACTS
+
+All facts are extracted directly from source artifacts.
+
+7.1 PROJECTS
+
+{
+  "project_id": "sha256(path+project+name)",
+  "name": "",
+  "path": "",
+  "deployment_model": "project|package",
+  "packages": ["package_id1", "package_id2"],
+  "evidence": { ... }
+}
+
+7.2 PACKAGES
+
+{
+  "package_id": "sha256(path+package+name)",
+  "name": "",
+  "path": "",
+  "protection_level": "DontSaveSensitive|EncryptSensitiveWithUserKey|...",
+  "has_sensitive_data": true|false,
+  "unreadable_sensitive": true|false,
+  "tasks": ["task_id1", "task_id2"],
+  "data_flows": ["data_flow_id1"],
+  "variables": [],
+  "parameters": [],
+  "connection_refs": ["connection_manager_id1"],
+  "evidence": { ... }
+}
+
+7.3 CONNECTION MANAGERS
+
+{
+  "connection_manager_id": "sha256(path+connection+name)",
+  "package_id": "",
+  "name": "",
+  "manager_type": "OLEDB|ADO.NET|ODBC|FILE|HTTP|...",
+  "provider_name": "",
+  "authentication_pattern": "SQLAuth|WindowsAuth|ServicePrincipal|...",
+  "network_scope": "on_premises|azure_vnet|public",
+  "requires_self_hosted_ir": true|false,
+  "is_deprecated_provider": true|false,
+  "secret_extraction_status": "not_present|suppressed|encrypted|externalized",
+  "evidence": { ... }
+}
+
+7.4 TASKS
+
+{
+  "task_id": "sha256(path+task+name)",
+  "package_id": "",
+  "name": "",
+  "task_type": "ExecuteSQL|ScriptTask|DataFlowTask|...",
+  "sql_category": "none|dml|ddl|stored_proc",
+  "uses_expression": true|false,
+  "uses_variables": true|false,
+  "requires_manual_rewrite": true|false,
+  "evidence": { ... }
+}
+
+7.5 PRECEDENCE CONSTRAINTS
+
+{
+  "constraint_id": "sha256(path+from+to)",
+  "from_task_id": "",
+  "to_task_id": "",
+  "evaluation_type": "expression|constraint|expressionAndConstraint|...",
+  "constraint_value": "Success|Failure|Completion",
+  "expression": "",
+  "logical_type": "AND|OR",
+  "evidence": { ... }
+}
+
+7.6 DATA FLOWS
+
+{
+  "data_flow_id": "sha256(path+dataflow+name)",
+  "package_id": "",
+  "task_id": "",
+  "sources": ["component_id1"],
+  "transforms": ["component_id2"],
+  "destinations": ["component_id3"],
+  "bulk_load_flags": [],
+  "evidence": { ... }
+}
+
+7.7 DATA FLOW COMPONENTS
+
+{
+  "component_id": "sha256(path+component+type)",
+  "role": "source|transform|destination",
+  "type": "OleDbSource|DerivedColumn|...",
+  "connection_manager_id": "",
+  "requires_conversion": true|false,
+  "unsupported": true|false,
+  "evidence": { ... }
+}
+
+7.8 SCRIPT ASSETS
+
+{
+  "script_id": "sha256(path+script+name)",
+  "type": "script_task|script_component",
+  "language": "C#|VB",
+  "complexity": "low|medium|high",
+  "manual_rewrite_risk": "low|medium|high",
+  "evidence": { ... }
+}
+
+8. PLAN
+
+The plan is derived from facts and must not contain raw extracted data.
+
+8.1 STRATEGY
+
+{
+  "default_mode": "hybrid",
+  "package_decisions": [
+    {
+      "package_id": "",
+      "selected_mode": "lift_and_shift|adf_native|hybrid",
+      "decision_status": "final|needs_human_review",
+      "reason_codes": ["script_task_present", "unsupported_component", ...],
+      "rationale": ""
+    }
+  ]
+}
+
+8.2 CONTROL FLOW MAPPINGS
+
+Maps each SSIS task to an ADF activity type.
+
+{
+  "task_id": "",
+  "source_task_type": "ExecuteSQL|ScriptTask|...",
+  "target_type": "Lookup|Script|...",
+  "decision_status": "final|needs_human_review",
+  "notes": ""
+}
+
+8.3 DATA FLOW MAPPINGS
+
+Maps each SSIS data flow component to an ADF data flow transformation.
+
+{
+  "component_id": "",
+  "source_component_type": "OleDbSource|DerivedColumn|...",
+  "target_type": "Source|DerivedColumn|...",
+  "decision_status": "final|needs_human_review",
+  "requires_manual_rewrite": true|false,
+  "notes": ""
+}
+
+8.4 TARGET ADF STRUCTURE
+
+{
+  "factory": {
+    "name": "",
+    "location": "",
+    "tags": {}
+  },
+  "integration_runtimes": [],
+  "linked_services": [],
+  "datasets": [],
+  "pipelines": [],
+  "triggers": []
+}
+
+INTEGRATION RUNTIMES
+
+{
+  "ir_name": "",
+  "ir_type": "azure|self_hosted|azure_ssis",
+  "required_for": ["linked_service1"],
+  "reason": ""
+}
+
+LINKED SERVICES
+
+{
+  "name": "",
+  "type": "AzureSqlDatabase|AzureBlobStorage|...",
+  "auth_type": "ManagedIdentity|ServicePrincipal|ConnectionString",
+  "ir_name": "",
+  "mapped_from_connection": ["connection_manager_id"],
+  "secret_source": "key_vault|parameter|environment"
+}
+
+PIPELINES
+
+{
+  "pipeline_name": "",
+  "mode": "lift_and_shift|adf_native|hybrid",
+  "activities": [
+    {
+      "activity_name": "",
+      "activity_type": "ExecuteSSISPackage|Lookup|...",
+      "depends_on": ["activity_name"],
+      "source_refs": ["task_id"]
+    }
+  ]
+}
+
+TRIGGERS
+
+{
+  "trigger_name": "",
+  "trigger_type": "schedule|storage_event|tumbling_window",
+  "pipelines": ["pipeline_name"],
+  "decision_status": "final|needs_human_review"
+}
+
+9. TERRAFORM (AZURERM)
+
+Terraform output must be production‑ready, with no placeholders. All resources must be fully specified.
+
+{
+  "provider": "azurerm",
+  "resources": [],
+  "modules": [],
+  "variables": [],
+  "outputs": [],
+  "state_risks": []
+}
+
+9.1 REQUIRED RESOURCES
+
+- azurerm_data_factory
+- azurerm_data_factory_integration_runtime_azure
+- azurerm_data_factory_integration_runtime_azure_ssis
+- azurerm_data_factory_integration_runtime_self_hosted
+- azurerm_data_factory_linked_service_*
+- azurerm_data_factory_pipeline
+- azurerm_data_factory_trigger_*
+- azurerm_key_vault (for secrets)
+- azurerm_monitor_diagnostic_setting
+
+9.2 RESOURCE STRUCTURE
+
+{
+  "terraform_type": "azurerm_data_factory_pipeline",
+  "logical_name": "migrated_pipeline_1",
+  "purpose": "migrated from package X",
+  "required": true,
+  "depends_on": ["azurerm_data_factory.main"],
+  "inputs": {
+    "name": "pl_migrated_pipeline_1",
+    "data_factory_id": "${azurerm_data_factory.main.id}",
+    "activities_json": "..."
+  }
+}
+
+9.3 MODULES
+
+Recommended standard modules:
+
+- adf_core – factory, IRs, linked services
+- adf_assets – pipelines, datasets, triggers
+- adf_connectivity – VNet, self‑hosted IR setup
+
+9.4 SECRET RULE
+
+If any linked service, dataset, or activity uses a secret:
+
+- The secret must be stored in Azure Key Vault
+- Terraform must reference it via azurerm_key_vault_secret and use the key_vault_secret_id attribute
+- The secret value must not appear in the Terraform state in plain text (use sensitive = true)
+
+10. UNSUPPORTED ITEMS
+
+Any object that cannot be migrated automatically must be listed here.
+
+{
+  "object_id": "",
+  "object_type": "task|data_flow_component|...",
+  "severity": "blocking|warning",
+  "manual_action_required": "",
+  "reason_code": "unsupported_component|script_task|...",
+  "recommended_pattern": "use_azure_function|rewrite_in_ssis_ir|..."
+}
+
+11. VALIDATION
+
+Validation is performed after all steps and before emitting JSON.
+
+{
+  "status": "pass|fail|partial",
+  "schema_valid": true|false,
+  "traceability_valid": true|false,
+  "coverage": {
+    "packages_total": 0,
+    "packages_classified": 0,
+    "tasks_total": 0,
+    "tasks_mapped": 0,
+    "components_total": 0,
+    "components_mapped": 0
+  },
+  "errors": []
+}
+
+11.1 FAIL CONDITIONS
+
+The validation fails (status = fail) if any of these occur:
+
+- Output JSON does not conform to the schema
+- Any fact or plan entity lacks mandatory evidence fields
+- Zero mappings exist and unsupported_items is empty
+- Any secret appears in plain text in the output (unless explicitly allowed)
+
+If validation fails, the output must not be emitted; instead, a failure object is returned (see Section 12).
+
+12. FAILURE MODE
+
+When a fatal error occurs (e.g., input not found, schema validation fails), output:
+
+{
+  "status": "partial",
+  "failure_mode": "validation_error|input_error|internal_error",
+  "blocked_sections": ["facts.packages", "plan.control_flow_mappings"],
+  "required_manual_actions": [
+    "Review package X: ambiguous classification due to unsupported component"
+  ]
+}
+
+This object is still valid JSON and must be returned.
+
+13. AGENT EXECUTION PROMPT (FOR THE MIGRATION TOOL)
+
+You are a production SSIS-to-ADF migration agent.
+
+Rules:
+1. Extract facts first – never derive before extraction.
+2. Attach evidence to every extracted entity.
+3. Do not hallucinate – if evidence is missing, record an error.
+4. Do not guess mappings – use needs_human_review for ambiguity.
+5. Separate facts and plan clearly in the output.
+6. Use structured mappings (objects) only.
+7. Classify each package according to the defined modes.
+8. Include Terraform intent with full resource specifications.
+9. Validate before output – if validation fails, produce a failure object.
+10. Output only valid JSON (no extra text).
+
+APPENDIX A: CONTROLLED REASON CODES
+
+Category             | Reason Code
+---------------------|-----------------------------------
+Classification       | script_task_present, unsupported_component, complex_logic, ambiguous
+Mapping              | no_direct_match, requires_human_review, unsupported_type
+Unsupported          | deprecated_provider, network_restricted, third_party_component
+Secret Handling      | secrets_not_externalized, encrypted_in_source
+
+APPENDIX B: EXAMPLE SNIPPET (FACTS – PACKAGE)
+
+{
+  "package_id": "5f4dcc3b5aa765d61d8327deb882cf99",
+  "name": "SalesETL",
+  "path": "projects/Sales/SalesETL.dtsx",
+  "protection_level": "EncryptSensitiveWithUserKey",
+  "has_sensitive_data": true,
+  "unreadable_sensitive": false,
+  "tasks": ["task_123", "task_456"],
+  "data_flows": ["df_789"],
+  "variables": [],
+  "parameters": [
+    {
+      "name": "ServerName",
+      "data_type": "String",
+      "sensitive": false
+    }
+  ],
+  "connection_refs": ["conn_abc"],
+  "evidence": {
+    "source_file": "projects/Sales/SalesETL.dtsx",
+    "source_type": "dtsx",
+    "evidence_pointer": "/DTS:Package/@ProtectionLevel",
+    "evidence_confidence": 1.0
+  }
+}
+
+END OF PLAYBOOK
