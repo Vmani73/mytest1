@@ -1,0 +1,18 @@
+Producer App: PAYMENTS
+
+Queue Manager: QM_PAYMENTS
+
+Remote Queue:
+RQ_PAYMENTS_TO_ORDERS
+
+XMIT Queue:
+XMIT_QM_PAYMENTS_TO_QM_ORDERS
+
+Channel:
+QM_PAYMENTS.TO.QM_ORDERS
+
+Target QM:
+QM_ORDERS
+
+Local Queue:
+LQ_ORDERS_CREATE
