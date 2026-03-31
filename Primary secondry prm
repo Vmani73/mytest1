@@ -1,0 +1,208 @@
+You are a senior architect and backend engineer. Do not guess, do not hallucinate, and do not skip steps. Build a production-grade system with clean structure, extensibility, and clear separation of concerns.
+
+### CONTEXT
+We have a DevX Agent integrated with VSCode that currently executes prompts from a centralized prompt library (Git repo). The current system is static and does not scale.
+
+We want to build a Prompt Intelligence System that can:
+1. Understand user intent
+2. Discover relevant prompts dynamically
+3. Rank them
+4. Select Primary and Secondary prompts
+5. Generate an execution plan
+6. Execute prompts in sequence
+
+---
+
+### OBJECTIVE
+Design and implement a Prompt Retrieval + Decision Engine.
+
+---
+
+### REQUIREMENTS
+
+#### 1. Prompt Metadata Model
+Create a structured schema for prompts.
+
+Each prompt must include:
+
+- id (string)
+- name (string)
+- description (string)
+- intent_tags (list of strings)
+- tech_stack (list of strings)
+- input_type (list)
+- output_type (list)
+- complexity (low/medium/high)
+- dependencies (list of prompt ids)
+- priority_hint (float 0–1)
+- success_rate (float 0–1)
+- prompt_template (string)
+
+Implement:
+- Python dataclass or Pydantic model
+- JSON storage format
+- Loader for prompt library from local repo
+
+---
+
+#### 2. Intent Analyzer
+Create a module that:
+- Takes user input (string)
+- Extracts:
+  - intent (e.g. "unit-test-generation")
+  - tech stack (e.g. "java", "python")
+  - task type (e.g. "code generation")
+
+Do NOT overuse LLM. Start with:
+- rule-based extraction
+- keyword mapping
+- fallback simple LLM call (optional)
+
+---
+
+#### 3. Prompt Retrieval Engine
+Implement a retrieval system that:
+
+Input:
+- user query
+- extracted intent metadata
+
+Output:
+- Top N matching prompts
+
+Approach:
+- Phase 1: keyword + tag matching
+- Phase 2: add embeddings (design for extension)
+
+Scoring factors:
+- intent_tags match
+- tech_stack match
+- keyword similarity
+
+Return top 5 prompts with scores.
+
+---
+
+#### 4. Ranking Engine (Hybrid Scoring)
+Implement scoring formula:
+
+score =
+  (0.5 * semantic_similarity)
++ (0.2 * metadata_match)
++ (0.2 * success_rate)
++ (0.1 * priority_hint)
+
+Design system so semantic_similarity can be plugged later.
+
+---
+
+#### 5. Prompt Decision Engine
+From retrieved prompts:
+
+- Select 1 Primary prompt:
+  - highest score
+- Select 2–3 Secondary prompts:
+  - supporting tasks (refinement, validation, enhancement)
+
+Rules:
+- avoid duplicate intent overlap
+- consider dependencies field
+
+Output format:
+
+{
+  "primary": "prompt_id",
+  "secondary": ["prompt_id_1", "prompt_id_2"]
+}
+
+---
+
+#### 6. Execution Planner
+Generate a plan:
+
+Example:
+
+Step 1: Execute primary prompt
+Step 2: Enhance output using secondary prompt A
+Step 3: Validate using secondary prompt B
+
+Return structured plan:
+
+{
+  "steps": [
+    {"step": 1, "prompt_id": "...", "role": "primary"},
+    {"step": 2, "prompt_id": "...", "role": "secondary"}
+  ]
+}
+
+---
+
+#### 7. Prompt Execution Engine
+Implement a simple execution engine:
+
+- Takes plan
+- Executes prompts sequentially
+- Passes output from one step to next
+- Supports LLM call abstraction (do NOT hardcode provider)
+
+---
+
+#### 8. Feedback & Learning (Basic Version)
+Log:
+- prompts used
+- execution result (success/failure)
+- user feedback (optional)
+
+Update:
+- success_rate (simple increment/decrement logic)
+
+---
+
+### PROJECT STRUCTURE
+
+Create clean modular structure:
+
+/prompt_engine
+  /models
+  /retrieval
+  /ranking
+  /decision
+  /planner
+  /executor
+  /utils
+  main.py
+
+---
+
+### OUTPUT EXPECTATION
+
+1. Complete working Python implementation
+2. Sample prompt library JSON
+3. Example run:
+
+Input:
+"Create unit tests for this Java class"
+
+Output:
+- detected intent
+- top prompts
+- selected primary/secondary
+- execution plan
+
+---
+
+### CONSTRAINTS
+
+- Do NOT skip modules
+- Do NOT hardcode logic into one file
+- Keep code extensible
+- No unnecessary complexity
+- No vague placeholders
+
+---
+
+### FINAL GOAL
+
+This system should evolve into an intelligent DevX Agent that dynamically selects and composes prompt workflows instead of relying on static instructions.
+
+Start implementation step-by-step. Show code for each module clearly.
