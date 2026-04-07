@@ -1,0 +1,149 @@
+You are a senior backend engineer working within an existing Python codebase. Do NOT create a new project structure. All code must integrate cleanly into the current repository.
+
+OBJECTIVE:
+Enhance the existing codebase by implementing a complete file ingestion lifecycle using external APIs. The implementation must reuse existing patterns, utilities, and architecture already present in the project.
+
+DO NOT:
+- Do NOT create a new root folder or new project
+- Do NOT redefine existing config, logging, or HTTP utilities if they already exist
+- Do NOT introduce parallel architecture
+
+INSTEAD:
+- Extend existing modules where appropriate
+- Reuse existing HTTP clients, config loaders, and logging frameworks
+- Follow current project conventions strictly
+
+---
+
+FUNCTIONAL REQUIREMENTS:
+
+1. FILE UPLOAD
+Create or extend a function:
+
+upload_file(file_path: str) -> str
+
+Responsibilities:
+- Validate file existence
+- Upload using multipart/form-data
+- Use existing HTTP client if available
+- Return file_id from response
+- Raise meaningful exception on failure
+
+---
+
+2. FILE INGESTION
+
+ingest_file(file_id: str, collection_id: str)
+
+- Trigger ingestion API
+- Validate inputs
+- Handle API errors properly
+
+---
+
+3. POLLING (CRITICAL)
+
+poll_ingestion_status(file_id: str, collection_id: str, timeout=300)
+
+- Poll every 5 seconds
+- Stop when status == "success"
+- Fail if:
+  - status == "failed"
+  - timeout exceeded
+- Must include retry and timeout handling
+
+---
+
+4. FETCH STATUS WITH FILTER
+
+get_files_by_status(collection_id: str, status_filter: str)
+
+- Support:
+  success, failed, in_progress
+- Validate inputs
+
+---
+
+5. DELETE OPERATIONS
+
+Implement:
+
+delete_from_vector_store(file_id, collection_id)
+delete_from_storage(file_id)
+
+- Use correct HTTP methods
+- Handle already-deleted cases gracefully
+
+---
+
+6. UPDATE FILE
+
+- Reuse ingestion logic
+- Ensure same file_id is used
+
+---
+
+7. ROLLBACK
+
+- Add header: rollback = "true"
+- Ensure safe execution and validation
+
+---
+
+ERROR HANDLING (MANDATORY):
+
+- Use existing exception framework if available
+- Otherwise define:
+  AuthenticationError
+  UploadError
+  IngestionError
+  PollingTimeoutError
+  APIResponseError
+
+Every API call must:
+- Validate status_code
+- Safely parse JSON
+- Raise meaningful errors
+
+---
+
+RETRY LOGIC:
+
+- Use existing retry mechanism if present
+- Otherwise implement retry with exponential backoff
+
+---
+
+LOGGING:
+
+- Use existing logging system
+- Log:
+  - request URL
+  - response status
+  - correlation id if available
+- DO NOT log sensitive data
+
+---
+
+SECURITY:
+
+- Do not expose tokens or API keys
+- Mask sensitive headers in logs
+
+---
+
+CONFIGURATION:
+
+- Use existing config system (env/config file)
+- Do NOT hardcode values
+
+---
+
+OUTPUT REQUIREMENT:
+
+- Modify or extend existing files only
+- Clearly indicate where code is added (file name + function)
+- Provide complete working functions (not snippets)
+- Ensure code is consistent with existing project style
+
+If something is unclear, infer from existing codebase patterns and document assumptions briefly.
