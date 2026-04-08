@@ -1,0 +1,373 @@
+# Playbook: verify_db_config_and_usage (Production Grade v4)
+
+---
+name: verify_db_config_and_usage
+version: "4.0"
+description: >
+  Production-grade agent playbook to validate Oracle, SQL Server, and MongoDB configurations
+  in CD repositories and verify correct, secure usage in CI repositories. Designed for
+  read-only indexed environments with strict evidence-based validation, zero hallucination,
+  deterministic execution, and JSON-only output.
+category: compliance
+complexity: high
+max_iterations: 10
+output_format: STRICT_JSON_ONLY
+---
+
+## 1. Inputs
+
+cd_repo_path: string (required)  
+ci_repo_path: string (required)  
+environment_hint: string (optional)
+
+Rules:
+- Agent MUST NOT clone or modify repositories
+- Only read via index or filesystem
+- No external calls allowed
+
+---
+
+## 2. Execution Model
+
+Iteration Strategy:
+- Phase 1: 1 iteration
+- Phase 2: max 3 iterations (per DB type)
+- Phase 3: 1 iteration
+- Phase 4: 1 iteration
+- Phase 5: continuous
+- Phase 6: 1 iteration
+
+Exit Conditions (STRICT):
+- No DB config found → EXIT with PASS
+- DB found but no CI usage → FAIL
+- All DB types processed once → STOP
+- No new findings → STOP
+
+---
+
+## 3. Environment Detection
+
+Priority:
+1. environment_hint  
+2. Path keywords (`/prod/`, `/dev/`, `/staging/`)  
+3. Branch (`main`, `master` → production)  
+4. Default → production  
+
+---
+
+## 4. Redaction Rules (STRICT)
+
+Replace:
+- (password|passwd|pwd) → password=<REDACTED>
+- (secret|token|key) → <REDACTED>
+
+Connection string masking (preserve structure):
+Example:
+jdbc:sqlserver://db.prod:1433;user=admin;password=abc  
+→ jdbc:sqlserver://<HOST>:<PORT>;user=<REDACTED>;password=<REDACTED>
+
+Never redact:
+- hostnames  
+- environment names  
+- service identifiers  
+
+---
+
+## 5. Phase 1: Inventory
+
+CD Repo Search:
+- **/*.ora  
+- **/*.{yaml,yml,json,properties,tf}  
+- regex: mongodb://|mongodb+srv://  
+- regex: jdbc:sqlserver://|Server=  
+
+CI Repo Search:
+- .github/workflows/*.yml  
+- .gitlab-ci.yml  
+- Jenkinsfile  
+- azure-pipelines.yml  
+- **/*.sh  
+
+Output Rules:
+- Record all queries in search_log  
+- If no results → explicitly "Not found"  
+- No assumptions  
+
+---
+
+## 6. Phase 2: CD Repository Validation
+
+### Oracle
+
+- TLS:
+  (PROTOCOL=tcps) must exist in production  
+  Missing → High  
+
+- DN Match:
+  SSL_SERVER_DN_MATCH=TRUE required  
+  Missing → High  
+
+- Wallet:
+  Must be from secret mount  
+  Static path → Medium  
+
+---
+
+### SQL Server
+
+Find:
+- jdbc:sqlserver://  
+- Server=
+
+Checks:
+
+- Encryption:
+  encrypt=true required (prod)  
+  Missing → Critical  
+
+- Certificate validation:
+  trustServerCertificate=true  
+  In production → Critical  
+
+- Failover:
+  MultiSubnetFailover=true  
+  Missing → High  
+
+---
+
+### MongoDB
+
+Find:
+- mongodb://  
+- mongodb+srv://  
+
+Checks:
+
+- TLS:
+  mongodb:// must contain tls=true  
+  Missing → High  
+
+- Insecure flags:
+  tlsAllowInvalidCertificates=true  
+  → Critical  
+
+- Auth source:
+  Missing → Low  
+
+---
+
+## 7. Phase 3: CI Repository Validation
+
+### DB Job Detection
+Search:
+flyway|liquibase|mongo|sqlcmd|psql|db:
+
+---
+
+### Secret Validation
+
+Critical if:
+- PASSWORD / SECRET / TOKEN in plaintext  
+- Not using secure injection  
+
+---
+
+### Script Analysis
+
+Search:
+- echo $PASSWORD  
+- printenv  
+- set -x  
+
+If found → Critical  
+
+---
+
+### Migration Config
+
+- Must use environment variables  
+- No hardcoded credentials  
+
+---
+
+## 8. Phase 4: Reconciliation
+
+Resolution Order:
+1. Direct match  
+2. Env variable mapping  
+3. Helm/Kustomize substitution  
+4. Secret injection  
+5. Unknown  
+
+Status Types:
+- Match  
+- Mismatch  
+- Missing  
+- Unknown  
+
+---
+
+## 9. Deduplication
+
+unique_key = db_type + issue_type + config_key  
+
+---
+
+## 10. Severity Adjustment
+
+if environment != production:  
+  downgrade severity by 1 level  
+
+---
+
+## 11. Confidence Scoring
+
+- High → direct evidence  
+- Medium → partial mapping  
+- Low → heuristic  
+
+---
+
+## 12. Status Calculation
+
+if any Critical → FAIL  
+elif any High → WARN  
+else → PASS  
+
+---
+
+## 13. Evidence Rules
+
+Each finding MUST include:
+- evidence_id  
+- repo (cd/ci)  
+- file_path  
+- line_ranges  
+- snippet_redacted  
+
+No evidence → NO finding  
+
+---
+
+## 14. Performance Guardrails
+
+- max_files_per_phase = 200  
+- max_file_size = 1MB  
+- skip_binary_files = true  
+
+---
+
+## 15. Output Schema (STRICT JSON ONLY)
+
+{
+  "executive_summary": "string",
+  "confidence_overall": "High|Medium|Low",
+  "scope": {
+    "cd_repo_path": "string",
+    "ci_repo_path": "string",
+    "environments_found": ["string"],
+    "db_types_found": ["oracle","sqlserver","mongodb"]
+  },
+  "db_inventory": [
+    {
+      "inventory_id": "string",
+      "db_type": "string",
+      "service_name": "string",
+      "environment_scope": "string",
+      "cd_config_locations": [
+        {
+          "file_path": "string",
+          "line_ranges": ["string"],
+          "config_type": "string"
+        }
+      ],
+      "ci_usage_locations": [
+        {
+          "file_path": "string",
+          "line_ranges": ["string"],
+          "pipeline": "string",
+          "stage": "string"
+        }
+      ]
+    }
+  ],
+  "cd_repo_assessment": {
+    "status": "PASS|WARN|FAIL",
+    "findings": [
+      {
+        "id": "string",
+        "severity": "Critical|High|Medium|Low",
+        "confidence": "High|Medium|Low",
+        "description": "string",
+        "evidence": "string"
+      }
+    ]
+  },
+  "ci_repo_assessment": {
+    "status": "PASS|WARN|FAIL",
+    "findings": []
+  },
+  "reconciliation": {
+    "alignment_table": [
+      {
+        "cd_key": "string",
+        "ci_key": "string|null",
+        "status": "Match|Mismatch|Missing|Unknown"
+      }
+    ],
+    "mismatches": []
+  },
+  "remediation_plan": [
+    {
+      "action_id": "string",
+      "priority": "P0|P1|P2",
+      "action": "string",
+      "mapped_findings": ["string"]
+    }
+  ],
+  "evidence_index": [
+    {
+      "evidence_id": "string",
+      "repo": "cd|ci",
+      "file_path": "string",
+      "line_ranges": ["string"],
+      "snippet_redacted": "string"
+    }
+  ],
+  "search_log": [
+    {
+      "repo": "cd|ci",
+      "query": "string",
+      "rationale": "string",
+      "hits": ["string"]
+    }
+  ]
+}
+
+---
+
+## 16. Remediation Priority
+
+- P0 → Remove plaintext secrets, disable insecure flags  
+- P1 → Enable TLS and validation  
+- P2 → Improve alignment and config quality  
+
+---
+
+## 17. Quality Rules (NON-NEGOTIABLE)
+
+- No hallucination  
+- No missing evidence  
+- No unredacted secrets  
+- No assumptions  
+
+Must be:
+- Deterministic  
+- Auditable  
+- Reproducible  
+
+---
+
+## 18. Execution Flow
+
+Inventory → CD Validation → CI Validation → Reconciliation → Evidence → JSON Output
