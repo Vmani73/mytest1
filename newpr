@@ -1,0 +1,296 @@
+You are a senior system architect and expert Python engineer.
+
+Your task is to build a production-grade, end-to-end system for:
+
+"Enterprise Knowledge Mining + Traceability + Artifact Generation using Knowledge Graph + RAG"
+
+This system MUST follow the exact architecture and constraints below. Do NOT simplify, do NOT skip components, do NOT hallucinate.
+
+------------------------------------------------------------
+1. SYSTEM OVERVIEW
+------------------------------------------------------------
+
+Build a platform that:
+
+- Ingests data from:
+  - Code repositories (Git: Python, Java, SQL, SAS)
+  - Documents (PDF, DOCX, Excel - BRD, rules, design docs)
+  - Data sources (DB schema, tables, columns)
+  - APIs / configs / YAML
+
+- Parses and extracts:
+  - Requirements
+  - Business rules
+  - Code entities (functions, classes)
+  - Data entities (tables, columns)
+  - Relationships (implements, calls, reads, validates)
+
+- Stores everything in:
+  - Knowledge Graph (Neo4j)
+
+- Supports:
+  - Natural language query (RAG)
+  - Artifact generation (DOCX, XLSX, diagrams)
+  - Full traceability (every output must map to source)
+
+------------------------------------------------------------
+2. TECH STACK (MANDATORY)
+------------------------------------------------------------
+
+Backend:
+- Python 3.10+
+- FastAPI
+- Celery (async workers)
+- Redis (queue + cache)
+
+Databases:
+- Neo4j (knowledge graph)
+- PostgreSQL (metadata)
+- Qdrant or pgvector (embeddings)
+
+Storage:
+- MinIO or S3 (raw + processed files)
+
+Parsing:
+- Tree-sitter (code parsing)
+- spaCy / transformers (NLP)
+
+LLM:
+- OpenAI / Claude (RAG layer)
+
+Frontend:
+- React or Next.js
+
+Auth:
+- JWT-based (extensible to SSO later)
+
+Deployment:
+- Docker
+- Kubernetes (Helm-ready)
+
+------------------------------------------------------------
+3. MICROSERVICES ARCHITECTURE
+------------------------------------------------------------
+
+Create the following services:
+
+1. API Gateway (FastAPI entry point)
+2. Ingestion Service
+3. Parsing + Enrichment Service
+4. Knowledge Graph Service
+5. RAG / LLM Service
+6. Artifact Generator Service
+7. Query Service
+8. Frontend UI
+
+Each service must be modular and independently runnable.
+
+------------------------------------------------------------
+4. FOLDER STRUCTURE (STRICT)
+------------------------------------------------------------
+
+backend/
+  api_gateway/
+  ingestion/
+  parser/
+  enrichment/
+  kg_service/
+  rag_service/
+  artifact_service/
+  query_service/
+  common/
+  config/
+
+frontend/
+  src/
+  components/
+  pages/
+  services/
+
+infrastructure/
+  docker/
+  k8s/
+  helm/
+
+------------------------------------------------------------
+5. INGESTION REQUIREMENTS
+------------------------------------------------------------
+
+Implement connectors for:
+
+- Git repos (clone + scan files)
+- Local document folder (PDF, DOCX, XLSX)
+- Optional: API ingestion
+
+Support:
+- Incremental ingestion (track versions)
+- Metadata tagging (source, file, version)
+
+------------------------------------------------------------
+6. PARSING REQUIREMENTS
+------------------------------------------------------------
+
+Code Parsing:
+- Use tree-sitter
+- Extract:
+  - functions
+  - classes
+  - method calls
+  - imports
+
+Document Parsing:
+- Extract text (PDF, DOCX)
+- NLP:
+  - Requirements
+  - Rules
+  - Conditions
+
+------------------------------------------------------------
+7. KNOWLEDGE GRAPH DESIGN
+------------------------------------------------------------
+
+Neo4j schema MUST include:
+
+Nodes:
+- Requirement
+- Rule
+- CodeArtifact
+- Function
+- DataTable
+- DataColumn
+- API
+- TestCase
+
+Relationships:
+- IMPLEMENTS
+- CALLS
+- READS
+- WRITES
+- VALIDATES
+- DEPENDS_ON
+
+Each node MUST store:
+- source
+- file
+- line number (if applicable)
+- confidence score
+
+------------------------------------------------------------
+8. RAG IMPLEMENTATION
+------------------------------------------------------------
+
+Implement hybrid retrieval:
+
+- Graph query (Cypher)
+- Vector search (Qdrant / pgvector)
+
+Pipeline:
+1. Parse user query
+2. Retrieve:
+   - graph data
+   - semantic chunks
+3. Build prompt with context
+4. Call LLM
+5. Return answer WITH citations
+
+STRICT RULE:
+- No hallucination
+- Every answer must reference source
+
+------------------------------------------------------------
+9. ARTIFACT GENERATION
+------------------------------------------------------------
+
+Generate:
+
+1. Requirements.docx
+2. DecisionHarvest.xlsx
+3. TraceabilityMatrix.xlsx
+4. Architecture diagrams (Mermaid / Graphviz)
+
+Use:
+- python-docx
+- openpyxl
+
+Each output MUST:
+- include traceability
+- include source references
+
+------------------------------------------------------------
+10. API CONTRACTS
+------------------------------------------------------------
+
+Implement endpoints:
+
+POST /ingest
+POST /parse
+POST /enrich
+POST /query
+POST /generate-artifact
+GET  /graph/query
+
+------------------------------------------------------------
+11. EVENT-DRIVEN FLOW
+------------------------------------------------------------
+
+Use Celery + Redis:
+
+Flow:
+Ingestion → Parsing → Enrichment → KG → Indexing → Ready
+
+------------------------------------------------------------
+12. SECURITY
+------------------------------------------------------------
+
+- JWT authentication
+- Role-based access (basic)
+- Audit logs for:
+  - ingestion
+  - queries
+  - generation
+
+------------------------------------------------------------
+13. OBSERVABILITY
+------------------------------------------------------------
+
+Add:
+- Logging (structured)
+- Metrics hooks (Prometheus-ready)
+
+------------------------------------------------------------
+14. CI/CD (BASIC)
+------------------------------------------------------------
+
+Provide:
+- Dockerfiles for each service
+- docker-compose for local run
+
+------------------------------------------------------------
+15. DELIVERABLES
+------------------------------------------------------------
+
+Generate:
+
+1. Complete backend code
+2. Working APIs
+3. Sample ingestion pipeline
+4. Neo4j schema + loader
+5. RAG pipeline implementation
+6. Artifact generator
+7. Minimal frontend UI
+8. README with setup steps
+
+------------------------------------------------------------
+IMPORTANT RULES
+------------------------------------------------------------
+
+- Do NOT skip any component
+- Do NOT oversimplify
+- Do NOT mock core logic
+- Code must be runnable
+- Follow modular architecture
+- Maintain production-grade structure
+
+------------------------------------------------------------
+
+Now generate the full implementation step-by-step.
