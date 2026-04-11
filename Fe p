@@ -1,0 +1,94 @@
+You are a senior frontend architect and UI/UX expert.
+
+Task: Refactor my existing UI into a clean, document-style professional layout similar to structured documentation tools (like Confluence / Word editor view).
+
+STRICT REQUIREMENTS:
+
+1. LAYOUT STRUCTURE
+- Create a centered content container (max-width: 900px–1100px)
+- Apply proper left and right margins (not full-width stretched UI)
+- Maintain vertical reading flow (top → bottom document style)
+- Add consistent spacing between sections (24px–32px)
+
+2. TYPOGRAPHY SYSTEM
+- Use clear hierarchy:
+
+  Title (if present):
+    font-size: 24px–28px
+    font-weight: 600–700
+
+  Section Headers (e.g., "Challenge", "Challenge Objectives"):
+    font-size: 18px–20px
+    font-weight: 600
+
+  Subsections (e.g., "A. Ingest existing artifacts"):
+    font-size: 16px–17px
+    font-weight: 600
+
+  Body text:
+    font-size: 14px–15px
+    line-height: 1.6–1.8
+
+- Use neutral professional font (Inter / Roboto / Segoe UI)
+
+3. CONTENT STYLING
+- Paragraphs should:
+  - Be left aligned
+  - Have proper spacing (margin-bottom: 12px–16px)
+  - Avoid dense blocks (increase readability)
+
+4. BULLET POINT SYSTEM
+- Implement proper nested bullet styling:
+  - Primary bullets: standard dot
+  - Indentation: 16px–24px
+  - Spacing between bullets: 8px–12px
+- Ensure bullets align vertically and are readable
+
+5. SECTION DIVISION
+- Add clear separation between sections:
+  - spacing OR
+  - subtle divider line (#eee or light gray)
+
+6. VISUAL CLEANLINESS
+- No heavy colors
+- White or very light background
+- Text color: #222 or #333
+- Secondary text: #555
+
+7. OPTIONAL ENHANCEMENTS (IMPORTANT)
+- Add subtle hover highlight for sections (optional)
+- Add sticky header for navigation (if applicable)
+- Add left-side outline/navigation panel (optional advanced feature)
+
+8. DATA STRUCTURE SUPPORT
+Ensure UI supports structured content like:
+
+- Sections (Challenge, Objectives)
+- Subsections (A, B, etc.)
+- Paragraphs
+- Bullet lists
+
+9. COMPONENTIZATION (VERY IMPORTANT)
+Break UI into reusable components:
+
+- DocumentContainer
+- SectionHeader
+- SubSectionHeader
+- Paragraph
+- BulletList
+- BulletItem
+
+10. RESPONSIVENESS
+- Maintain readability on smaller screens
+- Reduce padding but keep structure intact
+
+OUTPUT EXPECTATION:
+- Refactor existing UI code (do NOT create a new project)
+- Apply changes within current structure
+- Keep code clean, modular, production-ready
+- No unnecessary libraries
+
+Focus on clarity, readability, and professional documentation-style UI.
+Avoid flashy UI, gradients, or unnecessary animations.
+
+Think like building a UI for enterprise documentation system.
