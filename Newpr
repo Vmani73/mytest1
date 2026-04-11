@@ -1,0 +1,70 @@
+Refactor the existing backend system to remove all embedding-related logic and shift the architecture to a format-agnostic knowledge extraction pipeline.
+
+1. Remove Embedding Logic
+- Remove or disable _encode_batch_async and all embedding/vector API calls.
+- Remove dependency on embedding endpoints and related retry logic.
+- Ensure existing ingestion and search flows continue to work without embeddings.
+
+2. Multi-Format Ingestion Layer
+- Extend ingestion to support multiple input formats:
+  - Excel (.xlsx, .xls)
+  - PDF (.pdf)
+  - Word (.docx)
+  - CSV (.csv)
+  - Plain text / logs
+- Implement format-specific parsers:
+  - Excel: structured sheet parsing
+  - PDF/Word: text extraction with section awareness
+  - CSV: row/column mapping
+- Normalize all extracted data into a common intermediate structure.
+
+3. Unified Knowledge Model
+- Convert parsed content into a structured JSON model capturing:
+  - entities (fields/attributes)
+  - rules (validations, conditions)
+  - transformations (imputations, derivations)
+  - decisions (strategy/eligibility logic)
+  - outputs
+  - relationships between all components
+- Ensure model is format-independent.
+
+4. Traceability Engine
+- Build mappings:
+  - input/source → rules → transformations → decisions → outputs
+- Support reverse trace:
+  - output → contributing inputs and rules
+- Store traceability in structured format for API consumption.
+
+5. Refactor Existing APIs (do not redesign from scratch)
+- Update ingestion endpoint to:
+  - accept multiple file formats
+  - trigger parsing + model building
+- Update retrieval endpoints to return:
+  - structured knowledge model
+  - traceability mappings
+- Keep existing working endpoints intact.
+
+6. Artifact Generation
+- Generate artifacts from the unified model:
+  - BRD (structured requirement document)
+  - Decision/Rule workbook
+  - Traceability Matrix
+- Ensure artifacts are derived from model, not raw files.
+
+7. Maintain Stability
+- Do NOT break existing:
+  - file upload flow
+  - ingestion pipeline (where working)
+  - search functionality
+- Only remove embedding-related parts and refactor processing.
+
+8. Modular Structure
+- parsers/ → format-specific extractors
+- normalizer/ → converts raw data to common structure
+- model_builder/ → builds unified knowledge model
+- traceability/ → mapping engine
+- artifacts/ → document generation
+- api/ → FastAPI endpoints (refactored)
+
+Goal:
+Transform the system into a format-agnostic knowledge extraction and traceability engine that works across Excel, PDF, Word, CSV, and text inputs without relying on embeddings.
