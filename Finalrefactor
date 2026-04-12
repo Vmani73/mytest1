@@ -1,0 +1,245 @@
+Executive Summary  
+The proposed refactoring shifts the focus from vector‐based search to an **end‐to‐end Decision Intelligence Engine** that ingests messy enterprise inputs (Excel/PDF/Word/CSV), extracts structured decision logic, and provides full traceability and explainability. Key priorities are: **remove embeddings/vector modules**, **enhance parsers for all formats**, **define a unified JSON model for decision rules**, **implement traceability graph/queries**, and **generate clear business artifacts** (BRD, decision workbook, traceability matrix). FastAPI endpoints will be reworked for file upload, processing, and artifact delivery (using `UploadFile`, JSON responses, and `HTTPException` for errors【16†L798-L801】). A concise, demo‐focused workflow is emphasized: upload a file, extract logic, show traces, answer “Why?” questions, and output generated documents. Future extensions (MCP Apps or agentic layers) can plug in for UI/UX, but are **deferred until after core logic is solid**.  
+
+## 1. Refactor Inventory and Priorities  
+- **Remove Embedding/Vector Logic (Top Priority):** Eliminate any code that calls embedding APIs or stores vectors. This includes Tachyon embedding endpoints or similar. The system will no longer index vectors or use LLM embeddings, avoiding “black box” search. Rationale: focus on rule extraction (no hallucination) and simplify architecture.  
+- **Refactor Ingestion Module:** Modify the ingestion/upload handlers to use format-specific parsers (Excel/PDF/Word/CSV) instead of generic text extraction. Prioritize reliable libraries (e.g. Pandas, PyMuPDF, python-docx). Ensure file uploads use `UploadFile` (FastAPI)【16†L798-L801】.  
+- **Refactor Search/Query Module:** If search currently depends on embeddings, replace it with keyword or field-based search using the unified JSON data. Adjust query endpoints to operate over structured data. This may involve deprecating Tachyon-specific calls.  
+- **Code Modules to Update:** Inventory likely includes modules like `ingest.py` (file handling), `search.py` (query logic), `app.py` (FastAPI routes), and any utility classes for embeddings or vector storage. Identify and remove or disable: e.g., `vectorizer.py`, `embed_client.py`, or any Tachyon SDK usage.  
+- **APIs to Change:** The existing `/upload` or `/ingest` endpoint must parse files; `/search` may need reimplementation or deprecation. Any `/embed` endpoints should be removed. Update `/schema` or `/knowledge` endpoints to return the extracted JSON model.  
+- **Connector Cleanup:** Remove connectors to LLMs or non-essential services. Ensure no secret/API key is required for removed components. For example, drop any Tachyon API keys if vector search is unused.  
+- **Priority Rationale:** Focus first on core logic (parsing and model extraction). Removing embedding gives immediate clarity and reduces error sources. Next prioritize parsing for each file type, since without parsing there is no input. Lower priority is UI enhancements (MCP), which can wait.
+
+## 2. Unified JSON Knowledge Schema  
+Design a **format-agnostic JSON schema** that captures all decision logic from any input. For example:
+```jsonc
+{
+  "fields": [
+    {"name": "BUSINESS_ECN", "type": "string", "description": "...", "source": {"sheet":"Input", "column":"BUSINESS_ECN"}},
+    {"name": "BATCHMODE",    "type": "boolean", "description": "...", "source": {"sheet":"Input", "column":"BATCHMODE"}},
+    // ... other input fields
+  ],
+  "validations": [
+    {"field": "BUSINESS_ECN", "condition": "not null", "error": "Missing BUSINESS_ECN"},
+    {"field": "BATCHMODE",    "condition": "in [A,M,D]", "error": "Invalid Batch Mode"},
+    // ... other validation rules
+  ],
+  "imputations": [
+    {"field": "LOAN_AMOUNT", "default": 0, "condition": "if null"},
+    // ... imputation rules
+  ],
+  "derivations": [
+    {"output": "TOTAL_DUE", "formula": "SUM(payments) - discount", "inputs": ["payments", "discount"]},
+    // ... derived fields
+  ],
+  "strategy_rules": [
+    {"if": "credit_score >= 700", "then": "strategy = 'Standard'"}, 
+    {"if": "credit_score < 700",  "then": "strategy = 'Review'"}
+    // ... other strategy rules
+  ],
+  "decisions": [
+    {"output": "approve", "conditions": ["strategy == 'Standard'", "no major issues"]},
+    {"output": "reject",  "conditions": ["violations exist"]}
+  ],
+  "outputs": [
+    {"name": "ERROR_MESSAGE", "type": "string", "description": "Final error or status message"},
+    {"name": "RESULT",        "type": "string", "description": "Approved/Rejected outcome"}
+    // ... final outputs
+  ],
+  "flows": [
+    {"from": "BUSINESS_ECN", "to": "validate", "type": "forward"},
+    {"from": "validate", "to": "BATCHMODE_check", "type": "forward"},
+    {"from": "BATCHMODE_check", "to": "derive", "type": "forward"},
+    {"from": "derive", "to": "Decision", "type": "forward"}
+    // ... etc for reverse tracing with "type": "backward"
+  ]
+}
+```
+This schema captures **attributes, rules, and outputs** in one place. All formats map into it via their fields (see table below). Each entry includes its **source location**, enabling traceability back to the original Excel sheet or document. All types and descriptions are normalized (e.g. boolean vs string).
+
+| **Field**         | **Excel**                     | **PDF**                           | **Word**                           | **CSV**               | **Code**                            | **Type**    | **Description**                               |
+|-------------------|-------------------------------|-----------------------------------|------------------------------------|-----------------------|-------------------------------------|-------------|-----------------------------------------------|
+| BUSINESS_ECN      | Sheet `01_Input`, Col `BUSINESS_ECN` | Look for “Business ECN” header or label on page | Look for “Business ECN” label in doc | Column `BUSINESS_ECN` | (if in config or constant)            | string      | Business identifier (external contract no.)  |
+| BATCHMODE         | Sheet `01_Input`, Col `BATCHMODE`    | Find “Batch Mode” or similar      | Find “Batch mode” text in doc      | Column `BATCHMODE`    | (e.g., DEFAULT_BATCHMODE in code)    | string      | Processing mode flag (e.g. “A”/“M”/“D”)    |
+| GUARANTOR         | Sheet `01_Input`, Col `GUARANTOR`    | Find “Guarantor(s)” label if present | Look for “Guarantor” list/table    | Column `GUARANTOR`    | (parsing code for guarantor field)   | array of objects | Details of guarantor contacts           |
+| ERROR_MESSAGE     | Sheet `Final_Output`, Col `ERROR_MESSAGE` | “Error Message” in output section | “Error Message” text or comment   | (no CSV; output generated later) | In exception handlers or constants | string      | Final error/status message                   |
+
+This table shows how each logical field is obtained from different formats. For Excel/CSV, column names map directly (via Pandas【30†L125-L133】【33†L130-L132】). For PDF/Word, simple keyword heuristics are used to locate the text (e.g. regex on content). The unified JSON schema then holds each field under its standard name, type and source reference.  
+
+## 3. Parsers and Normalization  
+Implement **format-specific parsers** that feed into the unified schema. For each type:  
+
+- **Excel (`.xlsx/.xls`)**: Use `pandas.read_excel`【30†L125-L133】 or `openpyxl`. Support multiple sheets (e.g. input, validation). Normalize types (e.g. convert numeric to int/float, trim whitespace). **Edge Cases:** merged cells, missing headers, multiple header rows (use `header=None` in Pandas and assign names). **Heuristics:** if sheet names vary slightly, match known keywords (contains “input”, “validation”). **Confidence:** High (structured data). If parsing fails (bad file), return HTTP 400 with message.  
+- **CSV/TXT (`.csv/.txt`)**: Use `pandas.read_csv`【33†L130-L132】 or Python’s `csv.reader`. Handle delimiter variations (comma vs semicolon) via sniffing. **Edge Cases:** missing columns, extra blank lines. **Heuristics:** If header line present, use `header=0`; else treat first row as data and assign default headers. **Confidence:** High for structured CSV. If parse error, return descriptive error.  
+- **PDF (`.pdf`)**: Use **PyMuPDF (fitz)** for text extraction【22†L124-L132】. For tables, use `page.find_tables()` to detect tables and load into DataFrames【22†L241-L245】. **Edge Cases:** scanned/PDF images – apply OCR (e.g. Tesseract) if no text. **Heuristics:** If structured (key: value pairs), use bounding-box method (PyMuPDF’s `page.get_text("blocks")` and align keys to values). **Confidence:** Medium – depends on PDF quality. Provide confidence score (e.g. 0.8 if OCR used, 0.95 if text). Record page number and region in metadata.  
+- **Word (`.docx`)**: Use **python-docx**【28†L103-L105】 to read paragraphs and tables. Iterate `Document.paragraphs` and `tables`. **Edge Cases:** complex formatting (non-`.docx` or embedded objects) – skip images. **Heuristics:** Identify field labels by bold text or table headers (e.g., find paragraph text matching known field names). **Confidence:** Medium-high; usually text is accessible.  
+- **Normalization:** After raw extraction, map all values to canonical types: booleans (`"True"/"False"` to booleans), numbers, date strings (ISO format). Strip units/currency. Clean text (remove stray characters). Compute confidence per field (1.0 for exact matches, lower if heuristics used).  
+- **Error Handling:** If a required field cannot be found, add a warning in JSON. If parsing fails, return HTTP error via FastAPI (e.g. `HTTPException(status_code=422)`).  
+
+## 4. Traceability Data Model and API  
+Traceability is modeled as a directed graph of **nodes** (fields, rules, operations) and **edges** (data flow or rule application). Use a JSON graph or adjacency list. For example:  
+```json
+{
+  "nodes": [
+    {"id": "BUSINESS_ECN", "type": "Field"},
+    {"id": "Valid_BUSINESS_ECN", "type": "ValidationRule"},
+    {"id": "Derive_TotalDue", "type": "Derivation"},
+    {"id": "Decision_Approve", "type": "DecisionOutcome"}
+  ],
+  "edges": [
+    {"from": "BUSINESS_ECN", "to": "Valid_BUSINESS_ECN"},
+    {"from": "Valid_BUSINESS_ECN", "to": "Derive_TotalDue"},
+    {"from": "Derive_TotalDue", "to": "Decision_Approve"}
+  ]
+}
+```
+**Forward Trace Example (JSON):** Tracing from an input field to outputs:  
+```json
+{"trace": [
+   {"step": 1, "from": "BUSINESS_ECN", "to": "Valid_BUSINESS_ECN", "description": "Input field to validation"},
+   {"step": 2, "from": "Valid_BUSINESS_ECN", "to": "Derive_TotalDue", "description": "Passed validation to derivation"},
+   {"step": 3, "from": "Derive_TotalDue", "to": "Decision_Approve", "description": "Derived values to decision outcome"}
+]}
+```  
+**Reverse Trace Example (JSON):** From an output back to inputs:  
+```json
+{"trace": [
+   {"step": 1, "from": "Decision_Approve", "to": "Derive_TotalDue", "description": "Output depends on derivation"},
+   {"step": 2, "from": "Derive_TotalDue", "to": "Valid_BUSINESS_ECN", "description": "Derivation uses validated input"},
+   {"step": 3, "from": "Valid_BUSINESS_ECN", "to": "BUSINESS_ECN", "description": "Validation applied to original field"}
+]}
+```  
+These traces allow answering “Why?” questions by following links. Implement a **Traceability API** endpoint (e.g. `/trace`) where the request is `{ "from": "BUSINESS_ECN", "direction": "forward" }` and response includes the JSON trace.  
+
+**Mermaid Charts:** Visualize forward/backward flowcharts to aid understanding. For example:  
+```mermaid
+flowchart LR
+  BUSINESS_ECN --> Valid_BUSINESS_ECN --> Derive_TotalDue --> Decision_Approve
+```  
+(The above “graph LR” shows a left-to-right forward chain.) For reverse tracing, arrows can be inverted or styled dashed to denote reverse direction:  
+```mermaid
+flowchart TB
+  Decision_Approve -.-> Derive_TotalDue -.-> Valid_BUSINESS_ECN -.-> BUSINESS_ECN
+```  
+(Use dotted arrows (`-.->`) for reverse trace【45†L1169-L1174】.) This aligns with common practice of using **solid arrows for parent→child** and **dotted for trace links**【40†L85-L89】.  
+
+The data model underpins a **Traceability Matrix**: a table (or graph) linking every input, rule, and output. By design, each requirement/rule can be traced both forward (to outputs) and backward (to its source)【12†L470-L478】. This satisfies compliance needs (as in NASA/PM standards) and makes auditing decisions easy.
+
+## 5. Artifact Generation (BRD, Workbook, Matrix)  
+Produce three key artifacts from the knowledge model:  
+
+- **Business Requirements Document (BRD):** Automate a BRD with sections: *Project Overview*, *Goals*, *Scope*, *Stakeholders*, *Requirements*, *Assumptions/Risks*, etc. Map model content to BRD: e.g., list each extracted **field and rule as requirements**, include *scope* from strategy rules, *stakeholders* could be derived from context or left generic. Use our schema to fill “requirements” (rules become requirement statements). For example, the **BRD content** might include:  
+  - *Executive Summary*: “This project extracts decision logic from legacy files and provides an explainable decision model.”  
+  - *Scope and Objectives*: List all high-level goals (e.g. “Integrate Excel/PDF sources; Auto-generate decision logic; Full traceability”).  
+  - *Requirements*: For each rule or field, an item like “The system shall validate **BUSINESS_ECN** is non-empty” (from a validation rule), “The system shall impute missing **LOAN_AMOUNT** with 0” (from imputations), etc.  
+  - *Stakeholders*: e.g. “Business Analysts”, “Regulators” (based on domain), possibly placeholders.  
+  - *Risks*: e.g. “Incorrect parsing of PDF may affect rule accuracy.”  
+
+  According to official guidance, a BRD **“outlines a project and includes overview, goals, scope, stakeholders, requirements…”**【35†L72-L75】. Our BRD template will mirror those sections. **Sample BRD excerpt:**  
+  > **Business Requirements Document**: “The system shall load Excel/Word/PDF inputs, extract business rules (e.g. *If BATCHMODE != ‘A’, then reject*) with 95% accuracy, and allow user queries. Full traceability is required to answer audit questions.”  
+
+- **Decision Workbook (Excel):** A structured workbook (e.g. `.xlsx`) summarizing decision logic. This might contain sheets like *Attributes*, *Validation Rules*, *Derivation Formulas*, *Strategy Table*, *Outputs*. Each sheet is populated from the JSON model. For example, a “Decision Table” sheet listing each field, its allowed values or condition. This is akin to a “Decision Harvest” workbook. We can output columns matching the unified schema. For instance:  
+  | Field           | Type    | Description                 | Validation           | Imputation | Derivation      |
+  |-----------------|---------|-----------------------------|----------------------|------------|-----------------|
+  | BUSINESS_ECN    | string  | Business ECN identifier     | required, no null    | –          | –               |
+  | BATCHMODE       | string  | Batch mode flag (A/M/D)     | must be in [A,M,D]   | “A” if null| –               |
+  | LOAN_AMOUNT     | number  | Loan amount in USD          | ≥ 0                  | 0 if null  | –               |
+  | INTEREST_RATE   | number  | Annual interest rate (%)    | 0–100                | –          | derived (via formula) |
+  | CREDIT_SCORE    | integer | Customer credit score       | [300–850]            | median(800)| –               |
+  | Decision Logic: If (`CREDIT_SCORE<600`) then `reject`, else `approve` |         |                            |                      |            |                 |  
+
+  (Each row = one “field” or one “decision rule”.) This Excel workbook is a **human-friendly view**. It directly maps the JSON model fields/values into cells. Each field’s name, type, description, plus rule logic is included. We should cite that such tabular artifacts help clarity (traceability matrix practice suggests spreadsheets for linking items【12†L470-L478】).  
+
+- **Traceability Matrix:** A matrix (usually a table) linking inputs to rules to outputs. For example:  
+  | **Input/Requirement**       | **Validation Rule**          | **Derived Field**     | **Output**         |
+  |-----------------------------|------------------------------|----------------------|--------------------|
+  | BUSINESS_ECN present        | (BUSINESS_ECN != null)       | –                    | “Missing ECN” error|
+  | LOAN_AMOUNT missing         | –                            | Impute 0 into LOAN_AMOUNT| –                |
+  | BATCHMODE invalid           | (BATCHMODE ∈ {A,M,D})        | –                    | “Invalid Batch” error |
+  | Derived Risk = function(...)| –                            | “High Risk” flag     | –                  |  
+
+  This traces each **requirement/field** through any validation or derivation and any resulting output. The exact mapping rules: *for each edge in the JSON trace graph, create a row linking the source node to target nodes.* A traceability matrix is essentially a tabular form of the directed graph. It satisfies the idea that “bidirectional links… allow you to trace requirements forward (to implementation) and backward (to origin)”【12†L470-L478】.  
+
+**Mapping Rules Table (Model→Artifact):** Summarize how JSON maps to each artifact. For example:  
+
+| JSON Section    | BRD Section            | Workbook Sheet         | Trace Matrix Column  |
+|-----------------|------------------------|------------------------|----------------------|
+| `fields`        | Requirements (Items)   | Attributes sheet (rows)| “Input/Req” column    |
+| `validations`   | Requirements (Items)   | Validation sheet       | “Validation Rule” column |
+| `imputations`   | (as needed)            | Imputation sheet       | (links to input)       |
+| `derivations`   | Requirements           | Derivation sheet       | “Derived Field” col.  |
+| `decisions`     | Requirements/Scope     | Decision Logic sheet   | (could map to strategy) |
+| `outputs`       | Requirements (Outputs) | Output sheet           | “Output” column      |  
+
+This shows each JSON element’s role. In the **sample BRD excerpt** above, we used language from the model (“system shall…”), aligning with BRD best practices【35†L72-L75】.  
+
+## 6. FastAPI Endpoint Design  
+Refactor existing FastAPI app to handle new flows. Key changes:  
+- **/upload (POST):** Accepts file(s) via `UploadFile`. Use `File()` to allow multiple uploads if needed【16†L798-L801】. The handler reads the file byte stream and calls the appropriate parser based on extension. Response: 202 Accepted (processing) or immediate JSON with status.  
+- **/parse (POST)** or reuse /upload: After upload, trigger parsing. Could be same endpoint (sync) or two-step (first upload, then parse). Returns the **knowledge JSON** (as above). Example request: `curl -F file=@data.xlsx http://.../upload`. Response example: `{"fields": [...], "validations": [...], ...}`. Use `HTTPException` for errors (e.g., unsupported file type) and return JSON `{"detail": "Error message"}`【38†L532-L540】.  
+- **/trace (GET/POST):** Given a `node` and direction, returns JSON trace as designed above. Example: `GET /trace?from=BUSINESS_ECN&direction=forward` returns JSON with steps. Use 400 error if node not found.  
+- **/artifacts/brd (GET):** Returns generated BRD document (e.g. as PDF or markdown). Example request `GET /artifacts/brd`. Response: either download file or JSON with content. Could use `fastapi.responses.FileResponse` for a PDF/word. Return 500 if generation fails.  
+- **/artifacts/workbook (GET):** Returns the Excel workbook (Decision Harvest). `FileResponse` with `.xlsx`.  
+- **/artifacts/traceability (GET):** Returns the traceability matrix (e.g. as CSV or HTML table).  
+- **Error Handling:** Use FastAPI’s `HTTPException` to send errors. For example, if upload has wrong format:  
+   ```python
+   from fastapi import HTTPException, status
+   if not allowed_extension:
+       raise HTTPException(status_code=415, detail="Unsupported file type")
+   ```  
+  Use `try/except` around parsing and raise `HTTPException(400)` on failure. If needed, define custom exception handlers (FastAPI docs show how【38†L532-L540】).  
+- **Existing Endpoints to Refactor:** Likely `/search`, `/embed`, `/vector`; remove or update them. Rename or add `/knowledge` for schema retrieval. Use Pydantic models for request/response schemas for clarity.  
+- **Examples:**  
+  - *Request:* `POST /upload` with form-data `file=decision.xlsx`  
+    *Response:* `{"status":"processing","task_id":"1234"}` or immediate schema.  
+  - *Request:* `GET /trace?from=OUTPUT_ERROR&direction=reverse`  
+    *Response:* `{"trace":[ ...steps as above...]}`.  
+  - *Errors:* `{"detail":"File is not a valid Excel."}` with `400 Bad Request`.  
+
+## 7. Demo Script (Hackathon Focus)  
+Keep the demo **concise and value-driven**. Steps:  
+1. **Upload Input:** User uploads a messy enterprise file (Excel/PDF/CSV). (Endpoint `/upload`.) *Expect:* Confirmation that parsing starts.  
+2. **Extraction Output:** System displays or returns the **structured model** (e.g. print JSON or show web UI). Highlight key fields and rules extracted (e.g. list of rule descriptions). Show an example like “Found 3 validation rules, 2 imputations, 1 derivation.”  
+3. **Trace Example:** Click or query a field (e.g. BUSINESS_ECN). System shows a **forward trace** (via JSON or Mermaid chart). E.g. show flowchart: Input→Validation→Decision. Also show a **reverse trace** from final output back to inputs. This demonstrates transparency.  
+4. **Answer “Why?”:** Ask a question: “Why was this application rejected?” The system uses the traceability graph to respond, e.g. “Decision was ‘Reject’ because validation *BATCHMODE* failed (Batch Mode not allowed), as shown in validation rule #2.” Display the relevant portion of the logic.  
+5. **Generate Artifacts:** Trigger artifacts generation (click “Export BRD”). Show the **BRD PDF** or text excerpt on screen, highlighting how rules became requirement statements. Also open the **Decision Workbook (Excel)** and **Trace Matrix**, scroll to show content. Emphasize readability.  
+6. **Conclude:** Summarize impact: extracted X fields, Y rules automatically, can explain decisions to stakeholders. Show low latency of operations. End with “Everything was automatic and fully traceable.”  
+
+This script focuses on user actions and clear results. Avoid deep architecture slides; show system in action. It directly aligns with what judges value: *solve a concrete problem with a working, explainable demo*.  
+
+## 8. Test Plan and Metrics  
+**Testing:** Develop unit and integration tests for each component:  
+- **Parser Tests:** Use sample files (Excel/PDF/Word/CSV) and verify extracted JSON matches expected. Check edge cases (missing values, malformed). For PDF/Word, test on differently formatted docs.  
+- **Trace Engine Tests:** Given a synthetic model, verify forward/backward trace queries produce correct chains.  
+- **API Tests:** Use tools like pytest & HTTPX to call endpoints, assert status codes and JSON structure. Include negative tests (bad file format, invalid query params).  
+- **Artifact Tests:** Verify generated BRD contains key phrases from requirements. Check workbooks can be opened and contain expected rows.  
+- **Performance:** Profile with representative data; ensure each request (upload→parse) completes in a few seconds (latent value for demo).  
+
+**Metrics (for evaluation):**  
+- **Extraction Accuracy:** Measure *precision/recall* of rule extraction (as recommended for knowledge extraction【14†L39-L45】). E.g., manually label a small gold-standard decision logic and compute coverage of fields/rules. Aim for high accuracy (e.g. >90% fields correct).  
+- **Traceability Coverage:** Percent of outputs that have a complete trace path back to inputs. Ideally 100%. Report e.g. “All outputs are fully traceable to source inputs” (measure via graph reachability).  
+- **Correctness:** Number of rules correctly parsed vs total in test set. Use automatic checks or human spot-checks.  
+- **API Latency:** Measure average request time for parsing a typical file (e.g. 1–2 sec). Ensure <5s for a smooth demo.  
+- **Stability:** Count of errors/bugs during testing. Zero critical failures.  
+
+Report these in the test plan: e.g. use **unit tests (pytest)** and measure “X% test coverage”, “0 critical issues found.”    
+
+## 9. Migration Plan (Removing Embedding)  
+Safely remove embedding logic:  
+1. **Identify Files/Functions:** Search codebase for keywords like `embed`, `vector`, `tachyon`. Typical places: `ingest.py`, `utils/vector.py`, `api/endpoints.py`. For example, remove any calls to `tachyon.ingest_embeddings(...)` or `requests.post("tachyon/embeddings", ...)`.  
+2. **Remove Dependency:** Uninstall or ignore any embedding-related libraries. Remove config (API keys). Update requirements.txt.  
+3. **Refactor Code:** In ingestion code, eliminate steps that generate or store embeddings. Instead, after parsing, feed textual data or structured JSON directly to search index if needed. If Tachyon was used, either stop using it or switch to simple full-text search on JSON fields.  
+4. **Update Tests:** Remove or update any tests expecting embeddings. Add tests for new parsing functionality. Run full test suite to catch breakages.  
+5. **Gradual Rollout:** If possible, branch code, run integration tests on staging. Verify that ingestion and search still work (now using text).  
+6. **Documentation:** Update README and code docs to reflect new architecture (no vector store). Document new endpoints.  
+7. **Verification:** After removal, ensure that features still needed (like keyword search) are replaced. Do a sanity check: ingest a sample and query.  
+Following this plan ensures embeddings are removed without impacting core features. Tests and code review will catch omissions.  
+
+## 10. Future Extensions (MCP Apps / Agents)  
+Once core functionality is stable, we can enhance with interactive UIs and automation layers:  
+- **MCP Apps (Interactive UI):** As an **optional future layer**, embed a dynamic UI inside the chat or web client. For example, a graphical trace explorer or rule editor (see MCP Apps spec【5†L98-L107】). The MCP Apps Extension uses `ui://` resources so the host can render HTML/JS apps inline. We could create a UI tool (e.g. using the MCP UI SDK) where users click on fields and see interactive visuals (charts, forms). This would use the existing JSON model and call back to our tools via `tools/call` under MCP. In practice, once we have the JSON, we could serve a mini web app (React/Vue) with Mermaid graphs, loaded as a `ui://trace_viewer` resource. This is **purely UI**; it does not affect our core logic.  
+- **Agents/Plugins:** Potentially wrap the engine in a ChatGPT plugin or agentic assistant. For example, a GPT4o agent could handle natural queries like “Summarize the lending decision logic,” using our endpoints for data. This layer would call our parse/trace APIs internally. For now, treat this as a **“future integration point”**, not part of MVP. We note the MCP-UI and OpenAI Apps SDK as evolving standards【5†L98-L107】【47†】.  
+
+In summary, the **immediate goal** is a robust, explainable Decision Intelligence Engine. MCP Apps or agents are future UX enhancements (e.g. richer UI or voice assistants) that can plug into the parsing and trace APIs. We ensure our design is modular so these layers can be “bolted on” later (e.g. by exposing REST endpoints that an agent can call). The core remains fully text/JSON-based to avoid overengineering in this sprint.  
+
+**Sources:** We relied on official documentation for tools (FastAPI【16†L798-L801】, pandas【30†L125-L133】【33†L130-L132】, PyMuPDF【22†L124-L132】【22†L241-L245】, python-docx【28†L103-L105】) and best practices (traceability【12†L470-L478】, knowledge extraction metrics【14†L39-L45】, BRD structure【35†L72-L75】, Mermaid usage【45†L1169-L1174】【40†L85-L89】). These informed our design of schemas, flows, and artifacts.
