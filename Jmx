@@ -1,0 +1,44 @@
+Build a React single-file component (JSX) — an AI-powered JMX Script Generator 
+for UI application load testing.
+
+## FUNCTIONALITY
+- Text area for the user to describe a UI flow 
+  (e.g., "Login → Browse Products → Add to Cart → Checkout")
+- Input fields for: Base URL, Virtual Users, Ramp-Up (seconds), Loop Count
+- Quick example buttons that auto-fill the flow text area
+- "Generate" button that calls the Anthropic Claude API 
+  (POST https://api.anthropic.com/v1/messages)
+- Display the returned JMX XML in a syntax-highlighted code block
+- Copy to clipboard and Download as .jmx buttons
+
+## API CALL
+Model: claude-sonnet-4-20250514
+Max tokens: 4000
+System prompt: You are a JMeter JMX expert. Output ONLY raw valid XML — 
+no markdown, no explanation. Generate a complete JMX with:
+ThreadGroup using the provided users/ramp-up/loops, HTTP Request Defaults 
+with the base URL, Cookie Manager, Cache Manager, one HTTP Sampler per step 
+(named "01 - Step Name"), GaussianRandomTimer between steps (1000ms mean), 
+Response Assertions (HTTP 200), and a Summary Report listener.
+
+## UI / DESIGN
+Dark theme — background #0a0e1a, accent color #00ffaa (green), 
+secondary accent #0099ff (blue)
+Font: IBM Plex Mono (import from Google Fonts)
+Two tabs: "Configure" and "Output"
+Configure tab: flow textarea + 4 parameter inputs + generate button
+Output tab: action bar (line count, Copy, Download buttons) + 
+  styled code viewer with fake macOS window chrome (red/yellow/green dots) 
+  + a "How to use" tip box
+Loading state: spinner with animated status text
+Subtle CSS grid background overlay (3% opacity green lines, 40px spacing)
+All animations via CSS keyframes (spin, pulse)
+
+## TECH CONSTRAINTS
+- Single .jsx file, no external dependencies beyond React + Tailwind core utils
+- Use useState, useRef hooks only
+- No <form> tags — use onClick/onChange handlers
+- Custom scrollbar styling via CSS
+- Syntax highlight the XML output using dangerouslySetInnerHTML with 
+  regex-based coloring (tags in blue #0099ff, strings in green #00ffaa, 
+  comments in gray #475569)
