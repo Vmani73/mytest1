@@ -1,0 +1,281 @@
+Create a high-resolution, leadership-ready, enterprise architecture diagram for a platform named:
+
+# Synapti-Q
+
+## Tagline
+AI-Powered Knowledge Discovery & Decision Platform  
+
+## Core Positioning
+Transform enterprise knowledge into real-time, autonomous decisions using agentic AI, knowledge graphs, and intelligent orchestration.
+
+---
+
+# 🔷 DESIGN STYLE (STRICT)
+
+- Use a clean, modern, corporate infographic style
+- Background: white or very light gradient
+- Use rounded rectangles with soft shadows
+- Maintain perfect alignment and spacing
+- Use minimal but premium icons for each component
+- Avoid clutter; ensure clear visual hierarchy
+
+## 🎨 Color Theme
+- Purple / Indigo → AI / Intelligence
+- Blue → Data Layer
+- Green → Security / Access
+- Orange / Yellow → Core Processing
+- Red → External Systems
+- Grey → Labels / Metadata
+
+## 🔁 Flow Direction
+- Strict Left → Right architecture flow
+- Use thin directional arrows
+  - Green → synchronous flow
+  - Purple → asynchronous flow
+  - Red dashed → external integrations
+
+---
+
+# 🔷 TOP HEADER (VERY IMPORTANT)
+
+Synapti-Q  
+AI-Powered Knowledge Discovery & Decision Platform  
+
+Subtitle:
+Turn enterprise knowledge into real-time, autonomous decisions using agentic AI
+
+---
+
+# 🔷 BUSINESS IMPACT STRIP (TOP ROW)
+
+Display 5 impact metrics with icons:
+
+1. 70–90% Faster Insights  
+   (Time to insight from hours to seconds)
+
+2. 3–5x Productivity Boost  
+   (Automate knowledge-intensive workflows)
+
+3. Lower Operating Cost  
+   (Reduce manual effort and rework)
+
+4. Better Decisions  
+   (AI + Knowledge Graph + Business Rules)
+
+5. Enterprise Ready  
+   (Secure, scalable, compliant)
+
+---
+
+# 🔷 MAIN ARCHITECTURE (6 SECTIONS)
+
+## 1. AI EXPERIENCE LAYER (LEFTMOST)
+
+Label: AI Decision Interface
+
+Include:
+- Chatbot UI (with emoji 🤖💬)
+  - Message: “Hello! How can I help you today?”
+- Web Application / API Interface
+- Multi-device icons (mobile, desktop, browser)
+
+Description:
+Natural language interface for insights, queries, and actions
+
+---
+
+## 2. SECURE ACCESS LAYER
+
+Label: API Gateway
+
+Include:
+- Authentication  
+- Authorization  
+- Rate Limiting  
+- Request Routing  
+- Monitoring  
+- Logging  
+
+Color: Green
+
+---
+
+## 3. INTELLIGENCE ENGINE (CORE SERVICES)
+
+Label: Intelligence Layer
+
+Stack vertically:
+
+- Ingestion  
+  Ingest data from multiple sources
+
+- Parser  
+  Extract and structure unstructured data
+
+- Enrichment  
+  Add metadata, entities, relationships
+
+- Knowledge Graph  
+  Build enterprise knowledge graph
+
+- LangGraph (Agent Orchestration)  
+  Agentic workflows with memory and reasoning
+
+- RAG (Retrieval Augmented Generation)  
+  Context-aware retrieval for accurate answers
+
+- Artifact Manager  
+  Generate and manage outputs
+
+- Decision Engine  
+  Combine AI + rules for deterministic decisions
+
+### 🔥 Highlight (CRITICAL)
+Visually emphasize:
+LangGraph + Decision Engine
+
+Label them as:
+👉 Autonomous Decision Core
+
+---
+
+## 4. DATA & KNOWLEDGE LAYER
+
+Label: Data & Knowledge Layer
+
+Include:
+
+- Object Storage  
+  (Documents, files, raw data)
+
+- Relational Database  
+  (Structured operational data)
+
+- Graph Database  
+  (Entities, relationships, knowledge network)
+
+- Vector Store  
+  (Embeddings for semantic search)
+
+Color: Blue
+
+---
+
+## 5. INTELLIGENT EXECUTION FABRIC
+
+Label: Asynchronous Orchestration Layer
+
+Replace traditional queue systems with:
+
+- Distributed Workflow Orchestrator  
+  (Manage scalable background processing)
+
+- Event Bus / Stream Processor  
+  (Real-time event-driven processing)
+
+Add capability tags:
+- Scalable  
+- Reliable  
+- Event Driven  
+- Fault Tolerant  
+
+Color: Purple
+
+---
+
+## 6. ENTERPRISE INTEGRATIONS
+
+Label: Enterprise Integrations
+
+Include:
+
+- OAuth2 / SSO Token Endpoint  
+- Embedding Providers  
+- Tachyon Vector Platform  
+
+Use red dashed arrows to show integration.
+
+---
+
+# 🔷 RIGHT PANEL – BUSINESS OUTCOMES
+
+Create a vertical panel:
+
+- Actionable Insights at Speed  
+  Access knowledge instantly
+
+- Operational Excellence  
+  Automate workflows and reduce manual effort
+
+- Better Decisions with Confidence  
+  Combine AI + knowledge graph + rules
+
+- Enterprise Safe & Scalable  
+  Built for compliance and scale
+
+---
+
+# 🔷 FLOW LEGEND (BOTTOM)
+
+Add a legend:
+
+- Blue Arrow → Client Request Flow  
+- Green Arrow → Synchronous Processing  
+- Purple Arrow → Asynchronous Processing  
+- Red Dashed Arrow → External Integration  
+- Grey Arrow → Data / Knowledge Flow  
+
+---
+
+# 🔷 FOOTER SECTION
+
+Add strip:
+
+Built for Enterprise
+
+Include:
+- Secure by Design  
+- Scalable Architecture  
+- High Availability  
+- Extensible Platform  
+- Future Ready  
+
+---
+
+# 🔷 FOOTER TAGLINE
+
+“One Platform. All Your Knowledge. Smarter Decisions.”
+
+---
+
+# 🔷 OUTPUT REQUIREMENT
+
+- Generate:
+  - High-resolution PNG (presentation ready)
+  - OR Draw.io XML (editable)
+  - OR Figma-style layout
+
+Ensure:
+- Balanced spacing  
+- No overlapping arrows  
+- Clean alignment  
+- Executive readability  
+
+---
+
+# 🔷 IMPORTANT INSTRUCTIONS
+
+- Do NOT oversimplify  
+- Do NOT remove any layers  
+- Maintain hierarchy clearly  
+- Keep text concise but meaningful  
+- Focus on clarity + business impact + architecture integrity
+
+---
+
+# 🔷 FINAL GOAL
+
+The diagram should look like:
+👉 A top-tier consulting slide (McKinsey / Microsoft / AWS level)  
+👉 Suitable for C-level / leadership presentation  
+👉 Communicating both technical depth and business value clearly
