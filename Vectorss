@@ -1,0 +1,164 @@
+You are a senior Python backend engineer. Refactor my Tachyon ingestion + search service to strictly align with a known working reference implementation.
+
+IMPORTANT: Do NOT redesign. Do NOT introduce new abstractions. Fix only what is broken.
+
+-----------------------------------
+CONTEXT
+-----------------------------------
+I already have a working standalone script (testtach.py) that:
+- uploads JSONL
+- ingests into Tachyon
+- performs search
+- applies metadata filter (agent)
+- returns correct results
+
+The current service layer (data_ingest_service.py + tachyon_minimal.py) is NOT working because it diverged from this working behavior.
+
+Your task is to bring the service layer back in alignment with the working script.
+
+-----------------------------------
+MANDATORY FIXES (STRICT)
+-----------------------------------
+
+1. REMOVE PREFIX-BASED SEARCH COMPLETELY
+- Delete all logic related to:
+  - prefix filtering
+  - "Discovery" prefix assumptions
+  - search_by_prefix behavior
+- Document IDs must be treated as EXACT values (no transformation, no prefixing)
+
+-----------------------------------
+
+2. REPLACE SEARCH PAYLOAD WITH WORKING VERSION
+
+Replace any hybrid / reranker / advanced search payload with EXACT structure:
+
+payload = {
+    "query": query,
+    "collectionId": collection_id,
+    "searchCount": limit,
+    "fieldFilters": {
+        "agent": [agent_filter]
+    },
+    "fieldsToReturn": [
+        "raw_context",
+        "agent",
+        "document_id",
+        "chunk_id",
+        "file_name"
+    ]
+}
+
+Rules:
+- DO NOT include:
+  - searchType
+  - reRanker
+  - queryVector
+- Keep it simple and identical to working script
+
+-----------------------------------
+
+3. ENSURE METADATA FILTER WORKS
+
+- agent filter MUST always be passed as:
+  fieldFilters = { "agent": [agent_filter] }
+
+- DO NOT over-engineer sanitization
+- DO NOT drop the filter silently
+
+-----------------------------------
+
+4. ENSURE raw_context IS RETURNED
+
+- This field is REQUIRED for downstream usage
+- If missing, search results are considered broken
+
+-----------------------------------
+
+5. ALIGN INGESTION SCHEMA
+
+During ingestion, every record MUST contain:
+
+meta["document_id"] = document_id
+meta["agent"] = agent_tag
+
+Stored structure must match search expectations exactly.
+
+NO renaming like:
+- discoveryDocId
+- documentId
+- id variations
+
+Use ONLY:
+- document_id
+
+-----------------------------------
+
+6. REMOVE HYBRID SEARCH + RERANKER
+
+Delete:
+- "searchType": "hybrid"
+- "reRanker": "CE"
+
+These are not part of the working system and break compatibility.
+
+-----------------------------------
+
+7. FIX DOCUMENT ID MAPPING
+
+When processing search results:
+
+Use ONLY:
+doc_id = result["document_id"]
+
+DO NOT fallback to:
+- documentId
+- id
+
+Consistency is critical.
+
+-----------------------------------
+
+8. DO NOT CHANGE INGESTION FLOW
+
+- Keep existing ingestion entry points
+- Only ensure metadata structure matches working script
+
+-----------------------------------
+
+9. KEEP CODE SIMPLE
+
+- No unnecessary abstraction
+- No dynamic imports unless already required
+- No fallback complexity
+
+-----------------------------------
+
+EXPECTED RESULT
+-----------------------------------
+
+After refactor:
+- Search must return results correctly filtered by agent
+- Results must match working script behavior
+- Mongo lookup must work with correct document_id
+- No empty results unless truly no data exists
+
+-----------------------------------
+
+OUTPUT FORMAT
+-----------------------------------
+
+- Provide FULL updated functions:
+  - search()
+  - search_by_prefix() (if retained, convert it to normal search and rename appropriately)
+- Highlight EXACT changes made
+- Do NOT provide explanation unless necessary
+
+-----------------------------------
+
+IMPORTANT
+-----------------------------------
+
+If something is unclear, default to matching the behavior of testtach.py exactly.
+
+Do not optimize. Do not innovate. Just make it work correctly.
