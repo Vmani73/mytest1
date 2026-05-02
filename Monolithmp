@@ -1,0 +1,507 @@
+# PROMPT 1 — BUILD THE MIGRATION MCPs
+
+# Paste this into Copilot Chat (Agent Mode) inside VS Code
+
+# Run this FIRST, before the migration agent prompt
+
+##############################################################
+
+You are a senior Node.js/TypeScript engineer.
+Your task is to build three local MCP (Model Context Protocol) servers
+that will power an autonomous migration agent running inside VS Code.
+
+These MCPs must be real, executable, production-safe tools.
+Do NOT simulate, stub, or mock any capability.
+Every tool must perform its actual operation and return real output.
+
+==============================================================
+
+## CONSTRAINTS (READ BEFORE WRITING ANY CODE)
+
+- Language: TypeScript (Node.js 18+)
+- MCP SDK: @modelcontextprotocol/sdk (latest)
+- Each MCP is a standalone server in its own folder
+- Each server communicates over stdio (standard MCP transport)
+- All paths are absolute or resolved relative to a configurable PROJECT_ROOT
+- PROJECT_ROOT is read from environment variable PROJECT_ROOT
+- All tools return structured JSON responses
+- All errors are caught and returned as structured error objects, never thrown raw
+- No tool may silently fail — every failure must be classified and returned
+- Shell commands must use a timeout (default 120s, configurable)
+
+==============================================================
+
+## FOLDER STRUCTURE TO CREATE
+
+```
+migration-mcps/
+├── package.json              (workspace root)
+├── tsconfig.base.json
+├── migration-fs/
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       └── index.ts
+├── migration-runner/
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       └── index.ts
+└── migration-analyzer/
+    ├── package.json
+    ├── tsconfig.json
+    └── src/
+        └── index.ts
+```
+
+==============================================================
+
+## MCP 1 — migration-fs
+
+## Purpose: File system operations, Git operations, and migration state persistence
+
+Build a complete MCP server exposing these tools:
+
+### read_file
+
+Input:  { path: string }
+Action: Read file at absolute path (or relative to PROJECT_ROOT)
+Output: { content: string, size_bytes: number, encoding: string }
+Error:  { error: “FILE_NOT_FOUND” | “PERMISSION_DENIED” | “READ_ERROR”, detail: string }
+
+### write_file
+
+Input:  { path: string, content: string, create_dirs?: boolean }
+Action: Write content to file. If create_dirs=true, create parent directories.
+Output: { written: true, path: string, size_bytes: number }
+Error:  { error: “WRITE_ERROR” | “PERMISSION_DENIED”, detail: string }
+
+### list_directory
+
+Input:  { path: string, recursive?: boolean, include_hidden?: boolean, extensions?: string[] }
+Action: List files/directories. If extensions provided, filter by extension.
+Output: { entries: Array<{ path: string, type: “file”|“dir”, size_bytes: number, extension: string }>, total: number }
+Error:  { error: “DIR_NOT_FOUND” | “PERMISSION_DENIED”, detail: string }
+
+### search_code
+
+Input:  { pattern: string, glob?: string, case_sensitive?: boolean, max_results?: number }
+Action: Search for regex pattern in files matching glob (default: **/*).
+Use ripgrep (rg) if available, else grep.
+Output: { matches: Array<{ file: string, line: number, content: string }>, total: number }
+Error:  { error: “SEARCH_ERROR”, detail: string }
+
+### get_state
+
+Input:  {}
+Action: Read migration_state.json from PROJECT_ROOT/.migration/state.json
+Output: { state: object | null, exists: boolean, last_updated: string | null }
+Error:  { error: “READ_ERROR”, detail: string }
+
+### set_state
+
+Input:  { state: object }
+Action: Write state to PROJECT_ROOT/.migration/state.json (create dir if needed)
+Always merge with existing state, never overwrite keys not provided
+Append timestamp to state.last_updated
+Output: { saved: true, path: string, last_updated: string }
+Error:  { error: “WRITE_ERROR”, detail: string }
+
+### get_git_log
+
+Input:  { limit?: number, branch?: string }
+Action: Run `git log --oneline -n {limit}` in PROJECT_ROOT
+Output: { commits: Array<{ hash: string, message: string, date: string }> }
+Error:  { error: “GIT_ERROR” | “NOT_A_REPO”, detail: string }
+
+### get_git_diff
+
+Input:  { base?: string, target?: string, file?: string }
+Action: Run `git diff {base}..{target} -- {file}` or `git diff HEAD` if no args
+Output: { diff: string, files_changed: string[], insertions: number, deletions: number }
+Error:  { error: “GIT_ERROR”, detail: string }
+
+### git_create_branch
+
+Input:  { name: string, from?: string }
+Action: Run `git checkout -b {name}` or `git checkout -b {name} {from}`
+Output: { created: true, branch: string, from: string }
+Error:  { error: “GIT_ERROR” | “BRANCH_EXISTS”, detail: string }
+
+### git_commit
+
+Input:  { message: string, files?: string[] }
+Action: Run `git add {files or "."}` then `git commit -m "{message}"`
+Output: { committed: true, hash: string, message: string }
+Error:  { error: “GIT_ERROR” | “NOTHING_TO_COMMIT”, detail: string }
+
+### git_current_branch
+
+Input:  {}
+Action: Run `git rev-parse --abbrev-ref HEAD`
+Output: { branch: string }
+Error:  { error: “GIT_ERROR” | “NOT_A_REPO”, detail: string }
+
+==============================================================
+
+## MCP 2 — migration-runner
+
+## Purpose: Execute build, test, static analysis, and mutation testing
+
+Build a complete MCP server exposing these tools:
+
+### detect_project_type
+
+Input:  { path?: string }
+Action: Inspect PROJECT_ROOT for package.json, pom.xml, build.gradle,
+Cargo.toml, requirements.txt, go.mod, *.csproj
+Determine language and build tool.
+Output: { language: string, build_tool: string, test_framework: string, confidence: “HIGH”|“MEDIUM”|“LOW” }
+Error:  { error: “DETECTION_FAILED”, detail: string }
+
+### run_command
+
+Input:  { cmd: string, cwd?: string, timeout_ms?: number, env?: Record<string,string> }
+Action: Execute shell command. cwd defaults to PROJECT_ROOT.
+Capture stdout and stderr separately.
+Enforce timeout (default 120000ms).
+Output: {
+exit_code: number,
+stdout: string,
+stderr: string,
+duration_ms: number,
+timed_out: boolean
+}
+Error:  { error: “EXEC_ERROR” | “TIMEOUT”, detail: string }
+
+### run_build
+
+Input:  { project_type?: string, args?: string[] }
+Action: Auto-detect or use provided project_type.
+Run the appropriate build command:
+- npm/node → npm run build
+- maven    → mvn compile -q
+- gradle   → ./gradlew build
+- cargo    → cargo build
+- python   → python -m py_compile on all .py files
+- go       → go build ./…
+Parse output for errors.
+Output: {
+success: boolean,
+project_type: string,
+command_run: string,
+errors: Array<{ file: string, line: number, message: string }>,
+warnings: Array<{ file: string, line: number, message: string }>,
+duration_ms: number,
+raw_output: string
+}
+
+### run_tests
+
+Input:  { project_type?: string, scope?: string, test_pattern?: string, args?: string[] }
+Action: Run test suite for detected or specified project type:
+- npm/node → npm test or jest –testPathPattern={scope}
+- maven    → mvn test -Dtest={scope}
+- gradle   → ./gradlew test
+- cargo    → cargo test {scope}
+- python   → pytest {scope} -v –tb=short
+- go       → go test ./…
+Parse results for pass/fail/skip counts.
+Output: {
+passed: number,
+failed: number,
+skipped: number,
+total: number,
+coverage_pct: number | null,
+failures: Array<{ test: string, file: string, message: string }>,
+duration_ms: number,
+success: boolean,
+raw_output: string
+}
+
+### run_static_check
+
+Input:  { tool?: string, path?: string, config?: string }
+Action: Run static analysis. Auto-detect tool if not specified:
+- JS/TS    → eslint
+- Python   → pylint or flake8
+- Java     → checkstyle
+- Go       → golint
+- Rust     → clippy
+Parse violations.
+Output: {
+violations: Array<{ file: string, line: number, rule: string, severity: “error”|“warning”, message: string }>,
+error_count: number,
+warning_count: number,
+tool_used: string,
+success: boolean
+}
+
+### run_mutation_test
+
+Input:  { scope?: string, threshold?: number }
+Action: Run mutation testing tool:
+- JS/TS  → stryker (stryker run)
+- Python → mutmut run
+- Java   → pitest
+threshold defaults to 80.
+If tool not installed, return error TOOL_NOT_INSTALLED with install instructions.
+Output: {
+mutation_score: number,
+mutations_total: number,
+mutations_killed: number,
+mutations_survived: number,
+passed_threshold: boolean,
+threshold: number,
+survivors: Array<{ file: string, line: number, mutation: string }>,
+tool_used: string
+}
+
+### get_test_baseline
+
+Input:  {}
+Action: Read .migration/test_baseline.json if exists
+Output: { baseline: object | null, exists: boolean }
+
+### save_test_baseline
+
+Input:  { results: object }
+Action: Write current test results to .migration/test_baseline.json
+Output: { saved: true }
+
+### compare_to_baseline
+
+Input:  { current_results: object }
+Action: Load baseline and compare to current_results.
+Identify regressions (tests that previously passed now fail).
+Output: {
+regressions: Array<{ test: string, status: “was_passing_now_failing” }>,
+improvements: Array<{ test: string, status: “was_failing_now_passing” }>,
+regression_count: number,
+is_regression: boolean
+}
+
+==============================================================
+
+## MCP 3 — migration-analyzer
+
+## Purpose: Code analysis, dependency graphs, domain detection, API surface analysis
+
+Build a complete MCP server exposing these tools:
+
+### build_dependency_graph
+
+Input:  { entry_point?: string, language?: string, depth?: number }
+Action: Build module-level dependency graph.
+- JS/TS  → use madge (npm install -g madge) or parse imports manually
+- Python → parse import statements from AST
+- Java   → parse import declarations
+- Go     → parse import blocks
+If madge available, use it. Else parse statically.
+Return adjacency list.
+Output: {
+nodes: Array<{ id: string, path: string, type: “module”|“package”|“class” }>,
+edges: Array<{ from: string, to: string, type: “import”|“extends”|“implements” }>,
+circular_dependencies: Array<string[]>,
+total_nodes: number,
+total_edges: number,
+tool_used: string
+}
+
+### detect_circular_dependencies
+
+Input:  { graph?: object }
+Action: If graph provided, analyze it. Else build graph first.
+Use DFS to find all cycles.
+Output: {
+cycles: Array<Array<string>>,
+cycle_count: number,
+affected_modules: string[]
+}
+
+### analyze_api_surface
+
+Input:  { path: string, language?: string }
+Action: For the given file or directory, extract public API surface:
+- JS/TS  → exported functions, classes, interfaces
+- Python → public methods (not starting with _), class definitions
+- Java   → public methods and fields
+Parse using regex + structural analysis (not full AST unless parser available).
+Output: {
+exports: Array<{
+name: string,
+type: “function”|“class”|“interface”|“constant”,
+signature: string,
+file: string,
+line: number
+}>,
+total: number
+}
+
+### analyze_data_models
+
+Input:  { path: string, language?: string }
+Action: Extract data model definitions:
+- JS/TS  → interfaces, types, Zod schemas, class properties
+- Python → dataclasses, Pydantic models, SQLAlchemy models
+- Java   → JPA entities, POJOs with fields
+- Any    → look for schema files: *.prisma, *.graphql, *.proto, migration SQL files
+Output: {
+models: Array<{
+name: string,
+type: “entity”|“schema”|“interface”|“proto”,
+fields: Array<{ name: string, type: string, nullable: boolean, constraints: string[] }>,
+file: string
+}>,
+total: number
+}
+
+### compute_coupling_score
+
+Input:  { module_a: string, module_b: string, graph?: object }
+Action: Compute coupling between two modules.
+Score = (shared_dependencies + cross_references) / total_possible_connections
+Return 0.0 (fully decoupled) to 1.0 (fully coupled)
+Output: {
+module_a: string,
+module_b: string,
+coupling_score: number,
+shared_dependencies: string[],
+cross_references: Array<{ from: string, to: string, type: string }>,
+recommendation: “LOW_RISK_TO_EXTRACT” | “MEDIUM_RISK” | “HIGH_COUPLING_DO_NOT_EXTRACT_YET”
+}
+
+### suggest_service_cuts
+
+Input:  { graph?: object, strategy?: “by_domain” | “by_coupling” | “by_size” }
+Action: Analyze dependency graph and suggest microservice boundaries.
+Strategy defaults to “by_coupling”.
+Group strongly connected components together.
+Apply domain heuristics: look for folder names like
+auth/, payment/, order/, user/, notification/, product/, inventory/
+Return ranked list of extraction candidates (lowest coupling first).
+Output: {
+candidates: Array<{
+name: string,
+modules: string[],
+coupling_score: number,
+extraction_risk: “LOW” | “MEDIUM” | “HIGH”,
+reason: string,
+dependencies_to_break: string[]
+}>,
+strategy_used: string,
+total_candidates: number
+}
+
+### count_language_files
+
+Input:  { path?: string }
+Action: Count files by language extension in project.
+Recurse entire PROJECT_ROOT (or provided path).
+Exclude node_modules, .git, dist, target, build directories.
+Output: {
+breakdown: Record<string, number>,
+dominant_language: string,
+total_files: number
+}
+
+### find_entry_points
+
+Input:  { language?: string }
+Action: Locate main entry points:
+- JS/TS → look at package.json “main”, “bin”, index.ts/js
+- Python → look for **main**.py, manage.py, app.py, main.py
+- Java   → look for @SpringBootApplication, public static void main
+- Go     → look for func main() in main.go
+Output: {
+entry_points: Array<{ file: string, type: string, framework: string | null }>,
+detected_frameworks: string[]
+}
+
+==============================================================
+
+## IMPLEMENTATION REQUIREMENTS
+
+### For ALL three servers:
+
+1. Use @modelcontextprotocol/sdk to create the server
+1. Use StdioServerTransport for transport
+1. Wrap every tool handler in try/catch
+1. Log to stderr (never stdout — stdout is the MCP protocol channel)
+1. Validate all inputs before executing
+1. For shell commands, always sanitize inputs to prevent injection
+
+### package.json for each server must include:
+
+```json
+{
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^18.0.0"
+  }
+}
+```
+
+### After creating all files, also create:
+
+**migration-mcps/README.md** containing:
+
+- How to install: `npm install` in each subfolder
+- How to build: `npm run build` in each subfolder
+- How to register in VS Code settings.json (provide the exact JSON block)
+- Required environment variables (PROJECT_ROOT)
+- Required optional tools (ripgrep, madge, stryker, mutmut, pitest)
+- How to verify each MCP is working
+
+**migration-mcps/.vscode/mcp.json** with:
+
+```json
+{
+  "servers": {
+    "migration-fs": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/migration-mcps/migration-fs/dist/index.js"],
+      "env": { "PROJECT_ROOT": "${workspaceFolder}" }
+    },
+    "migration-runner": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/migration-mcps/migration-runner/dist/index.js"],
+      "env": { "PROJECT_ROOT": "${workspaceFolder}" }
+    },
+    "migration-analyzer": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/migration-mcps/migration-analyzer/dist/index.js"],
+      "env": { "PROJECT_ROOT": "${workspaceFolder}" }
+    }
+  }
+}
+```
+
+==============================================================
+
+## EXECUTION ORDER
+
+Build in this order:
+
+1. Create workspace package.json and tsconfig.base.json
+1. Build migration-fs completely (all files + compile)
+1. Build migration-runner completely (all files + compile)
+1. Build migration-analyzer completely (all files + compile)
+1. Create README.md and .vscode/mcp.json
+1. Run `npm run build` in each folder and fix any TypeScript errors
+1. Report: which tools are ready, which need optional dependencies, exact commands to start each server
+
+Do NOT proceed to the next server until the current one compiles cleanly.
+Do NOT leave any tool as a stub or placeholder.
+
+Begin now. Start with migration-fs.
