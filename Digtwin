@@ -1,0 +1,215 @@
+You are a principal software architect and senior distributed systems engineer.
+
+Your task is to design and implement a PRODUCTION-GRADE DIGITAL TWIN PLATFORM for software systems.
+
+STRICT RULES:
+- Do NOT simplify
+- Do NOT skip layers
+- Do NOT give partial code
+- Do NOT hallucinate libraries or APIs
+- Every component must be implementable and runnable
+- Follow clean architecture and separation of concerns
+- Code must be modular, testable, and extensible
+- Provide FULL working code, not snippets
+
+========================================
+OBJECTIVE
+========================================
+
+Build an end-to-end Digital Twin system that:
+1. Ingests real system data (logs, metrics, topology)
+2. Builds a live system model (dependency graph + state)
+3. Learns behavior patterns
+4. Simulates “what-if” scenarios
+5. Uses an agent loop to analyze, decide, and recommend actions
+6. Continuously updates itself based on real outcomes
+
+========================================
+ARCHITECTURE REQUIREMENTS
+========================================
+
+Design using layered architecture:
+
+1. Ingestion Layer
+   - Accept:
+     - service topology
+     - metrics
+     - events
+   - API endpoints for ingestion
+   - Schema validation
+
+2. Modeling Layer
+   - Build dependency graph
+   - Represent:
+     - services
+     - dependencies
+     - endpoints
+   - Must support:
+     - upstream/downstream traversal
+     - failure propagation
+
+3. State Store
+   - Abstract interface
+   - Implementation:
+     - In-memory (MVP)
+     - Pluggable for Neo4j later
+
+4. Behavior Engine
+   - Compute baseline metrics:
+     - latency
+     - error rate
+   - Detect anomalies
+
+5. Simulation Engine (CRITICAL)
+   Implement:
+   - Failure simulation
+     Input: service failure
+     Output: impacted services
+
+   - Deployment simulation
+     Input: service change + load change
+     Output:
+       - latency impact
+       - error propagation
+
+   Must be deterministic and explainable.
+
+6. Risk Scoring Engine
+   - Combine:
+     - graph centrality
+     - dependency depth
+     - historical failure
+   - Output numeric risk score
+
+7. Agent Layer
+   Implement loop:
+     ANALYZE → SIMULATE → SCORE → DECIDE
+
+   Agent must:
+     - Evaluate deployment safety
+     - Recommend:
+       - proceed
+       - monitor
+       - rollback
+
+8. API Layer
+   Build using FastAPI
+   Required endpoints:
+     - ingest topology
+     - ingest metrics
+     - simulate failure
+     - simulate deployment
+     - get risk score
+     - agent decision
+
+9. Visualization-ready output
+   - Return structured JSON suitable for UI
+   - Include:
+     - impacted nodes
+     - risk scores
+     - reasoning
+
+========================================
+TECH STACK (MANDATORY)
+========================================
+
+Backend:
+- Python 3.11+
+- FastAPI
+- Pydantic
+
+Graph:
+- NetworkX (MVP)
+- Abstract for Neo4j
+
+Simulation:
+- Custom engine (no black-box ML)
+
+Testing:
+- Pytest
+
+========================================
+PROJECT STRUCTURE
+========================================
+
+Create this structure:
+
+app/
+  main.py
+  api/
+  models/
+  services/
+  simulation/
+  agent/
+  storage/
+  utils/
+
+tests/
+
+requirements.txt
+README.md
+
+========================================
+IMPLEMENTATION REQUIREMENTS
+========================================
+
+1. Provide FULL WORKING CODE for:
+   - all modules
+   - API endpoints
+   - simulation engine
+   - agent logic
+
+2. Include:
+   - sample topology dataset
+   - sample API calls
+
+3. Ensure:
+   - code runs without modification
+   - no missing imports
+   - no pseudo-code
+
+4. Add:
+   - logging
+   - error handling
+   - input validation
+
+========================================
+ADVANCED FEATURES (REQUIRED)
+========================================
+
+- Failure propagation across graph
+- Latency impact simulation based on dependency chain
+- Risk scoring based on graph structure
+- Agent reasoning output (not just result)
+
+========================================
+OUTPUT FORMAT
+========================================
+
+1. Explain architecture briefly (max 10%)
+2. Then provide FULL CODE (90%)
+3. Ensure code is copy-paste runnable
+
+========================================
+DO NOT:
+========================================
+
+- Do NOT give high-level explanation only
+- Do NOT skip simulation logic
+- Do NOT skip agent loop
+- Do NOT produce incomplete files
+
+========================================
+GOAL
+========================================
+
+The system should answer:
+
+- What breaks if service X fails?
+- Is deployment of service Y safe?
+- What is the risk score?
+- What should we do next?
+
+========================================
+
+Start building now.
