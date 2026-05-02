@@ -1,0 +1,502 @@
+You are a principal software architect, senior static-analysis engineer, and production systems engineer.
+
+Build a production-grade advanced MVP that accepts ONLY a local zipped Git repository path and automatically produces an evidence-backed software digital twin, dependency graph, architecture catalog, risk analysis, simulation results, and leadership-ready report.
+
+This system must be deterministic-first. Do not rely on LLMs or agents for core parsing, graph creation, simulation, or risk calculation. LLM/agent layer may only be optional for summarization/explanation after deterministic results are produced.
+
+==================================================
+NON-NEGOTIABLE RULES
+==================================================
+
+1. Do not hallucinate.
+2. Do not create any dependency, relationship, risk, or architecture claim without evidence.
+3. Do not silently ignore parser failures.
+4. Do not use regex as primary parsing mechanism.
+5. Do not use LLM for parsing, dependency extraction, graph construction, or simulation.
+6. Every finding must include:
+   - evidence
+   - confidence score
+   - source file
+   - line number when possible
+   - reason for confidence level
+7. System must degrade gracefully.
+8. System must be runnable end-to-end.
+9. Code must be modular, testable, and production-oriented.
+10. Provide full working code, not pseudo-code.
+
+==================================================
+MINIMUM USER INPUT
+==================================================
+
+User provides only:
+
+{
+  "zip_path": "/local/path/to/repo.zip"
+}
+
+Optional inputs:
+{
+  "branch": "main",
+  "changed_files": ["optional/list/of/files"],
+  "target_node": "optional-service-or-file"
+}
+
+The system must not require manual topology.
+
+==================================================
+PRIMARY OUTPUT
+==================================================
+
+Return structured JSON and a readable report containing:
+
+{
+  "repo_summary": {},
+  "parse_summary": {},
+  "architecture_catalog": {},
+  "dependency_graph": {},
+  "digital_twin": {},
+  "risk_report": {},
+  "simulation_results": {},
+  "architecture_drift": {},
+  "test_gap_analysis": {},
+  "confidence_summary": {},
+  "unresolved_items": [],
+  "evidence": []
+}
+
+==================================================
+ARCHITECTURE
+==================================================
+
+Create the following modular structure:
+
+app/
+  main.py
+
+  api/
+    routes.py
+
+  ingestion/
+    zip_extractor.py
+    repo_inventory.py
+    safety.py
+
+  detection/
+    language_detector.py
+    framework_detector.py
+    config_detector.py
+
+  parsing/
+    base_parser.py
+    tree_sitter_parser.py
+    python_parser.py
+    javascript_parser.py
+    typescript_parser.py
+    java_parser.py
+    resolver.py
+    symbol_table.py
+    normalizer.py
+    evidence_extractor.py
+    parse_cache.py
+
+  graph/
+    graph_builder.py
+    graph_models.py
+    graph_queries.py
+    exporters.py
+
+  architecture/
+    architecture_inferencer.py
+    service_detector.py
+    api_detector.py
+    database_detector.py
+    drift_detector.py
+
+  twin/
+    twin_builder.py
+    twin_models.py
+
+  simulation/
+    failure_simulator.py
+    change_simulator.py
+    blast_radius.py
+
+  risk/
+    risk_engine.py
+    confidence_engine.py
+    test_gap_engine.py
+
+  validation/
+    result_validator.py
+    evidence_validator.py
+    consistency_checker.py
+
+  reporting/
+    json_report.py
+    markdown_report.py
+    leadership_report.py
+
+  storage/
+    memory_store.py
+
+  utils/
+    logging.py
+    file_utils.py
+    hashing.py
+
+tests/
+  sample_repos/
+  test_ingestion.py
+  test_detection.py
+  test_python_parser.py
+  test_js_ts_parser.py
+  test_java_parser.py
+  test_graph_builder.py
+  test_simulation.py
+  test_risk_engine.py
+  test_validation.py
+
+requirements.txt
+README.md
+
+==================================================
+TECH STACK
+==================================================
+
+Mandatory:
+- Python 3.11+
+- FastAPI
+- Pydantic
+- NetworkX
+- Tree-sitter
+- Pytest
+
+Allowed fallbacks:
+- Python ast
+- javalang for Java fallback
+- TypeScript/JavaScript parser fallback if Tree-sitter fails
+
+Do not use PyTorch.
+Do not use deep learning.
+Do not use agent frameworks for core logic.
+
+==================================================
+PROCESSING PIPELINE
+==================================================
+
+Implement this exact multi-pass pipeline:
+
+PASS 1: Safe ZIP extraction
+- Validate zip path
+- Prevent zip-slip attacks
+- Extract to controlled temp workspace
+- Reject suspicious files if needed
+
+PASS 2: Repo inventory
+- Count files
+- Detect languages
+- Detect ignored/vendor/generated directories
+- Ignore:
+  - node_modules
+  - target
+  - build
+  - dist
+  - .git
+  - __pycache__
+  - vendor folders
+  - binary files
+
+PASS 3: Framework/config detection
+Detect:
+- Python FastAPI/Flask/Django
+- Java Spring Boot
+- JavaScript/TypeScript React/Node/Express/Nest
+- Dockerfile
+- docker-compose
+- Kubernetes YAML
+- Helm charts
+- OpenAPI/Swagger files
+- package managers
+
+PASS 4: Strong parsing
+Use Tree-sitter first.
+Use language fallback if Tree-sitter fails.
+
+Extract:
+- imports
+- exports
+- classes
+- functions
+- method calls
+- constructors
+- decorators/annotations
+- route definitions
+- HTTP calls
+- DB access patterns
+- config references
+- test files
+
+PASS 5: Symbol resolution
+Resolve:
+- relative imports
+- package/module imports
+- __init__.py
+- index.js/index.ts
+- Java package paths
+- class/function references where possible
+
+If unresolved:
+- record unresolved item
+- do not fake link
+- mark confidence LOW
+
+PASS 6: Evidence graph
+Build directed graph:
+- nodes: file/module/class/function/service/api/database/config/test
+- edges: IMPORTS, CALLS, DEFINES_ROUTE, ACCESSES_DB, CALLS_EXTERNAL_API, CONFIGURES, TESTS
+
+Every edge must include:
+{
+  "file": "...",
+  "line": 123,
+  "snippet": "...",
+  "parser": "...",
+  "confidence": "HIGH|MEDIUM|LOW",
+  "confidence_reason": "..."
+}
+
+PASS 7: Architecture inference
+Infer architecture using deterministic rules:
+- controllers/routes
+- services
+- repositories/DAOs
+- databases
+- APIs
+- external clients
+- config/deployment units
+
+Do not overclaim.
+If uncertain, mark as inferred with LOW/MEDIUM confidence.
+
+PASS 8: Digital twin model
+Create:
+- logical nodes
+- dependencies
+- criticality
+- evidence-backed relationships
+- confidence score per relationship
+
+PASS 9: Simulation
+Implement deterministic graph-based simulations:
+
+A. Failure simulation:
+Input:
+{
+  "target_node": "node-id"
+}
+
+Output:
+- impacted nodes
+- propagation paths
+- impact depth
+- confidence
+- evidence
+
+B. Change simulation / PR blast radius:
+Input:
+{
+  "changed_files": [...]
+}
+
+Output:
+- impacted modules
+- impacted APIs
+- impacted services
+- impacted tests
+- missing tests
+
+PASS 10: Risk scoring
+Risk score must be explainable.
+
+Use:
+- impacted node count
+- dependency depth
+- centrality
+- critical node type
+- test coverage evidence
+- unresolved dependency count
+- confidence penalty
+
+Return:
+{
+  "risk_score": 0-100,
+  "risk_level": "LOW|MEDIUM|HIGH",
+  "reasoning": [],
+  "evidence": []
+}
+
+PASS 11: Architecture drift detection
+Detect basic drift:
+- controller directly accessing DB
+- service depending on UI layer
+- repository calling controller
+- circular dependencies
+- forbidden dependency direction
+- excessive coupling
+- missing tests for critical paths
+
+Each drift finding must have evidence.
+
+PASS 12: Validation
+Before final output:
+- verify every edge has evidence
+- verify every risk reason has evidence or assumption
+- list unsupported files
+- list parser failures
+- list unresolved symbols
+- calculate overall confidence
+
+==================================================
+API ENDPOINTS
+==================================================
+
+POST /analyze
+Input:
+{
+  "zip_path": "/path/repo.zip"
+}
+
+POST /simulate/failure
+Input:
+{
+  "analysis_id": "...",
+  "target_node": "..."
+}
+
+POST /simulate/change
+Input:
+{
+  "analysis_id": "...",
+  "changed_files": [...]
+}
+
+GET /analysis/{analysis_id}/report
+
+GET /analysis/{analysis_id}/graph
+
+==================================================
+CONFIDENCE SCORING
+==================================================
+
+HIGH:
+- AST parsed successfully
+- symbol resolved
+- evidence line available
+- relationship verified by code/config
+
+MEDIUM:
+- AST parsed
+- relationship likely but symbol partly unresolved
+
+LOW:
+- dynamic import
+- reflection
+- unresolved symbol
+- heuristic-only inference
+
+Never show LOW confidence findings as facts.
+
+==================================================
+REPORTING REQUIREMENTS
+==================================================
+
+Generate three reports:
+
+1. Developer Report
+- detailed graph
+- impacted files
+- evidence
+- unresolved items
+
+2. Leadership Report
+- short executive summary
+- risk level
+- top 5 risks
+- architecture health
+- recommended action
+
+3. JSON Report
+- machine-readable full output
+
+==================================================
+ERROR HANDLING
+==================================================
+
+Handle:
+- invalid zip path
+- corrupt zip
+- unsupported language
+- parser errors
+- large repo
+- binary files
+- missing dependencies
+- partial analysis
+
+System must continue where possible and clearly report limitations.
+
+==================================================
+PERFORMANCE REQUIREMENTS
+==================================================
+
+- Parse files in parallel
+- Cache by file hash
+- Avoid loading huge files fully when possible
+- Skip files above configurable size threshold
+- Support large repos with 10k+ files
+
+==================================================
+TESTING REQUIREMENTS
+==================================================
+
+Create sample repos in tests/sample_repos.
+
+Tests must verify:
+- zip extraction safety
+- language detection
+- Python import/call extraction
+- JS/TS import/call extraction
+- Java import/call extraction
+- evidence exists for every edge
+- unresolved symbols are reported
+- graph traversal works
+- failure simulation works
+- change blast radius works
+- risk scoring is deterministic
+- architecture drift detection works
+- final report includes confidence and limitations
+
+==================================================
+IMPORTANT DESIGN PRINCIPLES
+==================================================
+
+This is not a chatbot.
+This is not a diagram generator.
+This is not an LLM wrapper.
+
+This is an evidence-backed software analysis and digital twin engine.
+
+The system may later integrate AutoGen/Semantic Kernel, but not in the core MVP.
+
+==================================================
+DELIVERABLE
+==================================================
+
+Provide:
+1. Full source code for all modules
+2. requirements.txt
+3. README with setup/run instructions
+4. sample zip repo for testing
+5. pytest tests
+6. example API requests and responses
+
+Start implementation now.
