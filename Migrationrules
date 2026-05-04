@@ -1,0 +1,878 @@
+# Production-Grade Prompt-Only Migration Agent for Java and Spring Monoliths
+
+## Executive summary
+
+A production-grade, prompt-only migration system should not be a single “mega prompt.” The reliable shape is a **file-backed, multi-agent operating model** built from repository instructions, custom agents, prompt files, and reusable skills. Current Copilot customization surfaces support repository-wide instructions in `.github/copilot-instructions.md`, path-specific instructions under `.github/instructions`, custom agents under `.github/agents`, prompt files under `.github/prompts`, and project skills under `.github/skills`. Custom agents can restrict tools and offer handoffs, prompt files act as reusable slash commands, and skills package reusable instructions and optional resources. That makes a prompt-only system viable only when it is **phase-gated, artifact-backed, and role-separated** rather than “fully autonomous in one shot.” citeturn5view0turn9view0turn11view0turn11view1turn5view3
+
+For a Java/Spring monolith, the most important preconditions are not generic architecture diagrams but **runtime-semantic facts**: transaction boundaries, whether `@Transactional` is actually applied through Spring proxies, whether logic escapes to new threads, how security filters are ordered, how config is externalized, what health and metrics endpoints exist, and whether the build is Maven reactor, Gradle multi-project, or Gradle composite. Spring’s own documentation is explicit that transactional interception happens at the proxy boundary, that thread-bound transactions do not automatically propagate to newly started threads, and that security behavior in servlet applications is mediated by `FilterChainProxy` and `SecurityFilterChain`. Maven and Gradle also distinguish materially different build topologies that a migration agent must discover before it edits anything. citeturn0search4turn0search12turn8search0turn0search2turn0search3turn0search7
+
+The safest default is **same-language migration first**. Cross-language migration should exist, but only as an explicitly approved, high-risk mode that freezes API contracts, captures golden behavior, runs side-by-side verification, and keeps strangler routing and rollback paths intact until equivalence is demonstrated. That recommendation is consistent with the strangler-fig pattern’s emphasis on incremental replacement and risk reduction, and with Spring’s framework-specific behavior around transactions, events, async execution, and security, all of which make blind language translation unsafe. citeturn1search2turn1search10turn0search4turn7search1turn3search3turn8search0
+
+Testing must be treated as a first-class control system, not a trailing activity. Spring Boot and Spring Security provide testing support for application, slice, and security-specific tests; Testcontainers supports realistic dependency-backed tests; Pact supports provider verification with Spring; and PIT mutates compiled bytecode to test whether the suite can actually detect behavior changes. In practice, a production prompt-only design should require a **feedback loop after every patch** that executes static checks, build checks, targeted tests, mutation checks where logic is critical, observability checks, and rollback validation before the next patch is allowed. citeturn0search1turn0search5turn8search1turn3search0turn3search1turn1search0turn1search16
+
+The hard limits remain real. Prompt-only Copilot systems are still bounded by context windows, repository scale, tool availability, and preview-status customization features. Prompt files are still documented as preview in some IDE surfaces, custom skills in the SDK are also documented as preview, and prompt-only orchestration cannot by itself guarantee deterministic execution over arbitrarily large repositories. The right conclusion is not “prompt-only is impossible,” but “prompt-only is only credible when its autonomy is constrained by state files, explicit gates, strict schemas, and least-privilege agent roles.” citeturn5view2turn5view3turn9view0turn11view0
+
+## Design principles and control kernel
+
+The control kernel should be deliberately conservative. Every step should be scoped to one role, one repository slice, and one patch batch. Every statement should be tagged as `CONFIRMED`, `DERIVED`, `ASSUMPTION`, or `BLOCKED`. Every phase should emit durable artifacts into a `migration/` working-memory directory so the next prompt invocation can **reload** rather than “remember.” This is a design recommendation rather than a platform guarantee, but it aligns with how custom agents, handoffs, prompt files, and project instructions are meant to be composed in practice. citeturn11view0turn9view0turn5view0
+
+A prompt-only system should also make a clean distinction between **platform-native behavior** and **prompt-layer conventions**. Native Copilot behavior can load repository instructions, prompt files, agents, and skills when configured. A strict migration system should add its own text-level conventions on top of that: explicit state echoing, explicit skill invocation markers, explicit JSON output envelopes, and explicit approval tokens. That added ceremony is not redundant; it is the main mechanism by which a probabilistic assistant becomes auditable. citeturn5view0turn11view0turn5view3
+
+The state model below is the minimum viable control plane for a prompt-only migration run.
+
+```json
+{
+  "run_id": "mig-2026-05-04T110000+0530",
+  "mode": "PLAN_ONLY",
+  "language_mode": "SAME_LANGUAGE",
+  "target_language": "UNSPECIFIED",
+  "target_framework": "UNSPECIFIED",
+  "phase": "DISCOVERY",
+  "step": "BUILD_GRAPH",
+  "status": "IN_PROGRESS",
+  "active_agent": "discovery",
+  "invoked_skills": ["repo-scan", "build-graph"],
+  "scope": {
+    "build_root": "UNSPECIFIED",
+    "modules": [],
+    "services": [],
+    "paths": []
+  },
+  "baselines": {
+    "git_head": "UNSPECIFIED",
+    "build_fingerprint": "UNSPECIFIED",
+    "api_baseline_hash": "UNSPECIFIED",
+    "db_baseline_hash": "UNSPECIFIED"
+  },
+  "open_blockers": [],
+  "approval": {
+    "plan_approved": false,
+    "execution_approved": false,
+    "db_approved": false,
+    "cross_language_approved": false
+  },
+  "last_verified_patch": null,
+  "artifacts": [
+    "migration/STATE.json",
+    "migration/FACTS.md",
+    "migration/ASSUMPTIONS.md"
+  ]
+}
+```
+
+The reload protocol should be rigid:
+
+1. Load `migration/STATE.json`.
+2. Load the phase-specific artifacts referenced in `artifacts`.
+3. Recompute a small fingerprint of the current repo slice: current `HEAD`, build-root files, relevant `pom.xml` or `settings.gradle` or `build.gradle`, and changed paths.
+4. If any fingerprint differs from the stored baseline and the difference is unexplained, emit `DRIFT_DETECTED`, append it to `FAILURE_INDEX.md`, and switch `status` to `BLOCKED`.
+5. Only then proceed to the next step.
+
+This design is especially important for monorepos and multi-module projects, because Maven’s reactor model and Gradle’s multi-project or composite build behavior mean that “the changed files” and “the effective build graph” are not the same thing. citeturn0search2turn0search3turn0search7turn0search10
+
+The phase flow should look like this:
+
+```mermaid
+flowchart TD
+    A[Readiness] --> B[Discovery]
+    B --> C[Service Definition]
+    C --> D[Target Architecture]
+    D --> E[Migration Plan]
+    E --> F{Approval Gate}
+    F -- plan only --> Z[Stop]
+    F -- approve same-language --> G[Implementation]
+    F -- approve cross-language --> G
+    G --> H[Feedback Loop]
+    H --> I{Pass}
+    I -- no --> J[Failure Recovery]
+    J --> H
+    I -- yes --> K[Cutover Readiness]
+    K --> L{Cutover Gate}
+    L -- no --> Z
+    L -- yes --> M[Controlled Cutover]
+```
+
+The approval gate is the control break between “read-only planning” and “code-changing execution.” Current custom-agent support explicitly fits that model: a planning agent can be restricted to read-only tools and hand off to an implementation agent only after the user reviews the output. citeturn11view0
+
+## Agents and skills
+
+The recommended role set is shown below. The agents are prompt-layer personas; the skills are reusable capabilities. Current Copilot docs explicitly distinguish these concepts: use **custom agents** for persistent role behavior and tool restrictions, **prompt files** for lightweight single-task commands, and **skills** for portable capabilities and optional resources. citeturn11view0turn9view0turn5view3
+
+### Required agents
+
+| Agent | Primary responsibility | Tool posture | Must emit | Must stop when |
+|---|---|---|---|---|
+| `discovery` | Inventory repo, build roots, modules, entry points, config, runtime semantics | Read-only | `FACTS.md`, `MODULE_GRAPH.md`, `OWNERSHIP_MAP.md`, `STATE.json` | build topology is ambiguous |
+| `service-boundary` | Infer bounded contexts and service candidates | Read-only | `SERVICE_CATALOG.md`, `BOUNDARY_DECISIONS.md` | ownership is ambiguous or service has no stable API/data boundary |
+| `architecture` | Define target topology, contracts, data ownership, sync/async paths | Read-only | `API_BASELINE.md`, `INTERACTION_MATRIX.md`, `DB_PLAN.md` | transactional or security semantics are unresolved |
+| `planner` | Produce waves, rollback plan, risk register, test plan, mutation plan | Read-only | `EXECUTION_PLAN.md`, `RISKS.md`, `APPROVAL_GATE.md` | approvals or unspecified target constraints are missing |
+| `implementation` | Apply one patch batch at a time | Edit-capable | patch manifest, code changes, `PATCH_LOG.ndjson` | next patch would cross an unverified boundary |
+| `stabilization` | Recover build, test, config, or wiring regressions | Edit-capable | `FAILURE_INDEX.md`, updated logs | fix count exceeds policy or root cause remains unknown |
+| `mutation` | Run PIT policy and improve test strength | Read-only or limited edit | `MUTATION_HUNTER.md`, mutation findings | critical mutants survive without a remediation plan |
+| `cutover` | Validate readiness and propose route/ownership transfer | Read-only | `CUTOVER_CHECKLIST.md`, final approval payload | any cutover criterion is unmet |
+
+### Required skills
+
+| Skill | Inputs | Outputs | Core heuristics / algorithm | Failure modes |
+|---|---|---|---|---|
+| `repo-scan` | filesystem slice, root descriptors | language/runtime/build inventory | prioritize `pom.xml`, `settings.gradle`, `build.gradle`, `src/main`, `src/test`, config files; classify by evidence only | nested repos, vendored code, generated sources mistaken as authored code |
+| `build-graph` | Maven or Gradle files | build roots, module DAG, plugin/BOM map | parse Maven aggregation/inheritance, Gradle subprojects and included builds; record parent/child/BOM/plugin inheritance separately | mixed Maven and Gradle, ad hoc shell builds, missing parent POM |
+| `runtime-semantics` | Spring annotations, config, entry points | transaction/security/async/scheduling map | detect `@Transactional`, `@TransactionalEventListener`, `@Async`, `@Scheduled`, servlet filters, Actuator usage, external config | proxy boundaries not obvious, reactive and imperative code mixed |
+| `ownership-map` | packages, module names, events, repos, docs | domain ownership candidates | favor package cohesion, aggregate roots, repo-to-service affinity, module API vs internal access | shared “common/core/platform” modules hide business logic |
+| `service-candidate` | ownership map, build graph, runtime semantics | service candidates with exclusions | reject nano-services, purely technical slices, or boundaries lacking data or logic autonomy | ambiguous ownership, chatty dependencies, distributed transaction risk |
+| `api-freeze` | controllers, listeners, clients, OpenAPI or contracts if present | API and event baselines | freeze request/response shapes, headers, auth assumptions, event schemas; mark unspecified when absent | undocumented endpoints, implicit headers, schema drift |
+| `data-cutover` | schema inventory, event flows, DB ownership map | migration mode and rollback plan | classify per table: keep, split, replicate, outbox, CDC, backfill; prefer expand/contract | cross-domain foreign keys, irreversible transforms, unknown data volume |
+| `test-strength` | unit/integration/contract tests, changed scope | targeted test plan and risk score | prefer characterization tests for unclear behavior; use Spring test slices, Testcontainers, Pact where applicable | no tests, flaky tests, unsafe reliance on H2 or mocks |
+| `pit-gate` | changed classes, critical logic map | mutation score, surviving mutant list | run PIT only on critical or changed logic; require higher thresholds for state transitions | equivalent mutants, excessive runtime, unreproducible test selection |
+| `rollback` | patch manifest, config changes, DB plan | revert steps and verification | every patch must declare revert operation and proof path; no irreversible step without explicit gate | destructive DB DDL, no baseline snapshot, route switch without fallback |
+
+A useful optional accelerator is **Spring Modulith**. Where the monolith already has coherent packages, the discovery agent can use it as an evidence source because `ApplicationModules.verify()` checks for cycles and internal-package violations, and the `Documenter` can generate module diagrams and canvases including beans, events, and configuration properties. This is not a replacement for migration planning, but it is a strong discovery and verification aid. citeturn12view1turn12view2turn6search5
+
+### Role interaction model
+
+```mermaid
+flowchart LR
+    D[Discovery Agent] --> SB[Service Boundary Agent]
+    SB --> A[Architecture Agent]
+    A --> P[Planner Agent]
+    P -->|approval required| I[Implementation Agent]
+    I --> S[Stabilization Agent]
+    I --> M[Mutation Agent]
+    S --> M
+    M --> C[Cutover Agent]
+    C -->|if not ready| P
+```
+
+### Skill invocation syntax
+
+Native Copilot skill loading is implicit: the platform decides when to use a skill based on the prompt and the skill description, and when it does so the skill context is injected for the session. For production auditability, the prompt-only migration design should add a **deterministic prompt convention** on top of that: every agent must echo the invoked skills in both prose and JSON using a syntax like `[[SKILL:build-graph]]` and `invoked_skills: ["build-graph"]`. That syntax is **not** a native GitHub feature; it is a prompt-layer convention recommended here to make transcripts auditable and diffable. citeturn5view3turn5view2
+
+## Execution plan and safety model
+
+The execution plan should be phase-based and small-batch. Same-language and cross-language should share the same early phases and diverge only after the approval gate.
+
+### Phase plan
+
+| Phase | Active agent | Required outputs | Gate to continue |
+|---|---|---|---|
+| Readiness | `discovery` | repo type, build roots, language inventory, open blockers | build topology known |
+| Discovery | `discovery` | facts, module graph, ownership candidates, runtime semantics | semantic blockers resolved or marked |
+| Service definition | `service-boundary` | service catalog, exclusions, risk notes | each candidate has owner, API shape, data story |
+| Target architecture | `architecture` | contracts, interactions, event model, observability model, DB strategy | no unresolved transactional ambiguity on chosen wave |
+| Migration plan | `planner` | waves, scope per wave, rollback, validation, mutation plan | explicit user approval |
+| Implementation | `implementation` | one patch batch only | patch feedback loop passes |
+| Stabilization | `stabilization` | repaired build/tests/config/wiring | no open critical failures |
+| Cutover readiness | `cutover` | acceptance report and route switch proposal | all cutover criteria pass |
+
+### Feedback-loop enforcement
+
+The feedback loop must be mandatory after **every** patch batch. Spring Boot’s test support, Spring Security’s test support, Actuator health endpoints, Micrometer integration, and PIT all support the individual checks needed for a credible gate; the prompt-only design here combines them into one deterministic sequence. citeturn0search1turn8search1turn1search3turn1search7turn3search6turn1search0
+
+| Check | Minimum evidence | Fail action |
+|---|---|---|
+| Static | compile-inferrable imports, lint output, module sanity | stop patch; open `BUILD_FAILURE` or `STATIC_FAILURE` |
+| Build | reactor or target subproject build succeeds | revert patch or isolate changed build root |
+| Tests | targeted unit plus slice/integration tests for affected scope | add or repair tests before proceeding |
+| Mutation | PIT threshold met for critical logic | remain blocked; improve tests |
+| Functional equivalence | baseline behavior and side effects still match | revert or switch to characterization-first |
+| Observability | health, metrics, trace correlation, log fields preserved | block cutover; fix instrumentation |
+| Rollback | revert path documented and validated | mark patch invalid |
+
+The test harness should be layered. Targeted Spring tests should be preferred first, then realistic dependency-backed tests with Testcontainers, then contract tests where service boundaries emerge, then mutation tests where business logic is critical. Pact supports Spring provider verification; Testcontainers supports JUnit 5 integration; Spring Boot supports application and slice testing; Spring Security supports security-aware test primitives. citeturn0search5turn3search0turn3search8turn3search1turn3search5turn8search1
+
+### Cross-language safety rules
+
+Cross-language migration is a separate operating mode, not a variant of same-language execution. The recommended policy is:
+
+1. Default `LANGUAGE_MODE = SAME_LANGUAGE`.
+2. Allow `CROSS_LANGUAGE` only with an explicit approval token and a specified target language and framework.
+3. Freeze API and event contracts before any rewrite.
+4. Capture characterization tests and golden payloads from the Java/Spring source.
+5. Route side-by-side through a strangler facade or controlled shadow path.
+6. Compare not just HTTP responses but DB side effects, emitted events, logs, metrics, auth behavior, and timeout/retry semantics.
+7. Keep rollback immediate and route-based until equivalence is demonstrated across representative workloads.
+
+That policy is grounded in two facts. First, the strangler-fig pattern reduces risk by incrementally replacing behavior behind a facade rather than doing a cut-over rewrite. Second, Spring runtime semantics are framework-specific: `@Transactional` is proxy-driven and thread-bound, transaction-bound events default to the commit phase, `@Async` and `@Scheduled` introduce separate execution paths, and Spring Security relies on an ordered filter chain. Those are exactly the kinds of semantics most likely to be lost in a naive translation to another stack. citeturn1search2turn1search10turn0search4turn0search12turn7search1turn3search3turn8search0
+
+A practical equivalence checklist for cross-language waves is:
+
+| Category | Must match before cutover |
+|---|---|
+| Contract | endpoint paths, verbs, status codes, auth rules, headers, idempotency behavior |
+| Data | writes, read models, transaction visibility, event payloads, backfill correctness |
+| Security | authentication entry points, authorization outcomes, security headers, failure responses |
+| Async | retry semantics, ordering assumptions, scheduled jobs, timeout behavior |
+| Observability | health, business metrics, trace IDs, alerting signals, structured logs |
+| Operations | startup profile/config resolution, secrets source, rollback path, runbook parity |
+
+### Data migration and database strategies
+
+For database changes, the migration agent should prefer **expand/contract** over destructive changes, use versioned migrations through Flyway or Liquibase, and treat CDC/outbox as the preferred mechanism for asynchronous propagation when one service must publish changes that another consumes. Debezium’s outbox event router documents the purpose of safely and reliably exchanging data through an outbox table; Flyway documents repeatable, version-controlled migrations; and Liquibase documents rollback commands. The specific choice between dual-write, outbox, or CDC is a design decision, but the safest production default is to avoid direct dual-write unless there is an explicit approval and a verified fallback. citeturn2search0turn2search12turn2search1turn2search2turn2search10
+
+| Strategy | Use when | Required proof | Rollback posture |
+|---|---|---|---|
+| Expand / contract schema | same DB, gradual ownership move | old and new code both run during overlap | high |
+| Backfill | new service needs historical state | idempotent batch plan, progress markers, validation queries | medium to high |
+| CDC / outbox | async propagation or read model sync | durable event schema, replay policy, lag monitoring | high |
+| Dual-write | only when unavoidable and explicitly approved | exact write-order contract, reconciliation job, alerting, rollback switch | low by default |
+
+Config and secrets should be treated as evidence-only inputs. Spring Boot’s configuration model is explicitly externalized across properties, YAML, env vars, and command-line arguments. If the repo does not expose a real secret source, the migration agent must mark the value `UNSPECIFIED` and block any claim of production readiness. It should never invent credentials, endpoints, or secret-manager bindings. citeturn2search3turn2search11
+
+### Mutation-hunter policy
+
+PIT exists because green tests are not always strong tests. Its official model is mutation of compiled bytecode using configurable mutators; the migration design should use that capability as a gate for critical logic, especially validations, state transitions, authorization checks, calculations, idempotency logic, and repository predicates. citeturn1search16turn1search12turn1search4
+
+Recommended mutation thresholds for a prompt-only migration policy:
+
+| Scope | Threshold | Policy |
+|---|---|---|
+| Critical migrated logic | `>= 85%` | required to leave stabilization |
+| High-risk modules | `>= 75%` | required before route shift |
+| Ordinary migrated modules | `>= 65%` | required before wave completion |
+| Untouched legacy areas | informational only | never used to justify migration |
+
+These thresholds are not vendor defaults; they are a conservative migration policy intended to make “green but weak” suites visible.
+
+## Repository layout, JSON contracts, and prompt templates
+
+The file layout below aligns with current support in entity["company","GitHub","developer platform"] Copilot and VS Code for repository instructions, path-specific instructions, custom agents, prompt files, and project skills. Repository instructions belong in `.github/copilot-instructions.md`; path-specific instructions can live under `.github/instructions`; custom agents in VS Code use `.github/agents/*.agent.md`; prompt files use `.github/prompts/*.prompt.md`; and project skills can live under `.github/skills/<skill>/SKILL.md`. citeturn5view0turn9view0turn11view0turn11view1turn5view3
+
+```text
+.github/
+├── copilot-instructions.md
+├── instructions/
+│   ├── java.instructions.md
+│   ├── database.instructions.md
+│   ├── security.instructions.md
+│   └── observability.instructions.md
+├── agents/
+│   ├── discovery.agent.md
+│   ├── service-boundary.agent.md
+│   ├── architecture.agent.md
+│   ├── planner.agent.md
+│   ├── implementation.agent.md
+│   ├── stabilization.agent.md
+│   ├── mutation.agent.md
+│   └── cutover.agent.md
+├── prompts/
+│   ├── kickoff.prompt.md
+│   ├── reload-state.prompt.md
+│   ├── approve-plan.prompt.md
+│   ├── execute-patch.prompt.md
+│   ├── run-feedback-loop.prompt.md
+│   └── open-failure.prompt.md
+└── skills/
+    ├── repo-scan/
+    │   └── SKILL.md
+    ├── build-graph/
+    │   └── SKILL.md
+    ├── runtime-semantics/
+    │   └── SKILL.md
+    ├── ownership-map/
+    │   └── SKILL.md
+    ├── service-candidate/
+    │   └── SKILL.md
+    ├── api-freeze/
+    │   └── SKILL.md
+    ├── data-cutover/
+    │   └── SKILL.md
+    ├── test-strength/
+    │   └── SKILL.md
+    ├── pit-gate/
+    │   └── SKILL.md
+    └── rollback/
+        └── SKILL.md
+
+migration/
+├── STATE.json
+├── FACTS.md
+├── ASSUMPTIONS.md
+├── RISKS.md
+├── MODULE_GRAPH.md
+├── OWNERSHIP_MAP.md
+├── SERVICE_CATALOG.md
+├── API_BASELINE.md
+├── DB_PLAN.md
+├── EXECUTION_PLAN.md
+├── APPROVAL_GATE.md
+├── PATCH_LOG.ndjson
+├── FEEDBACK_LOG.ndjson
+├── MUTATION_HUNTER.md
+├── FAILURE_INDEX.md
+└── CUTOVER_CHECKLIST.md
+```
+
+### Core output envelopes
+
+A prompt-only system works best when every step returns a compact, machine-checkable envelope instead of free-form essays.
+
+#### Base step envelope
+
+```json
+{
+  "run_id": "string",
+  "phase": "READINESS|DISCOVERY|SERVICE_DEFINITION|ARCHITECTURE|PLANNING|IMPLEMENTATION|STABILIZATION|CUTOVER",
+  "step": "string",
+  "agent": "string",
+  "invoked_skills": ["string"],
+  "scope": {
+    "paths": ["string"],
+    "modules": ["string"],
+    "services": ["string"]
+  },
+  "classification": "CONFIRMED|DERIVED|ASSUMPTION|BLOCKED",
+  "status": "PASS|FAIL|BLOCKED|PARTIAL",
+  "inputs": ["string"],
+  "artifacts_written": ["string"],
+  "open_blockers": ["string"],
+  "next_action": "string"
+}
+```
+
+#### Discovery payload
+
+```json
+{
+  "build_systems": ["maven", "gradle"],
+  "build_roots": ["."],
+  "module_graph": [
+    {
+      "module": "billing-core",
+      "type": "runtime|library|test-support|aggregator|generated",
+      "depends_on": ["common-domain"],
+      "confidence": "HIGH"
+    }
+  ],
+  "runtime_semantics": {
+    "transactional_paths": ["com.example.billing..*"],
+    "async_paths": ["com.example.jobs..*"],
+    "scheduled_paths": ["com.example.jobs.InvoiceSweep"],
+    "security_paths": ["SecurityFilterChain"],
+    "actuator": true
+  }
+}
+```
+
+#### Service-definition payload
+
+```json
+{
+  "service_candidates": [
+    {
+      "name": "billing",
+      "owner_domain": "billing",
+      "source_modules": ["billing-core", "billing-api"],
+      "excluded_paths": ["common-domain"],
+      "inbound_contracts": ["POST /invoices"],
+      "outbound_dependencies": ["payments", "notifications"],
+      "data_ownership": ["invoice", "invoice_line"],
+      "risk": "HIGH"
+    }
+  ]
+}
+```
+
+#### Patch payload
+
+```json
+{
+  "patch_id": "wave-1-patch-003",
+  "goal": "extract billing read facade",
+  "changed_files": ["src/main/java/..."],
+  "rollback_steps": ["git revert patch or restore files from baseline"],
+  "expected_checks": ["build", "targeted-tests", "observability", "rollback"],
+  "cross_language": false
+}
+```
+
+#### Feedback-loop payload
+
+```json
+{
+  "patch_id": "wave-1-patch-003",
+  "checks": {
+    "static": "PASS",
+    "build": "PASS",
+    "tests": "PASS",
+    "mutation": "PASS",
+    "functional_equivalence": "PASS",
+    "observability": "PASS",
+    "rollback": "PASS"
+  },
+  "mutation_score": 87.2,
+  "issues": [],
+  "decision": "ADVANCE"
+}
+```
+
+#### Approval-gate payload
+
+```json
+{
+  "plan_summary": "string",
+  "language_mode": "SAME_LANGUAGE|CROSS_LANGUAGE",
+  "target_language": "UNSPECIFIED|string",
+  "target_framework": "UNSPECIFIED|string",
+  "waves": ["string"],
+  "risks": ["string"],
+  "rollback_summary": "string",
+  "verification_plan": ["string"],
+  "requires_user_reply": [
+    "LANGUAGE_MODE=...",
+    "YES_EXECUTE_PHASE or YES_PLAN_ONLY or NO_STOP"
+  ]
+}
+```
+
+### Root instruction file
+
+```markdown
+# .github/copilot-instructions.md
+
+You are part of a prompt-only migration operating model for Java/Spring monolith to microservices.
+
+Global rules:
+- Never claim a fact without repository evidence.
+- Every material statement must be classified as CONFIRMED, DERIVED, ASSUMPTION, or BLOCKED.
+- Default mode is PLAN_ONLY.
+- Default language mode is SAME_LANGUAGE.
+- CROSS_LANGUAGE requires explicit approval and a specified target language and framework.
+- Never modify more than one logical patch batch at a time.
+- After every patch batch, run the mandatory feedback loop:
+  static -> build -> tests -> mutation (if critical) -> functional equivalence -> observability -> rollback
+- Never continue after a FAIL or BLOCKED result.
+- Never invent secrets, endpoints, schemas, queues, topics, or ownership.
+- Reload migration/STATE.json at the start of every task.
+- If current repo state conflicts with stored state, emit DRIFT_DETECTED and stop.
+
+Required working-memory artifacts:
+migration/STATE.json
+migration/FACTS.md
+migration/ASSUMPTIONS.md
+migration/RISKS.md
+migration/MODULE_GRAPH.md
+migration/SERVICE_CATALOG.md
+migration/EXECUTION_PLAN.md
+migration/APPROVAL_GATE.md
+migration/PATCH_LOG.ndjson
+migration/FEEDBACK_LOG.ndjson
+migration/MUTATION_HUNTER.md
+migration/FAILURE_INDEX.md
+```
+
+### Full example agent prompt
+
+```markdown
+---
+name: discovery
+description: Read-only discovery agent for Java/Spring monolith inventory, build topology, runtime semantics, and evidence capture
+tools: ["search/codebase", "search/files", "search/text"]
+model: ["GPT-5.2 (copilot)", "Claude Sonnet 4.5 (copilot)"]
+handoffs:
+  - label: Define Service Boundaries
+    agent: service-boundary
+    prompt: Use the current discovery artifacts to propose bounded contexts and service candidates. Do not edit code.
+    send: false
+---
+
+# Discovery agent
+
+Role:
+- You are the read-only discovery authority.
+- You do not edit files outside migration/.
+- You do not propose implementation patches in this mode.
+
+Mandatory reload:
+1. Load migration/STATE.json if present.
+2. Load FACTS.md, ASSUMPTIONS.md, MODULE_GRAPH.md, RISKS.md if present.
+3. Recompute a lightweight fingerprint of build roots and changed paths.
+4. If drift is detected, output BLOCKED with reason DRIFT_DETECTED.
+
+Always invoke and echo skills:
+- [[SKILL:repo-scan]]
+- [[SKILL:build-graph]]
+- [[SKILL:runtime-semantics]]
+
+Required tasks:
+- detect language(s), Java version, framework version(s), build system(s)
+- identify Maven reactor roots, Gradle subprojects, Gradle included builds
+- identify entry points, controllers, listeners, schedulers, async jobs
+- identify transaction boundaries, security filter chains, actuator presence, externalized config
+- classify generated code separately from authored code
+- write only repository-backed facts
+
+Output contract:
+- return the base JSON step envelope
+- write migration/FACTS.md
+- write migration/MODULE_GRAPH.md
+- append new assumptions to migration/ASSUMPTIONS.md
+- never mark COMPLETE if build topology or runtime semantics remain ambiguous
+
+Stop conditions:
+- mixed build roots with unresolved ownership
+- missing parent POM or broken included build graph
+- evidence of transactional or security semantics that cannot yet be traced
+```
+
+### Full example skill file
+
+```markdown
+---
+name: build-graph
+description: Discover Maven reactor roots, Gradle multi-project/composite builds, plugin and BOM inheritance, and emitted module DAG
+---
+
+# Skill: build-graph
+
+Use this skill only for repository discovery and drift checks.
+
+Inputs:
+- root and nested build descriptors:
+  - pom.xml
+  - .mvn/*
+  - settings.gradle / settings.gradle.kts
+  - build.gradle / build.gradle.kts
+  - gradle.properties
+  - buildSrc/ and included build paths
+
+Outputs:
+- list of build roots
+- list of modules/subprojects/included builds
+- module dependency DAG
+- plugin inheritance map
+- BOM / platform inheritance map
+- generated-code or annotation-processor indicators
+- unresolved or suspicious build topology markers
+
+Algorithm:
+1. Prefer top-level build descriptors before source directories.
+2. For Maven:
+   - distinguish aggregation from inheritance
+   - record parent relationships separately from inter-module dependencies
+   - record reactor consistency risks
+3. For Gradle:
+   - parse subprojects and included builds separately
+   - detect buildSrc or convention plugins
+   - note composite boundaries that can change dependency resolution behavior
+4. Classify each module as:
+   - aggregator
+   - runtime app
+   - library
+   - shared module
+   - test-support
+   - generated/source-derived
+5. Emit CONFIRMED only when directly supported by descriptors.
+
+Heuristics:
+- A module named common/core/shared/platform/utils is not pure utility by default.
+- A module with controllers, repositories, entities, listeners, or config properties is business-relevant until disproven.
+- buildSrc, convention plugins, annotation processors, and generated sources raise migration risk.
+
+Failure modes:
+- nested independent repos
+- missing parent POM
+- Gradle composite builds not rooted where expected
+- generated sources treated as authored code
+- plugin-generated classes that affect runtime behavior
+
+When failure occurs:
+- emit BLOCKED
+- include exact missing or ambiguous file paths
+- recommend the smallest next repository slice to inspect
+```
+
+### Compact copy-paste agent prompts for each phase and role
+
+```markdown
+# .github/agents/service-boundary.agent.md
+---
+name: service-boundary
+description: Propose bounded contexts and service candidates from discovery artifacts only
+tools: ["search/codebase", "search/files", "search/text"]
+handoffs:
+  - label: Design Target Architecture
+    agent: architecture
+    prompt: Use the approved service candidates to define APIs, events, ownership, and topology.
+    send: false
+---
+Load migration/STATE.json, FACTS.md, MODULE_GRAPH.md, OWNERSHIP_MAP.md.
+Invoke [[SKILL:ownership-map]] and [[SKILL:service-candidate]].
+Reject nano-services, technical-only slices, and boundaries without independent data or logic.
+Return JSON only, write SERVICE_CATALOG.md and BOUNDARY_DECISIONS.md.
+Stop if ownership is ambiguous or a candidate requires unresolved distributed transactions.
+```
+
+```markdown
+# .github/agents/architecture.agent.md
+---
+name: architecture
+description: Define target topology, APIs, events, observability, and DB ownership
+tools: ["search/codebase", "search/files", "search/text"]
+handoffs:
+  - label: Produce Migration Plan
+    agent: planner
+    prompt: Turn the architecture into phased migration waves and an approval gate.
+    send: false
+---
+Load migration/STATE.json, FACTS.md, SERVICE_CATALOG.md.
+Invoke [[SKILL:api-freeze]], [[SKILL:data-cutover]], [[SKILL:runtime-semantics]].
+Produce API_BASELINE.md, DB_PLAN.md, INTERACTION_MATRIX.md.
+Default to strangler routing and rollback-first design.
+Stop if transaction, auth, or event semantics are unresolved.
+```
+
+```markdown
+# .github/agents/planner.agent.md
+---
+name: planner
+description: Build execution waves, rollback plans, risk register, and approval gate
+tools: ["search/codebase", "search/files", "search/text"]
+handoffs:
+  - label: Review Approval Gate
+    agent: cutover
+    prompt: Review the generated approval package for completeness only. Do not approve it.
+    send: false
+---
+Load migration/STATE.json and all planning artifacts.
+Invoke [[SKILL:test-strength]], [[SKILL:pit-gate]], [[SKILL:rollback]].
+Emit EXECUTION_PLAN.md, RISKS.md, APPROVAL_GATE.md.
+Set mode PLAN_ONLY unless explicit approval token already exists.
+Do not hand off to implementation unless user approval is present.
+```
+
+```markdown
+# .github/agents/implementation.agent.md
+---
+name: implementation
+description: Apply exactly one patch batch and then stop for verification
+tools: ["search/codebase", "search/files", "search/text", "editFiles"]
+handoffs:
+  - label: Run Stabilization
+    agent: stabilization
+    prompt: Verify and repair the current patch batch only.
+    send: false
+---
+Load migration/STATE.json, EXECUTION_PLAN.md, APPROVAL_GATE.md.
+Refuse to run if plan_approved is false.
+Invoke only the minimum skills needed for the current patch.
+Change only the approved scope.
+Write PATCH_LOG.ndjson entry and return patch payload JSON.
+Do not perform a second patch in the same turn.
+```
+
+```markdown
+# .github/agents/stabilization.agent.md
+---
+name: stabilization
+description: Recover build, wiring, config, or test regressions caused by the latest patch batch
+tools: ["search/codebase", "search/files", "search/text", "editFiles"]
+handoffs:
+  - label: Run Mutation Gate
+    agent: mutation
+    prompt: Evaluate mutation readiness for the affected critical logic.
+    send: false
+---
+Load migration/STATE.json and the latest PATCH_LOG.ndjson entry.
+Invoke [[SKILL:runtime-semantics]], [[SKILL:test-strength]], [[SKILL:rollback]].
+No new features, no refactors, no unrelated cleanup.
+Fix one failure class at a time.
+If three fixes fail for the same signature, emit STALLED.
+```
+
+```markdown
+# .github/agents/mutation.agent.md
+---
+name: mutation
+description: Apply mutation-testing policy and decide whether test strength is adequate
+tools: ["search/codebase", "search/files", "search/text"]
+handoffs:
+  - label: Evaluate Cutover Readiness
+    agent: cutover
+    prompt: Use the mutation and feedback artifacts to assess readiness, not to approve cutover.
+    send: false
+---
+Load migration/STATE.json, FEEDBACK_LOG.ndjson, MUTATION_HUNTER.md.
+Invoke [[SKILL:pit-gate]] and [[SKILL:test-strength]].
+Target changed critical logic only.
+Emit surviving mutants, test weakness explanations, and required remediation.
+Block progression if mutation policy is unmet.
+```
+
+```markdown
+# .github/agents/cutover.agent.md
+---
+name: cutover
+description: Audit readiness for route switch or ownership transfer
+tools: ["search/codebase", "search/files", "search/text"]
+---
+Load migration/STATE.json and all gate artifacts.
+Verify build, tests, mutation thresholds, observability, rollback, API parity, and DB validation.
+For cross-language, require side-by-side equivalence evidence.
+Produce CUTOVER_CHECKLIST.md and approval-gate JSON.
+Never approve if any required field remains UNSPECIFIED.
+```
+
+```markdown
+# .github/agents/reload-state.agent.md
+---
+name: reload-state
+description: Rebuild migration context from repository artifacts and detect drift
+tools: ["search/files", "search/text"]
+user-invocable: false
+---
+Load migration/STATE.json and all referenced artifacts.
+Recompute lightweight repo fingerprints.
+If fingerprints differ without explanation, emit BLOCKED and reason DRIFT_DETECTED.
+Return only the base JSON step envelope.
+```
+
+### Useful prompt files
+
+```markdown
+# .github/prompts/kickoff.prompt.md
+---
+name: kickoff-migration
+description: Start or resume the migration operating model
+agent: discovery
+---
+Reload migration state if present. If no state exists, initialize migration/STATE.json and run readiness + discovery on the current repository slice. Do not edit source code outside migration/.
+```
+
+```markdown
+# .github/prompts/approve-plan.prompt.md
+---
+name: approve-plan
+description: Record the user's approval decision in a structured way
+agent: planner
+---
+Use the current APPROVAL_GATE.md and update migration/STATE.json only if the user explicitly provides:
+- LANGUAGE_MODE=SAME_LANGUAGE or CROSS_LANGUAGE
+- target language/framework if cross-language
+- YES_EXECUTE_PHASE or YES_PLAN_ONLY or NO_STOP
+If any field is missing, leave approval unchanged and output BLOCKED.
+```
+
+## Edge cases, recovery policies, gates, and audit artifacts
+
+### Edge cases and handling
+
+The table below lists the edge cases that most often break prompt-only migration systems and the required handling policy. Where official framework behavior matters, the handling is anchored in those sources; where no single source exists, the response is a conservative design recommendation.
+
+| Edge case | Detection evidence | Responsible agent / skill | Required handling |
+|---|---|---|---|
+| Maven multi-module reactor | aggregator POM, parent relationships, reactor convergence risk | `discovery` + `build-graph` | separate aggregation from inheritance; never assume root-only build means isolated scope |
+| Gradle composite builds | `includeBuild`, included builds, convention plugins | `discovery` + `build-graph` | model included builds separately; do not patch across composite boundaries in one batch |
+| Generated code | annotation processors, generated-sources, codegen plugins | `discovery` + `build-graph` | classify as generated; patch source definitions, not generated output |
+| Shared modules with hidden business logic | `common/core/shared/platform` packages containing entities/services/repos | `service-boundary` + `ownership-map` | treat as business-relevant until ownership is proven; block extraction if ownership remains ambiguous |
+| Ambiguous ownership | one table or workflow touched by many modules without authoritative owner | `service-boundary` | emit `BLOCKED`; require ownership decision before extraction |
+| Transactional boundaries | `@Transactional`, transaction-bound events, nested service calls | `architecture` + `runtime-semantics` | freeze the boundary; prefer same-language extraction or facade-first isolation |
+| Eventual consistency paths | async listeners, outbox, message relays, batch jobs | `architecture` + `data-cutover` | use outbox/CDC or replay-capable event baselines; never assume sync semantics |
+| Async and scheduled work | `@Async`, `@Scheduled`, MVC async return types | `discovery` + `runtime-semantics` | create separate equivalence checks for timing, retries, and thread behavior |
+| External integrations | HTTP clients, messaging adapters, Spring Integration endpoints | `architecture` + `api-freeze` | baseline request/response/event schemas and failure behavior before moving code |
+| Secrets and config resolution | externalized config, env vars, Vault refs, profile-specific properties | `discovery` + `runtime-semantics` | never invent values; unresolved production secrets remain `UNSPECIFIED` and block readiness |
+| Missing tests | no characterization or contract coverage on changed path | `planner` + `test-strength` | require characterization tests before risky change; no “green by absence” allowed |
+| Large repo token limits | monorepo, many modules, huge generated files | all agents | process by build root, module, package, and contract boundary; summarize into artifacts between turns |
+| Security chain sensitivity | `SecurityFilterChain`, custom filters, method security | `architecture` + `stabilization` | preserve authn/authz order and security tests; block cutover without parity |
+| Async event publication after commit | `@TransactionalEventListener` and outbox/event bridges | `architecture` + `data-cutover` | verify commit-phase semantics and downstream timing before route movement |
+
+Spring’s transaction, event, async, scheduling, and security documentation is why these edge cases are not optional details: they materially change behavior. Spring Boot’s external configuration and Actuator also make config and operational parity first-order migration concerns. citeturn0search4turn0search12turn7search1turn3search3turn3search15turn8search0turn2search3turn1search3
+
+### Failure classification and recovery
+
+| Failure class | Typical trigger | Owner | Recovery policy |
+|---|---|---|---|
+| `STATIC_FAILURE` | missing imports, package drift, stale references | `stabilization` | repair current patch only |
+| `BUILD_FAILURE` | reactor break, plugin failure, config mismatch | `stabilization` | fix build root first; do not continue feature work |
+| `TEST_FAILURE` | broken unit/slice/integration/security test | `stabilization` | add characterization if behavior was unclear, then repair |
+| `FUNCTIONAL_DRIFT` | same inputs, different outputs or side effects | `implementation` then `stabilization` | revert or facade the change; do not normalize drift |
+| `MUTATION_WEAKNESS` | surviving critical mutants | `mutation` | strengthen tests, do not waive silently |
+| `OBSERVABILITY_GAP` | missing health, metric, trace, log parity | `architecture` then `stabilization` | block cutover until restored |
+| `DB_RISK` | destructive DDL, unsafe backfill, orphaned ownership | `architecture` + `planner` | roll back to expand/contract or stop |
+| `DRIFT_DETECTED` | repo changed outside recorded plan | `reload-state` | block and refresh baselines |
+| `STALLED` | same normalized failure after three repair attempts | `stabilization` | emit root-cause report and stop |
+| `OSCILLATION` | fixes alternate between two failure states | `stabilization` | revert last patch, isolate a smaller scope |
+
+### Approval gate format
+
+The approval gate should exist in both human-readable Markdown and machine-readable JSON.
+
+```markdown
+# migration/APPROVAL_GATE.md
+
+Status: PENDING
+
+Plan summary:
+- scope:
+- selected wave:
+- patch size policy:
+- language mode:
+- target language/framework:
+- unresolved assumptions:
+- top risks:
+- rollback summary:
+- validation summary:
+- mutation summary:
+- DB strategy:
+- observability checks:
+- cutover style:
+
+Required user reply:
+- LANGUAGE_MODE=SAME_LANGUAGE
+  or
+- LANGUAGE_MODE=CROSS_LANGUAGE
+- TARGET_LANGUAGE=<language>
+- TARGET_FRAMEWORK=<framework>
+
+Then one of:
+- YES_EXECUTE_PHASE
+- YES_PLAN_ONLY
+- NO_STOP
+```
+
+```json
+{
+  "status": "PENDING",
+  "language_mode": "SAME_LANGUAGE|CROSS_LANGUAGE",
+  "target_language": "UNSPECIFIED|string",
+  "target_framework": "UNSPECIFIED|string",
+  "wave_id": "string",
+  "approved_scope": ["string"],
+  "risks": ["string"],
+  "rollback_summary": "string",
+  "verification_plan": ["string"],
+  "required_reply_tokens": [
+    "LANGUAGE_MODE=...",
+    "YES_EXECUTE_PHASE|YES_PLAN_ONLY|NO_STOP"
+  ]
+}
+```
+
+### Audit artifacts and acceptance criteria
+
+The artifact set below is the minimum needed for full auditability.
+
+| Artifact | Produced by | Purpose | Acceptance criterion |
+|---|---|---|---|
+| `STATE.json` | every agent | canonical run state | valid JSON and current phase/step consistent |
+| `FACTS.md` | `discovery` | evidence-backed facts only | every fact has source path or build evidence |
+| `ASSUMPTIONS.md` | any agent | unresolved assumptions | each assumption has risk and owner |
+| `MODULE_GRAPH.md` | `discovery` | build/module topology | root, child, and dependency distinctions are explicit |
+| `SERVICE_CATALOG.md` | `service-boundary` | selected and rejected service candidates | each candidate has owner, contract story, and data story |
+| `API_BASELINE.md` | `architecture` | endpoint and event baseline | all moved paths have explicit baseline or are marked unspecified |
+| `DB_PLAN.md` | `architecture` | ownership, schema, backfill, CDC, rollback | no destructive action lacks approval and rollback |
+| `EXECUTION_PLAN.md` | `planner` | wave sequencing and patch sizing | every wave has prerequisites, checks, rollback |
+| `PATCH_LOG.ndjson` | `implementation` | immutable patch record | one entry per patch batch |
+| `FEEDBACK_LOG.ndjson` | `stabilization` | immutable check outcomes | one entry per patch batch with pass/fail by check |
+| `MUTATION_HUNTER.md` | `mutation` | mutation scope and evidence | critical paths have explicit decision |
+| `FAILURE_INDEX.md` | `stabilization` | normalized failures and attempts | stalled or oscillating paths are visible |
+| `CUTOVER_CHECKLIST.md` | `cutover` | final readiness record | every required gate is pass or explicitly blocked |
+
+Spring Modulith can optionally generate documentation artifacts that fit naturally into this audit model, especially module diagrams and canvases. OpenRewrite also fits naturally, but only as a **skill-level helper** for code transformations or framework upgrades, because its official operating model is recipe-driven refactoring, not architectural decomposition or gated migration control. citeturn12view2turn12view0turn1search1
+
+## Limitations and assumptions
+
+A prompt-only system is still limited by context size, repository size, and tool access. Custom agents help by restricting tools and enabling handoffs, but they do not create a true transactionally isolated workflow engine. Prompt files are useful for reusable commands, but they remain an invocation layer, not a scheduler. Skills improve repeatability, but they are still instructions injected into a model context, not hard guarantees of execution. Some current Copilot customization features are also documented as preview or subject to change. citeturn11view0turn9view0turn5view2turn11view1
+
+A prompt-only system also cannot guarantee semantic equivalence in the absence of executable evidence. That matters most for cross-language moves: a translated service can preserve endpoint shape and still break transaction timing, event ordering, security responses, or config resolution. For that reason, the system described here treats **same-language migration as the default** and **cross-language migration as an exceptional, explicitly approved mode**. That is an engineering judgment supported by the Spring runtime behaviors documented in the framework references. citeturn0search4turn7search1turn3search3turn8search0
+
+The design above assumes the following are **unspecified unless observed or supplied**: target language, target framework, deployment platform, message broker, database engine, secret source, SLOs, cutover window, and regulatory constraints. Under this model, “unspecified” is a valid and expected state. It must never be silently filled with invention. The migration agent should preserve that label until evidence exists or the user approves a specific value. That is the core anti-hallucination rule of the whole system.
