@@ -1,0 +1,105 @@
+---
+name: <skill-name>
+description: <WHEN Copilot should use this skill. Be precise and trigger-based.>
+---
+
+# 🧠 Skill: <skill-name>
+
+## 🎯 Goal
+Define the exact outcome this skill achieves.
+- Must be measurable
+- Must be production-relevant
+- No vague wording
+
+---
+
+## 📌 When to Use
+Use this skill ONLY when:
+- <clear condition 1>
+- <clear condition 2>
+- <clear condition 3>
+
+Do NOT use when:
+- <explicit exclusion 1>
+- <explicit exclusion 2>
+
+---
+
+## 📥 Required Inputs
+List ALL required inputs. If missing → mark as `UNSPECIFIED`.
+
+- Codebase context
+- Framework/library (if known)
+- Data/schema (if applicable)
+- API contracts (if applicable)
+- Constraints (performance, security, etc.)
+
+---
+
+## ⚙️ Execution Steps (STRICT)
+
+1. Analyze existing code / repo
+2. Identify integration points
+3. Validate assumptions (or mark UNSPECIFIED)
+4. Implement minimal safe changes
+5. Handle edge cases
+6. Validate output
+
+---
+
+## 🧩 Implementation Rules
+
+- Do NOT assume:
+  - frameworks
+  - libraries
+  - APIs
+  - infra
+- Prefer:
+  - typed schemas (Pydantic)
+  - modular code
+  - reusable components
+- Ensure:
+  - idempotency
+  - error handling
+  - logging
+
+---
+
+## 🔐 Safety & Guardrails
+
+- Reject unsafe execution
+- Prevent:
+  - infinite loops
+  - uncontrolled retries
+  - unvalidated tool calls
+- Mask sensitive data if present
+
+---
+
+## 🧠 Anti-Hallucination Rules
+
+- NEVER fabricate:
+  - APIs
+  - endpoints
+  - model capabilities
+- If unknown → return `UNSPECIFIED`
+- Validate:
+  - data flow
+  - dependencies
+  - logic correctness
+
+---
+
+## 📤 Output Format (MANDATORY)
+
+Return in this structure:
+
+### ✅ What was done
+- <summary>
+
+### 📁 Files modified/created
+- <file paths>
+
+### ⚙️ Implementation
+```python
+# actual code
