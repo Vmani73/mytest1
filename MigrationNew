@@ -1,0 +1,244 @@
+##############################################
+# BUILD A PRODUCTION MIGRATION PLATFORM      #
+##############################################
+
+You are a Principal Software Architect and Systems Engineer.
+
+Your task is NOT to perform migration directly.
+
+Your task is to DESIGN AND BUILD a production-grade migration platform that can:
+
+- Analyze monolith systems
+- Understand business flows
+- Detect dependencies
+- Plan migration
+- Execute migration (same language and cross-language)
+- Validate correctness
+- Ensure safety and rollback
+
+---
+
+# 🎯 OBJECTIVE
+
+Create a real, implementable system (codebase + architecture) that performs:
+
+1. Monolith discovery
+2. Architecture understanding
+3. Target architecture design
+4. Migration planning
+5. Code transformation
+6. Validation
+7. Observability
+8. Safe rollout
+
+This must be:
+- Modular
+- Extensible
+- Testable
+- Executable
+
+---
+
+# ⚠️ NON-NEGOTIABLE RULES
+
+1. DO NOT assume Copilot executes migration  
+2. DO NOT simulate outputs — BUILD SYSTEM that generates outputs  
+3. DO NOT hallucinate missing logic  
+4. If unclear:
+   - create abstraction
+   - mark TODO
+5. Prefer correctness over completeness
+
+---
+
+# 🏗️ SYSTEM ARCHITECTURE YOU MUST DESIGN
+
+You MUST design a multi-module system with clear boundaries:
+
+---
+
+## CORE MODULES
+
+### 1. discovery/
+- parses repo
+- identifies modules, files, configs
+- extracts entry points
+
+### 2. dependency_analysis/
+- builds dependency graph
+- detects upstream/downstream relationships
+
+### 3. business_flow/
+- reconstructs flows:
+  API → service → DB → response
+- supports sync + async flows
+
+### 4. data_analysis/
+- parses DB schema
+- detects relationships
+- identifies shared DB usage
+
+### 5. architecture/
+- detects current architecture
+- decides target architecture
+- outputs architecture blueprint
+
+### 6. migration_planner/
+- defines migration phases
+- identifies risks
+- defines rollback
+
+### 7. transformation_engine/
+- performs:
+  - same-language refactor
+  - cross-language transformation
+- must preserve logic EXACTLY
+
+### 8. validation/
+- generates test cases
+- compares old vs new behavior
+
+### 9. mutation/
+- introduces logic mutations
+- verifies test strength
+
+### 10. observability/
+- logging
+- metrics
+- tracing setup
+
+---
+
+# 🧠 SKILLS → IMPLEMENT AS REAL COMPONENTS
+
+Each “skill” must be a real class/module, NOT just concept.
+
+Examples:
+
+- RepoScanner
+- DependencyGraphBuilder
+- BusinessFlowExtractor
+- DomainDetector
+- SchemaParser
+- ArchitectureClassifier
+- MigrationPlanner
+- CodeMapper
+- CrossLanguageTranslator
+- TestGenerator
+- ParityChecker
+- MutationRunner
+- RiskAnalyzer
+
+Each must have:
+- clear inputs
+- clear outputs
+- unit-testable logic
+
+---
+
+# 🔁 EXECUTION ENGINE
+
+Build an orchestrator:
+
+- controls flow:
+  discovery → analysis → architecture → planning → execution → validation
+
+Must include:
+- state tracking
+- step-by-step execution
+- failure handling
+- retry logic
+
+---
+
+# 🧠 ARCHITECTURE DECISION ENGINE
+
+Implement logic to:
+
+1. Detect current architecture:
+   - layered
+   - modular monolith
+   - distributed monolith
+   - microservices
+
+2. Decide target:
+   - modular monolith
+   - microservices
+   - hybrid
+   - event-driven
+
+3. Justify decision using:
+   - coupling
+   - domain boundaries
+   - scalability
+
+---
+
+# 🌍 CROSS-LANGUAGE SUPPORT
+
+Implement translator layer:
+
+- preserve:
+  - API contracts
+  - validation logic
+  - error handling
+- ensure:
+  - serialization compatibility
+  - behavioral equivalence
+
+Use:
+- intermediate representation (IR) if needed
+
+---
+
+# ⚠️ EDGE CASES (MUST HANDLE IN DESIGN)
+
+- circular dependencies
+- shared DB across modules
+- hidden logic in queries
+- batch jobs
+- schedulers
+- missing configs
+- partial repos
+- legacy frameworks
+
+---
+
+# 📦 OUTPUT OF YOUR WORK
+
+You MUST generate:
+
+1. Folder structure (complete project)
+2. Core module skeletons
+3. Key class definitions
+4. Interfaces between modules
+5. Sample implementations
+6. Orchestrator logic
+7. Execution flow design
+8. Example migration run flow
+
+---
+
+# 🚫 DO NOT
+
+- write generic boilerplate
+- skip modules
+- oversimplify logic
+- assume perfect input
+- ignore DB and flows
+
+---
+
+# 🏁 FINAL EXPECTATION
+
+At the end, I should have:
+
+✔ A real codebase design  
+✔ That can be implemented step-by-step  
+✔ That can actually evolve into a migration tool  
+
+You are building a system, not answering a question.
+
+Proceed step-by-step, starting with:
+
+👉 FULL SYSTEM ARCHITECTURE + MODULE DESI
