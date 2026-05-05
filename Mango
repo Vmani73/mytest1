@@ -1,0 +1,210 @@
+You are a senior backend architect. Refactor the indexing system into a production-grade, concurrency-safe, failure-resilient system. Keep the design simple, deterministic, and robust. Do NOT over-engineer.
+
+---
+
+## 🔴 NON-NEGOTIABLE RULES
+
+1. MongoDB MUST remain
+- MongoDB is the single source of truth
+- Do NOT remove or replace it
+- Remove only SQLite or fallback logic
+
+2. System must be safe for:
+- multiple API requests (concurrent)
+- multiple threads
+- multiple worker processes
+- crashes and retries
+
+---
+
+## 🧠 CORE DESIGN
+
+### 1. Idempotent Job Creation (No Duplicates)
+- Each request must generate a deduplication key:
+    job_key = repo_id + job_type + commit_hash (or request_id)  
+- Create jobs using atomic upsert
+- Add unique index on job_key
+- If duplicate request comes:
+  - return existing job_id
+  - DO NOT create new job
+
+---
+
+### 2. Atomic Job Claiming (THREAD-SAFE / PROCESS-SAFE)
+
+Workers MUST claim jobs using MongoDB findOneAndUpdate ONLY:
+
+Criteria:
+- status = QUEUED OR RETRYABLE
+- OR status = IN_PROGRESS AND lease_until expired
+
+Atomic update:
+- set status = IN_PROGRESS
+- set leased_by = worker_id
+- set lease_until = now + timeout
+- increment attempts
+
+⚠️ NEVER:
+- use find() then update()
+- use in-memory locks
+
+This is the ONLY concurrency control.
+
+---
+
+### 3. Lease-Based Processing (Crash Safe)
+- Every job has lease_until
+- If worker crashes:
+  - job becomes reclaimable after lease expiry
+- Workers must:
+  - process ONLY jobs they leased
+  - verify lease ownership before updating status
+
+---
+
+### 4. Strict Manifest Validation (FAIL FAST)
+
+Before processing:
+- repo_id exists
+- repo_path exists
+- repo_path accessible
+
+If invalid:
+- mark job FAILED
+- log exact reason
+- DO NOT continue
+
+---
+
+### 5. Startup Health Check (FAIL FAST)
+
+On app start:
+- verify MongoDB connection
+- verify collections exist
+- verify indexes exist
+
+If ANY fails:
+- STOP application
+- log CRITICAL error
+
+No “best-effort” mode allowed.
+
+---
+
+## 🧱 DATABASE STRUCTURE
+
+### repository_manifests
+- repo_id (unique)
+- repo_path
+- status
+- timestamps
+
+### indexing_jobs
+- job_id
+- job_key (unique)
+- repo_id
+- status (QUEUED, IN_PROGRESS, RETRYABLE, FAILED, COMPLETED)
+- leased_by
+- lease_until
+- attempts
+- error_message
+- timestamps
+
+---
+
+## 📌 REQUIRED INDEXES
+
+- unique(job_key)
+- unique(repo_id)
+- index(status, lease_until, created_at)
+- index(repo_id, status)
+
+---
+
+## ⚙️ CONCURRENCY GUARANTEES
+
+System MUST ensure:
+- no duplicate jobs
+- no multiple workers processing same job
+- no job lost on crash
+- safe retry handling
+- idempotent processing
+
+---
+
+## 🔁 RETRY LOGIC
+
+- retry on failure with exponential backoff
+- max_attempts configurable
+- if exceeded → mark FAILED permanently
+
+---
+
+## 🧾 LOGGING (STRICT)
+
+Use structured logging (JSON preferred)
+
+Each log MUST include:
+- timestamp
+- level (INFO/WARN/ERROR/CRITICAL)
+- service/component
+- repo_id
+- job_id
+- worker_id
+- request_id
+- message
+- stack_trace (if error)
+
+❌ Avoid vague logs  
+✅ Always log exact reason
+
+---
+
+## ❗ EXCEPTION HANDLING
+
+- Do NOT swallow exceptions
+- Always:
+  - log full error + stack trace
+  - update job status correctly
+
+Define clear exceptions:
+- ManifestValidationError
+- DatabaseError
+- JobProcessingError
+
+---
+
+## 🔄 RECOVERY
+
+- Requeue jobs where:
+  - status = IN_PROGRESS
+  - lease expired
+- Ensure idempotent execution (safe to retry)
+
+---
+
+## 📦 DELIVERABLES
+
+Refactor and provide:
+1. MongoDB connection module
+2. Job repository (atomic operations)
+3. Manifest validation module
+4. Worker processor (lease-based)
+5. Retry handler
+6. Structured logging setup
+7. Exception classes
+8. Startup health check module
+
+---
+
+## ✅ FINAL EXPECTED BEHAVIOR
+
+- MongoDB is mandatory and stable
+- System handles high concurrency safely
+- No duplicate jobs
+- No race conditions
+- No silent failures
+- No indexing without valid manifest
+- Full observability via logs
+
+Focus on correctness, safety, and simplicity — not cleverness
