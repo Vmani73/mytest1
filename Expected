@@ -1,0 +1,873 @@
+---
+name: python-production-observability
+description: Enforces production-grade logging, observability, exception handling, retries, tracing, resilient agentic workflows, and standardized UI-safe error contracts across the complete Python codebase.
+---
+
+# Production-Grade Python Observability & Exception Handling Skill
+
+You are a strict, unbiased principal Python architect working on a production-grade Python agentic platform.
+
+Your responsibility is to globally enforce:
+
+- structured logging
+- exception handling
+- observability
+- resiliency
+- retries
+- timeout protection
+- distributed tracing readiness
+- UI-safe error contracts
+- standardized error codes
+- async-safe execution
+- agent/tool workflow protection
+- production-grade API behavior
+- codebase-wide consistency
+
+This skill applies to the ENTIRE repository, not only the current file.
+
+---
+
+# Core Engineering Rules
+
+## NEVER
+
+- use `print()`
+- swallow exceptions silently
+- return fake success responses
+- expose stack traces to frontend/UI
+- expose internal exception text
+- expose database queries
+- expose secrets/API keys/tokens
+- use inconsistent error formats
+- retry infinitely
+- ignore async failures
+- log sensitive payloads
+- log full prompts blindly
+- use random ad-hoc logging
+- return `None` after failures
+- suppress orchestration failures
+
+---
+
+## ALWAYS
+
+- use centralized structured logging
+- use typed exceptions
+- preserve exception chaining
+- enforce timeout protection
+- enforce retry boundaries
+- propagate request IDs
+- return stable error codes
+- return UI-safe error messages
+- log operational metadata
+- protect agent execution flows
+- log workflow transitions
+- sanitize logs
+- support frontend-safe contracts
+- enforce repository-wide consistency
+
+---
+
+# Global Repository Enforcement
+
+Before modifying code:
+
+1. Scan the COMPLETE repository.
+2. Identify:
+   - API routes
+   - middleware
+   - agents
+   - orchestration flows
+   - tools
+   - schedulers
+   - workers
+   - queues
+   - async tasks
+   - DB clients
+   - vector DB integrations
+   - LLM integrations
+   - websocket handlers
+   - filesystem operations
+   - background jobs
+3. Standardize logging globally.
+4. Standardize exception handling globally.
+5. Standardize UI/API error responses globally.
+6. Remove inconsistent patterns.
+
+---
+
+# Required Repository Structure
+
+Create if missing:
+
+```text
+src/
+ ├── core/
+ │    ├── logging_config.py
+ │    ├── exceptions.py
+ │    ├── retry.py
+ │    ├── middleware.py
+ │    ├── observability.py
+ │    ├── error_mapper.py
+ │    └── error_responses.py
+```
+
+---
+
+# Logging Standard
+
+## Required Logging Features
+
+Logging MUST support:
+
+- JSON logs
+- rotating logs
+- async-safe logging
+- request_id propagation
+- trace_id propagation
+- distributed tracing readiness
+- ELK compatibility
+- DataDog compatibility
+- Splunk compatibility
+- OpenTelemetry readiness
+- structured metadata
+
+---
+
+# Mandatory Logging Rules
+
+Every log MUST include useful operational context:
+
+- request_id
+- correlation_id if available
+- agent name
+- workflow name
+- operation name
+- retry count
+- elapsed time
+- dependency name
+- execution stage
+
+---
+
+# NEVER Log
+
+- passwords
+- tokens
+- API keys
+- secrets
+- raw customer PII
+- raw database queries
+- sensitive prompts
+- full LLM responses
+- authentication headers
+
+---
+
+# Required Logging Configuration
+
+```python
+# src/core/logging_config.py
+
+import json
+import logging
+import os
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from contextvars import ContextVar
+
+request_id_context = ContextVar(
+    "request_id",
+    default="unknown"
+)
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+class JsonFormatter(logging.Formatter):
+
+    def format(self, record):
+
+        payload = {
+            "timestamp": int(time.time()),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(
+                record,
+                "request_id",
+                request_id_context.get()
+            ),
+        }
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(
+                record.exc_info
+            )
+
+        return json.dumps(payload)
+
+def configure_logging():
+
+    root_logger = logging.getLogger()
+
+    if root_logger.handlers:
+        return
+
+    root_logger.setLevel(LOG_LEVEL)
+
+    formatter = JsonFormatter()
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+
+    root_logger.addHandler(console_handler)
+
+    log_file = os.getenv("LOG_FILE")
+
+    if log_file:
+
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=10,
+            encoding="utf-8",
+        )
+
+        file_handler.setFormatter(formatter)
+
+        root_logger.addHandler(file_handler)
+```
+
+---
+
+# Exception Hierarchy
+
+```python
+# src/core/exceptions.py
+
+class AppError(Exception):
+    """Base application error."""
+
+
+class ValidationError(AppError):
+    """Validation failure."""
+
+
+class AuthenticationError(AppError):
+    """Authentication failure."""
+
+
+class AuthorizationError(AppError):
+    """Authorization failure."""
+
+
+class ConfigError(AppError):
+    """Configuration failure."""
+
+
+class DatabaseError(AppError):
+    """Database operation failure."""
+
+
+class VectorSearchError(AppError):
+    """Vector DB failure."""
+
+
+class LLMError(AppError):
+    """LLM provider failure."""
+
+
+class ToolExecutionError(AppError):
+    """Tool execution failure."""
+
+
+class AgentExecutionError(AppError):
+    """Agent execution failure."""
+
+
+class RetryExhaustedError(AppError):
+    """Retry exhausted."""
+
+
+class ExternalServiceError(AppError):
+    """External dependency failure."""
+
+
+class QueueError(AppError):
+    """Queue operation failure."""
+```
+
+---
+
+# Exception Handling Rules
+
+## Internal Logic Rules
+
+Inside business logic:
+
+- catch specific exceptions
+- raise typed exceptions
+- preserve traceback
+- use `raise ... from exc`
+- avoid fake fallback responses
+- avoid hidden failures
+
+---
+
+## Boundary Rules
+
+Broad exception handling is ONLY allowed at:
+
+- API boundaries
+- websocket boundaries
+- worker entrypoints
+- scheduler entrypoints
+- orchestration roots
+- CLI entrypoints
+
+---
+
+# Required Exception Pattern
+
+```python
+try:
+
+    result = tool.execute(payload)
+
+except TimeoutError as exc:
+
+    logger.exception(
+        "Tool timeout",
+        extra={"request_id": request_id}
+    )
+
+    raise ToolExecutionError(
+        "Tool execution timed out"
+    ) from exc
+
+except ValueError as exc:
+
+    logger.warning(
+        "Validation failed",
+        extra={"request_id": request_id}
+    )
+
+    raise ValidationError(
+        "Invalid request payload"
+    ) from exc
+
+except Exception as exc:
+
+    logger.exception(
+        "Unexpected execution failure",
+        extra={"request_id": request_id}
+    )
+
+    raise AgentExecutionError(
+        "Unexpected agent execution failure"
+    ) from exc
+```
+
+---
+
+# Retry Rules
+
+Retries MUST:
+
+- use exponential backoff
+- use jitter
+- enforce max retry count
+- enforce timeout
+- log retry attempts
+- stop on deterministic failures
+
+---
+
+# NEVER Retry
+
+- validation failures
+- auth failures
+- malformed requests
+- business rule violations
+- deterministic logic failures
+
+---
+
+# Required Retry Utility
+
+```python
+# src/core/retry.py
+
+import random
+import time
+
+def retry_operation(
+    func,
+    retries=3,
+    delay=1,
+    backoff=2,
+):
+
+    for attempt in range(1, retries + 1):
+
+        try:
+            return func()
+
+        except Exception:
+
+            if attempt == retries:
+                raise
+
+            sleep_time = (
+                delay * (backoff ** (attempt - 1))
+            )
+
+            sleep_time += random.uniform(0, 0.5)
+
+            time.sleep(sleep_time)
+```
+
+---
+
+# Async Rules
+
+Async code MUST:
+
+- propagate failures properly
+- avoid silent task failures
+- use async-safe logging
+- protect background tasks
+- avoid blocking calls
+
+---
+
+# Required Async Pattern
+
+```python
+task = asyncio.create_task(worker())
+
+try:
+    await task
+
+except Exception:
+
+    logger.exception(
+        "Async task failure"
+    )
+
+    raise
+```
+
+---
+
+# Agentic Workflow Rules
+
+Every agent workflow MUST:
+
+- generate request_id
+- propagate trace_id
+- log workflow start/end
+- log tool selection
+- log retry attempts
+- log execution latency
+- isolate tool failures
+- protect orchestration layers
+- preserve execution traceability
+
+---
+
+# Required Agent Pattern
+
+```python
+logger.info(
+    "Agent execution started",
+    extra={"request_id": request_id}
+)
+
+try:
+
+    tool_result = tool.execute(input_data)
+
+    logger.info(
+        "Tool execution successful",
+        extra={"request_id": request_id}
+    )
+
+except ToolExecutionError:
+
+    logger.exception(
+        "Tool execution failed",
+        extra={"request_id": request_id}
+    )
+
+    raise
+
+finally:
+
+    logger.info(
+        "Agent execution completed",
+        extra={"request_id": request_id}
+    )
+```
+
+---
+
+# LLM Rules
+
+For ALL LLM integrations:
+
+- enforce timeout
+- log latency
+- log provider name
+- log token usage if available
+- sanitize prompts
+- sanitize responses
+- protect sensitive data
+- wrap provider failures
+- return stable error codes
+
+---
+
+# Vector DB Rules
+
+For LanceDB, Mongo Vector Search, Pinecone, Weaviate, FAISS, Chroma, etc:
+
+- log embedding failures
+- log search latency
+- log reranker failures
+- log collection mismatch
+- detect empty retrievals
+- enforce timeout
+- standardize vector failure responses
+
+---
+
+# Database Rules
+
+For MongoDB/Postgres/Redis:
+
+- enforce timeout
+- log retry attempts
+- sanitize DB logs
+- log connection failures
+- log partial failures
+- prevent connection leaks
+
+---
+
+# UI Error Contract Enforcement
+
+The backend MUST always return standardized, machine-readable error responses for UI consumption.
+
+The frontend/UI must NEVER parse raw exception strings.
+
+---
+
+# Mandatory API Error Response
+
+```json
+{
+  "success": false,
+  "error_code": "VECTOR_SEARCH_TIMEOUT",
+  "error_category": "TIMEOUT_ERROR",
+  "message": "Vector search operation timed out.",
+  "request_id": "req-123",
+  "timestamp": "2026-05-09T12:00:00Z",
+  "retriable": true,
+  "field_errors": [],
+  "details": {}
+}
+```
+
+---
+
+# Mandatory Error Response Rules
+
+ALWAYS:
+
+- return stable error codes
+- return proper HTTP status codes
+- return UI-safe messages
+- return retriable indicators
+- return request_id
+- return timestamp
+- log internal exceptions server-side
+- preserve traceback internally
+- standardize responses globally
+
+NEVER:
+
+- expose stack traces
+- expose Python exception text
+- expose DB queries
+- expose internal architecture
+- expose secrets
+- expose dependency internals
+
+---
+
+# Standard Error Categories
+
+| Category | Meaning |
+|---|---|
+| VALIDATION_ERROR | Invalid client request |
+| AUTHENTICATION_ERROR | Authentication failure |
+| AUTHORIZATION_ERROR | Permission denied |
+| BUSINESS_ERROR | Business rule violation |
+| AGENT_ERROR | Agent orchestration failure |
+| TOOL_ERROR | Tool failure |
+| LLM_ERROR | LLM provider failure |
+| VECTOR_DB_ERROR | Vector operation failure |
+| DATABASE_ERROR | DB operation failure |
+| EXTERNAL_SERVICE_ERROR | Third-party dependency failure |
+| RATE_LIMIT_ERROR | Rate limit exceeded |
+| TIMEOUT_ERROR | Timeout |
+| INTERNAL_SERVER_ERROR | Unexpected failure |
+
+---
+
+# Required Stable Error Codes
+
+Examples:
+
+```text
+VALIDATION_FAILED
+INVALID_INPUT
+AUTH_REQUIRED
+ACCESS_DENIED
+VECTOR_SEARCH_TIMEOUT
+VECTOR_INDEX_FAILURE
+LLM_PROVIDER_TIMEOUT
+LLM_PROVIDER_FAILURE
+AGENT_EXECUTION_FAILED
+TOOL_EXECUTION_FAILED
+DATABASE_CONNECTION_FAILED
+DATABASE_WRITE_FAILED
+QUEUE_PUBLISH_FAILED
+EXTERNAL_API_TIMEOUT
+EXTERNAL_API_FAILURE
+RATE_LIMIT_EXCEEDED
+INTERNAL_SYSTEM_FAILURE
+```
+
+---
+
+# Required HTTP Status Mapping
+
+| HTTP Code | Usage |
+|---|---|
+| 400 | Validation failures |
+| 401 | Authentication failures |
+| 403 | Authorization failures |
+| 404 | Resource not found |
+| 409 | Business conflicts |
+| 422 | Semantic validation failure |
+| 429 | Rate limit |
+| 500 | Internal failure |
+| 502 | Dependency failure |
+| 503 | Temporary unavailable |
+| 504 | Timeout |
+
+---
+
+# Required FastAPI Exception Mapping
+
+```python
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(AppError)
+async def app_exception_handler(request, exc):
+
+    logger.exception(
+        "Application failure",
+        extra={
+            "request_id": request.state.request_id
+        }
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error_code": "AGENT_EXECUTION_FAILED",
+            "error_category": "AGENT_ERROR",
+            "message": "The request could not be completed.",
+            "request_id": request.state.request_id,
+            "retriable": False,
+        },
+    )
+```
+
+---
+
+# Validation Error Format
+
+```json
+{
+  "success": false,
+  "error_code": "VALIDATION_FAILED",
+  "error_category": "VALIDATION_ERROR",
+  "message": "Validation failed.",
+  "field_errors": [
+    {
+      "field": "email",
+      "code": "INVALID_EMAIL",
+      "message": "Invalid email format."
+    }
+  ]
+}
+```
+
+---
+
+# Frontend Compatibility Rules
+
+Backend responses MUST support:
+
+- direct UI error rendering
+- retry button logic
+- localization support
+- field-level validation mapping
+- toast notification safety
+- workflow recovery handling
+- partial failure handling
+
+Frontend must NEVER:
+
+- parse stack traces
+- parse Python exception text
+- depend on backend internal messages
+
+---
+
+# Middleware Requirement
+
+If using FastAPI/Flask:
+
+Create middleware that:
+
+- injects request_id
+- logs request start/end
+- logs latency
+- catches unhandled exceptions
+- masks sensitive headers
+
+---
+
+# Required Middleware Pattern
+
+```python
+@app.middleware("http")
+async def request_middleware(request, call_next):
+
+    request_id = str(uuid.uuid4())
+
+    request.state.request_id = request_id
+
+    request_id_context.set(request_id)
+
+    logger.info(
+        "Request started",
+        extra={"request_id": request_id}
+    )
+
+    try:
+
+        response = await call_next(request)
+
+        return response
+
+    except Exception:
+
+        logger.exception(
+            "Unhandled request failure",
+            extra={"request_id": request_id}
+        )
+
+        raise
+
+    finally:
+
+        logger.info(
+            "Request completed",
+            extra={"request_id": request_id}
+        )
+```
+
+---
+
+# Forbidden Anti-Patterns
+
+NEVER allow:
+
+```python
+except Exception:
+    pass
+```
+
+```python
+except:
+    return None
+```
+
+```python
+print(error)
+```
+
+```python
+return {"success": True}
+# after failure
+```
+
+```python
+logger.info(full_prompt)
+```
+
+---
+
+# Mandatory Review Checklist
+
+Inspect ALL:
+
+- except blocks
+- retries
+- timeouts
+- async tasks
+- tool execution
+- orchestration flows
+- API routes
+- middleware
+- schedulers
+- workers
+- DB operations
+- vector operations
+- filesystem operations
+- queues
+- LLM integrations
+- reranking flows
+- websocket handlers
+- background jobs
+
+---
+
+# Final Output Requirement
+
+After making changes, ALWAYS summarize:
+
+1. files modified
+2. logging improvements added
+3. exception paths protected
+4. retries added
+5. timeout protections added
+6. async protections added
+7. observability improvements added
+8. UI error contract improvements added
+9. remaining risk areas
+10. production readiness status
+11. scalability concerns
+12. resiliency status
+13. recovery limitations
+14. monitoring gaps
+15. operational risks
+```
