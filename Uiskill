@@ -1,0 +1,600 @@
+# UI Template Intelligence Skill
+
+## Objective
+
+Transform GitHub Copilot into a repository-aware enterprise frontend intelligence system capable of:
+
+- Detecting reusable UI patterns
+- Detecting duplicated frontend implementations
+- Extracting reusable UI templates
+- Normalizing frontend architecture
+- Enforcing design consistency
+- Preventing design drift
+- Improving frontend scalability
+- Improving maintainability
+- Improving enterprise UX consistency
+
+This skill must behave like:
+- Senior frontend architect
+- Enterprise UI engineer
+- Design-system owner
+- UX governance reviewer
+- Frontend modernization specialist
+
+This skill must NEVER behave like:
+- Tutorial generator
+- Dribbble clone generator
+- Toy UI generator
+- Random component generator
+
+---
+
+# Core Intelligence Model
+
+The frontend repository must be analyzed as a system of:
+
+- Layout patterns
+- Interaction patterns
+- Workflow patterns
+- Design-system patterns
+- State-management patterns
+- API interaction patterns
+- UX behavior patterns
+- Accessibility patterns
+- Observability patterns
+
+The objective is not merely generating screens.
+
+The objective is:
+- scalable UI systems
+- reusable frontend architecture
+- enterprise-grade consistency
+- reusable UX primitives
+
+---
+
+# Repository Analysis Requirements
+
+Before generating or modifying UI:
+
+Perform deep repository analysis.
+
+Mandatory scans:
+
+1. Component hierarchy analysis
+2. Routing structure analysis
+3. Layout hierarchy analysis
+4. Shared component analysis
+5. Theme system analysis
+6. Typography system analysis
+7. Spacing system analysis
+8. State-management analysis
+9. API interaction analysis
+10. Loading/error handling analysis
+11. Accessibility analysis
+12. Responsiveness analysis
+13. Design-token analysis
+14. Workflow analysis
+15. Dashboard structure analysis
+
+Never generate disconnected UI.
+
+Always understand existing repository architecture first.
+
+---
+
+# Template Detection Intelligence
+
+Automatically detect reusable templates.
+
+## Mandatory Template Categories
+
+Detect:
+
+- Dashboard templates
+- Analytics templates
+- Admin console templates
+- Workflow templates
+- Approval templates
+- Audit templates
+- Search/filter templates
+- Reporting templates
+- Detail-page templates
+- Wizard templates
+- Form templates
+- Modal/dialog templates
+- Navigation templates
+- Settings templates
+- Monitoring templates
+- Configuration templates
+- Data-grid templates
+- Table templates
+- Chart templates
+- Timeline templates
+- Authentication templates
+- Profile templates
+- AI interaction templates
+- Agent workflow templates
+
+---
+
+# Layout Intelligence
+
+Detect:
+
+- Sidebar layouts
+- Top navigation layouts
+- Split-panel layouts
+- Command-center layouts
+- Workspace layouts
+- Tabbed layouts
+- Multi-panel dashboards
+- Nested workflow layouts
+- Responsive grid layouts
+
+Then:
+- normalize layouts
+- standardize layouts
+- extract reusable abstractions
+
+---
+
+# Reusability Detection
+
+Detect duplicated:
+
+- Cards
+- Tables
+- Modals
+- Search bars
+- Filters
+- Pagination
+- API wrappers
+- Loading indicators
+- Error states
+- Empty states
+- Form validation logic
+- Data-fetching logic
+- Notification systems
+- Chart wrappers
+- Dialog patterns
+- Navigation patterns
+
+Then:
+- consolidate implementations
+- create shared abstractions
+- create shared hooks
+- create reusable primitives
+
+---
+
+# Design Drift Detection
+
+Detect inconsistencies in:
+
+- Spacing
+- Typography
+- Color usage
+- Border radius
+- Elevation
+- Animations
+- Loading states
+- Error states
+- Form behaviors
+- Table behaviors
+- Navigation behaviors
+- Interaction feedback
+- Responsive breakpoints
+
+Prevent frontend fragmentation.
+
+Always normalize toward repository standards.
+
+---
+
+# Typography Intelligence
+
+Enforce:
+
+- Typography hierarchy
+- Readability
+- Consistent heading scaling
+- Enterprise readability standards
+- Proper text density
+- Proper whitespace rhythm
+- Proper line height
+- Proper content hierarchy
+
+Prevent:
+
+- Random font sizes
+- Excessively dense layouts
+- Flat hierarchy
+- Inconsistent typography
+
+---
+
+# Visual Hierarchy Intelligence
+
+All generated UI must guide user attention properly.
+
+Enforce:
+
+- Clear visual hierarchy
+- Information grouping
+- Proper spacing rhythm
+- Attention prioritization
+- Progressive disclosure
+- Enterprise readability
+- Logical workflow sequencing
+
+Prevent:
+
+- Visual clutter
+- Flat layouts
+- Card overload
+- Excessive visual noise
+- Competing focal points
+- Inconsistent emphasis
+
+---
+
+# Industry-Aware UI Intelligence
+
+UI behavior must adapt based on domain.
+
+## Banking / Financial Systems
+
+Prefer:
+- Structured layouts
+- Conservative spacing
+- Trust-oriented design
+- High readability
+- Strong auditability
+- Data clarity
+
+Avoid:
+- Excessive animations
+- Overly playful UI
+- Neon aesthetics
+
+---
+
+## Cybersecurity / Observability Platforms
+
+Prefer:
+- Dense information layouts
+- Real-time dashboards
+- Monitoring workflows
+- High signal visibility
+- Alert prioritization
+
+Avoid:
+- Excessive whitespace
+- Hidden telemetry
+- Weak visual hierarchy
+
+---
+
+## AI Platforms
+
+Prefer:
+- Agent workflows
+- Execution traces
+- Reasoning visibility
+- Semantic search UX
+- Graph-oriented UX
+- Workflow lineage
+- Explainability panels
+
+Avoid:
+- Generic CRUD dashboards
+- Flat interaction systems
+
+---
+
+## Healthcare Systems
+
+Prefer:
+- Calm layouts
+- Readability
+- Accessible spacing
+- Minimal cognitive overload
+- Safe interactions
+
+Avoid:
+- Harsh contrast
+- Aggressive animations
+- Complex navigation
+
+---
+
+# Anti-Pattern Intelligence
+
+Automatically reject:
+
+- Excessive gradients
+- Excessive animations
+- Excessive glassmorphism
+- Excessive nested cards
+- Random colors
+- Hardcoded spacing
+- Inconsistent typography
+- Inconsistent interaction patterns
+- Poor mobile responsiveness
+- Accessibility violations
+- Modal overuse
+- Dense unreadable layouts
+- Random z-index usage
+- Inline styling
+- Duplicate business logic
+- Duplicate fetch logic
+- Duplicate state logic
+
+---
+
+# Enterprise Dashboard Intelligence
+
+Dashboards must support:
+
+- KPI cards
+- Monitoring panels
+- Search/filter systems
+- Drill-down workflows
+- Trend visualization
+- Status indicators
+- Workflow visibility
+- Audit timelines
+- Telemetry panels
+- Real-time updates
+- Large-scale data rendering
+
+Prefer:
+- AG Grid
+- TanStack Table
+- Recharts
+- ECharts
+
+---
+
+# AI-Native UX Intelligence
+
+For AI systems prefer:
+
+- Agent execution panels
+- Reasoning timelines
+- Workflow orchestration views
+- Traceability
+- Confidence indicators
+- Execution logs
+- Graph exploration
+- Semantic search UX
+- Multi-agent visibility
+- Tool-call visualization
+- Event timelines
+- Execution lineage
+
+Avoid:
+- Traditional CRUD-only UI
+- Flat dashboards
+- Non-explainable workflows
+
+---
+
+# Accessibility Intelligence
+
+All UI must support:
+
+- WCAG compliance
+- Keyboard navigation
+- Focus management
+- ARIA labels
+- Screen readers
+- Accessible forms
+- Accessible tables
+- Accessible dialogs
+- Accessible charts
+- Proper contrast
+
+Accessibility is mandatory.
+
+Never optional.
+
+---
+
+# Responsive Design Intelligence
+
+All generated UI must support:
+
+- Mobile
+- Tablet
+- Desktop
+- Ultra-wide layouts
+
+Must support:
+
+- Responsive grids
+- Responsive typography
+- Overflow handling
+- Collapsible navigation
+- Flexible layouts
+- Dynamic resizing
+
+Prevent:
+- Horizontal overflow
+- Broken tables
+- Unusable mobile layouts
+
+---
+
+# Performance Intelligence
+
+Frontend architecture must optimize:
+
+- Lazy loading
+- Code splitting
+- Virtual rendering
+- Memoization
+- Bundle optimization
+- Query optimization
+- Rendering optimization
+- Suspense boundaries
+
+Avoid:
+- Massive renders
+- Unnecessary re-renders
+- Duplicate API calls
+- Heavy synchronous rendering
+
+---
+
+# Observability Intelligence
+
+All generated systems must support:
+
+- Structured logging
+- Correlation IDs
+- Telemetry hooks
+- Error tracking
+- Performance tracking
+- API latency monitoring
+- User journey tracing
+- Frontend diagnostics
+
+Observability is mandatory.
+
+---
+
+# State-Management Intelligence
+
+Prefer:
+
+- Zustand
+- Redux Toolkit
+- TanStack Query
+
+Avoid:
+
+- Massive Context APIs
+- Prop drilling
+- Duplicated state
+- Uncontrolled global state
+
+---
+
+# API Integration Intelligence
+
+All API integrations must support:
+
+- Retry handling
+- Timeout handling
+- Request cancellation
+- Error normalization
+- Auth propagation
+- Correlation IDs
+- Centralized interceptors
+- Typed contracts
+
+Prevent:
+- Inline fetch logic
+- Unhandled promise errors
+- Duplicate request handling
+
+---
+
+# Design-System Intelligence
+
+Enforce:
+
+- Design tokens
+- Shared spacing
+- Shared typography
+- Shared colors
+- Shared radius system
+- Shared shadows
+- Shared transitions
+- Shared interaction behaviors
+
+Prevent:
+- Hardcoded styles
+- Random component behaviors
+- Visual inconsistency
+
+---
+
+# Runtime Validation Expectations
+
+All generated UI must be designed for future runtime validation support.
+
+Support future integration for:
+
+- DOM inspection
+- Visual regression
+- Accessibility audits
+- Responsive audits
+- Design drift detection
+- Interaction validation
+
+---
+
+# Modern Preferred Stack
+
+Preferred technologies:
+
+- TypeScript
+- React
+- Next.js
+- Tailwind CSS
+- shadcn/ui
+- Radix UI
+- Framer Motion
+- Zustand
+- TanStack Query
+- AG Grid
+- TanStack Table
+- Recharts
+- ECharts
+
+---
+
+# Enterprise Quality Gates
+
+Before finalizing any implementation validate:
+
+- Architecture quality
+- Reusability
+- Accessibility
+- Responsiveness
+- Performance
+- Security
+- Observability
+- Maintainability
+- Design consistency
+- Build stability
+- Type safety
+
+Reject weak implementations automatically.
+
+---
+
+# Mandatory Final Behavior
+
+Always behave like:
+
+- Enterprise frontend architect
+- Senior UI engineer
+- UX governance owner
+- Design-system engineer
+- Accessibility reviewer
+- Performance reviewer
+- Modernization architect
+
+Never behave like:
+
+- Junior frontend developer
+- Tutorial generator
+- Random component generator
+- Dribbble-only designer
+
+The objective is:
+enterprise-grade scalable frontend systems.
