@@ -1,0 +1,135 @@
+# Resumable Execution Skill
+
+## Objective
+
+Ensure Copilot performs large repository changes end-to-end instead of stopping after one file.
+
+This skill is mandatory for:
+- exception handling
+- logging
+- observability
+- UI modernization
+- security hardening
+- accessibility fixes
+- performance refactoring
+- API layer changes
+- multi-file architecture changes
+
+## Core Rule
+
+Never attempt a large task as one unstructured edit.
+
+Always use:
+
+1. Inventory
+2. Plan
+3. Batch execution
+4. Checkpoint
+5. Validation
+6. Resume
+7. Final audit
+
+## Mandatory Execution Ledger
+
+For every large task, create or update:
+
+.github/copilot-progress/active-task.md
+
+This file must track:
+
+- Task objective
+- Files discovered
+- Files completed
+- Files pending
+- Files skipped
+- Errors encountered
+- Retry attempts
+- Validation results
+- Next action
+
+## Execution Protocol
+
+Before editing code:
+
+1. Scan repository structure.
+2. Identify all impacted files.
+3. Group files into small batches.
+4. Write the execution ledger.
+5. Start with batch 1 only.
+6. After each batch, update the ledger.
+7. Continue with the next pending batch.
+8. Do not declare completion until all batches are finished.
+
+## Batch Rules
+
+Each batch must contain:
+
+- Maximum 3 to 5 files
+- Related files only
+- One clear objective
+- One validation step
+
+After each batch:
+
+- Save changes
+- Update active-task.md
+- Run available tests or static checks
+- Record failures
+- Fix failures before moving forward
+
+## Retry Rules
+
+If network/tool/model failure happens:
+
+- Do not restart from zero.
+- Read .github/copilot-progress/active-task.md.
+- Continue from the next pending file.
+- Retry failed operation up to 3 times.
+- If still blocked, mark file as blocked with reason.
+- Continue with other pending files.
+
+## Stop Prevention Rules
+
+Never stop after modifying one file if pending files remain.
+
+Before stopping, always check:
+
+- Are there pending files?
+- Are there skipped files?
+- Are there failed validations?
+- Are there unresolved TODOs?
+- Are there incomplete batches?
+
+If yes, continue or clearly write the next resume command.
+
+## Large Task Behavior
+
+For requests like:
+
+“Implement production-grade exception handling across the repo”
+
+Copilot must:
+
+1. Find all entry points.
+2. Find all API handlers.
+3. Find all service methods.
+4. Find all async flows.
+5. Find all UI error boundaries.
+6. Find all logging points.
+7. Find all retry points.
+8. Create a batch plan.
+9. Implement changes batch by batch.
+10. Validate each batch.
+11. Final audit full repository.
+
+## Required Final Output
+
+At completion, provide:
+
+- Files changed
+- Files skipped
+- Files blocked
+- Tests run
+- Validation result
+- Remaining risks
+- Follow-up recommendations
