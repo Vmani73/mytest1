@@ -1,0 +1,544 @@
+# Ultra-Detailed Copilot Prompt — Build RepoAgent End-to-End
+
+> Paste everything below this line directly into GitHub Copilot Chat (Agent mode, GPT-4 or better).
+
+---
+
+## CONTEXT & OBJECTIVE
+
+You are building a complete, production-ready Python CLI application called **RepoAgent** — an LLM-powered framework that automatically generates, maintains, and updates Markdown documentation for entire Python code repositories. The system was originally published by OpenBMB (https://github.com/OpenBMB/RepoAgent) and presented at EMNLP 2024.
+
+Your job is to implement **every component from scratch**, end-to-end, with no placeholders and no stub functions. Every function must be fully implemented. All files must be wired together and runnable.
+
+---
+
+## HIGH-LEVEL ARCHITECTURE
+
+The system has **three stages**:
+
+1. **Global Structure Analysis** — Parse every Python file in a target repository using Python's `ast` module to build a "Project Tree" (a hierarchical data structure of all code objects: modules, classes, methods, functions). Identify bi-directional call/reference relationships between objects. Store the result as a JSON file (`.project_doc_record`).
+
+2. **Documentation Generation** — Walk the Project Tree in bottom-up topological order (leaves first, following a DAG of reference relationships). For each code object, call an LLM (OpenAI-compatible API) with a structured prompt that includes: the global project tree, the object's raw source code snippet, its reference relationships (callers/callees), its meta-information (type, name, file path), and optionally, already-generated documentation of its direct child nodes. Write output as `.md` files into a configurable `markdown_docs/` folder.
+
+3. **Documentation Update** — Use `gitpython` to diff the target repository against its HEAD commit. Detect which Python files and objects have been added, modified, or deleted. Re-generate or delete only the affected documentation nodes. This runs automatically via a `pre-commit` hook.
+
+There is also a **Chat With Repo** mode (optional fourth module) that enables Q&A over the generated documentation using an embedding-based RAG pipeline.
+
+---
+
+## FULL PROJECT STRUCTURE TO GENERATE
+
+```
+repo_agent/
+├── __init__.py
+├── main.py                  # Typer CLI entry point
+├── settings.py              # Pydantic BaseSettings config model
+├── runner.py                # Orchestrates stages 1-3; called by CLI
+├── doc_meta_info.py         # DocItem, MetaInfo, ProjectHierarchy data models
+├── file_handler.py          # AST parsing, file I/O, source extraction
+├── change_detector.py       # Git diff logic using gitpython
+├── prompt.py                # All LLM prompt templates (Python f-strings)
+├── chat_with_repo/
+│   ├── __init__.py
+│   ├── main.py              # FastAPI server for Q&A
+│   ├── gradio_interface.py  # Gradio chat UI
+│   ├── vectordb.py          # Chroma/FAISS embedding store
+│   └── rag_pipeline.py      # Retriever + LLM chain
+├── utils/
+│   ├── __init__.py
+│   └── meta_info_utils.py   # Topology sort, DAG traversal helpers
+tests/
+├── test_file_handler.py
+├── test_change_detector.py
+├── test_doc_meta_info.py
+└── test_runner.py
+pyproject.toml
+requirements.txt
+.pre-commit-config.yaml.example
+README.md
+```
+
+---
+
+## MODULE-BY-MODULE SPECIFICATION
+
+### 1. `settings.py`
+
+Use `pydantic-settings` (`BaseSettings`). Define a class `ProjectSettings` with these fields and their exact types:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `target_repo_path` | `Path` | required | Absolute path to the repo to document |
+| `hierarchy_path` | `str` | `.project_doc_record` | Filename for the JSON structure cache |
+| `markdown_docs_path` | `str` | `markdown_docs` | Folder name inside target repo for output docs |
+| `ignore_list` | `list[str]` | `[]` | File/dir names to skip |
+| `language` | `str` | `"English"` | Language for generated docs (ISO name or code) |
+| `model` | `str` | `"gpt-4o"` | LLM model string passed to OpenAI client |
+| `temperature` | `float` | `0.2` | Generation temperature |
+| `request_timeout` | `int` | `60` | HTTP timeout for API calls |
+| `base_url` | `str` | `"https://api.openai.com/v1"` | Base URL (supports any OpenAI-compatible endpoint) |
+| `openai_api_key` | `SecretStr` | from env `OPENAI_API_KEY` | API key |
+| `log_level` | `Literal["DEBUG","INFO","WARNING","ERROR","CRITICAL"]` | `"INFO"` | Log verbosity |
+| `max_thread_count` | `int` | `4` | Thread pool size for concurrent LLM calls |
+| `max_document_tokens` | `int` | `1024` | Max tokens per generated doc section |
+
+Support loading from a `config.yml` file in the target repo root via a custom `settings_customise_sources`. Settings can be overridden by CLI flags.
+
+---
+
+### 2. `doc_meta_info.py`
+
+Define the following dataclasses/Pydantic models:
+
+**`DocItemType` (Enum)**
+Values: `_repo`, `_dir`, `_file`, `_class`, `_function`, `_sub_function`, `_global_var`
+
+**`DocItemStatus` (Enum)**
+Values: `doc_up_to_date`, `doc_has_not_been_generated`, `code_changed`, `add_new_to_tree`, `need_to_be_deleted`
+
+**`DocItem` (dataclass)**
+
+Fields:
+- `item_type: DocItemType`
+- `obj_name: str` — the code object's name
+- `code_start_line: int`
+- `code_end_line: int`
+- `md_content: list[str]` — list of generated doc strings (one per LLM generation; keep history)
+- `item_status: DocItemStatus`
+- `children: dict[str, "DocItem"]` — child objects (e.g., methods inside a class)
+- `father: Optional["DocItem"]` — parent node
+- `depth: int` — depth in the tree (repo=0, file=2, etc.)
+- `tree_path: list[str]` — full path from root to this node
+- `reference_who: list["DocItem"]` — objects this item calls/references
+- `who_reference_me: list["DocItem"]` — objects that call this item
+- `special_reference_type: list[bool]` — whether each reference is a "special" (e.g., inheritance) reference
+- `reference_who_name_list: list[str]` — raw name strings before resolution
+- `has_return_statement: bool`
+- `multithread_task_id: int` — for concurrent task tracking
+
+Methods on `DocItem`:
+- `get_full_name(strict: bool = False) -> str` — returns dot-separated path like `module.ClassName.method_name`
+- `find(name_list: list[str]) -> Optional["DocItem"]` — recursive search by name list
+- `get_file_name() -> str` — returns the `.py` file this item belongs to
+- `get_travel_list() -> list["DocItem"]` — DFS traversal of subtree
+- `check_depth() -> int` — recursively compute and set depth
+- `parse_tree_path(now_path: list[str])` — populate `tree_path`
+- `to_dict() -> dict` — serialize to JSON-compatible dict (exclude circular refs)
+- `from_dict(data: dict, father: Optional["DocItem"] = None) -> "DocItem"` — class method deserializer
+
+**`MetaInfo` (class)**
+
+Fields:
+- `repo_path: Path`
+- `document_version: str` — git commit hash of last full doc generation
+- `in_generation_process: bool`
+- `target_repo_hierarchical_tree: DocItem` — root node of type `_repo`
+
+Methods:
+- `get_all_files() -> list[DocItem]` — return all `_file` nodes
+- `find_obj_with_lineno(file_node: DocItem, start_line: int) -> Optional[DocItem]`
+- `get_topology_task_manager(avoid_list: list[DocItem]) -> list[DocItem]` — returns objects in topological order (bottom-up), respecting `reference_who` edges. Use Kahn's algorithm on the DAG.
+- `load_doc_from_older_meta(older_meta: "MetaInfo")` — copy existing `md_content` from older snapshot
+- `from_project_hierarchy_path(project_hierarchy_path: Path) -> "MetaInfo"` — deserialize from JSON file
+- `to_hierarchy_json(hierarchy_path: Path)` — serialize full tree to JSON
+- `checkpoint(target_dir_path: Path, flash_reference_relation: bool = False)` — save current state
+
+---
+
+### 3. `file_handler.py`
+
+**Class `FileHandler`**
+
+Constructor: `__init__(self, repo_path: Path, file_path: Path, project_settings: ProjectSettings)`
+
+Where `file_path` is relative to `repo_path`.
+
+**Key methods:**
+
+`read_file() -> str`  
+Read and return the raw source of the Python file.
+
+`get_obj_code_info(code_type: str, code_name: str, start_line: int, end_line: int, parent_obj: str | None, file_path: str, source: str) -> dict`  
+Returns a dict with keys: `type`, `name`, `md_content`, `code_content`, `have_return_statement`, `code_start_line`, `code_end_line`, `parent`, `name_column`.
+
+`generate_file_structure(file_path: str) -> dict[str, dict]`  
+Parse a single `.py` file with `ast.parse`. Walk the AST to extract:
+- All `ast.ClassDef` nodes → type `ClassDef`
+- All `ast.FunctionDef` and `ast.AsyncFunctionDef` at module level → type `FunctionDef`  
+- All `ast.FunctionDef` and `ast.AsyncFunctionDef` inside classes → type `FunctionDef` with parent class
+- All module-level `ast.Assign` / `ast.AnnAssign` → type `ClassDef` (global vars)
+- Detect whether each function has a `return` statement with a value (not bare `return`)
+
+Return a dict keyed by object name with the info dict from `get_obj_code_info`.
+
+`generate_overall_structure(file_path_reflections: dict = {}) -> dict`  
+Walk the entire repo directory. For every `.py` file not in `ignore_list` and not in `.gitignore` patterns, call `generate_file_structure`. Return a nested dict: `{relative_file_path: {obj_name: obj_info}}`.
+
+`convert_structure_to_json(structure: dict, json_path: Path)`  
+Save the structure dict as indented JSON.
+
+`load_structure_from_json(json_path: Path) -> dict`  
+Load and return the structure dict.
+
+`get_modified_file_versions(old_structure: dict, new_structure: dict) -> tuple[dict, dict, dict]`  
+Compare two structure snapshots. Return `(added, deleted, modified)` each as a dict of `{file_path: {obj_name: info}}`.
+
+---
+
+### 4. `change_detector.py`
+
+**Class `ChangeDetector`**
+
+Constructor: `__init__(self, repo_path: Path, project_settings: ProjectSettings)`  
+Initialize a `git.Repo(repo_path)` object.
+
+**Methods:**
+
+`get_staged_pys() -> list[str]`  
+Use `repo.index.diff("HEAD")` and `repo.untracked_files` to get all staged or new `.py` files. Return their relative paths.
+
+`get_file_diff(file_path: str, is_new: bool) -> str`  
+Return the raw unified diff string for the file. For new files, return the entire content as an addition.
+
+`parse_diffs_for_changes(diff_text: str) -> tuple[set[int], set[int]]`  
+Parse the unified diff format. Return `(added_line_numbers, deleted_line_numbers)` as sets of integers relative to the new file.
+
+`identify_changes_in_structure(new_structure: dict, old_structure: dict) -> tuple[list, list, list]`  
+Compare old and new file structures. Return `(newly_added_objs, deleted_objs, changed_objs)` where each element is a `(file_path, obj_name, obj_info)` tuple.
+
+`add_unstaged_mds(repo: git.Repo, file_handler: FileHandler)`  
+Stage all generated `.md` files inside `markdown_docs_path` using `repo.git.add()`.
+
+---
+
+### 5. `prompt.py`
+
+Define all prompt strings as Python functions that return formatted strings. Do **not** use external template files.
+
+**`get_system_prompt(language: str) -> str`**  
+Returns a system prompt instructing the LLM to act as a senior software engineer writing technical documentation in the specified language. The doc must follow a strict Markdown structure.
+
+**`get_doc_generation_prompt(code_type: str, code_name: str, code_content: str, have_return_statement: bool, file_path: str, project_structure: str, reference_letter: str, docstring_instruction: str, language: str) -> str`**  
+
+Builds the full user prompt. Include all of:
+1. The full project tree (truncated to 3000 chars if needed) under a `## Project Structure` heading
+2. The file path and object metadata
+3. The raw code snippet under a fenced code block
+4. The reference relationships (who calls this, who this calls) under `## Reference Relationships`
+5. Instruction to generate documentation with sections: **Functionality**, **Parameters** (with types and descriptions for each param), **Returns**, **Raises**, **Code Description** (step-by-step walkthrough of the code logic), **Notes** (usage gotchas), **Examples** (concrete input/output examples)
+6. The target output language
+
+**`get_doc_update_prompt(old_doc: str, code_content: str, changes_summary: str, language: str) -> str`**  
+Prompt for updating an existing doc when code has changed. Includes the old doc, the new code, and a summary of what changed.
+
+**`get_project_tree_string(meta_info: "MetaInfo") -> str`**  
+Render the project hierarchy as a readable indented tree string. Max depth: show file → class → method hierarchy. Cap total characters at 4000.
+
+---
+
+### 6. `runner.py`
+
+**Class `Runner`**
+
+Constructor: `__init__(self, project_settings: ProjectSettings)`  
+Initialize `FileHandler`, `ChangeDetector`, load or create `MetaInfo`, set up `openai.OpenAI` client using `base_url`, `api_key`, `timeout`.
+
+**`first_generate()`**  
+Full initial generation:
+1. Call `file_handler.generate_overall_structure()` to get the full structure
+2. Build a `MetaInfo` object from that structure (create all `DocItem` nodes, wire parent/child relationships, resolve reference relationships by scanning `ast.Call` nodes across files)
+3. Save the hierarchy JSON
+4. Call `generate_doc_for_a_single_item()` for every item in topological order, using a `ThreadPoolExecutor` with `max_thread_count` workers
+5. After all docs are generated, write all `.md` files to `markdown_docs_path`
+6. Save the updated hierarchy JSON
+
+**`generate_doc_for_a_single_item(doc_item: DocItem)`**  
+1. Extract source code via `file_handler`
+2. Build reference letter string from `doc_item.reference_who` and `doc_item.who_reference_me`
+3. Optionally prepend child node documentation
+4. Call OpenAI chat completions with the prompt from `prompt.py`
+5. Retry up to 3 times on timeout or rate-limit errors using `tenacity`
+6. Parse the returned text; set `doc_item.md_content` and `doc_item.item_status = doc_up_to_date`
+
+**`update_existing_item(doc_item: DocItem, file_handler: FileHandler)`**  
+Re-generate documentation for a single changed item using `get_doc_update_prompt`.
+
+**`add_new_item(doc_item: DocItem, file_handler: FileHandler)`**  
+Generate documentation for a newly added item; insert the `DocItem` into `MetaInfo` tree at the correct position.
+
+**`delete_item(doc_item: DocItem)`**  
+Remove the `DocItem` from the `MetaInfo` tree and delete the corresponding `.md` file.
+
+**`run()`**  
+Main entry point for incremental update (called by pre-commit hook):
+1. Use `ChangeDetector` to get staged Python files
+2. For each changed file, compare new vs old structure
+3. Call `add_new_item`, `update_existing_item`, `delete_item` as appropriate
+4. Re-generate docs using thread pool
+5. Stage the modified `.md` files
+
+**`print_hierarchy()`**  
+Print the current project tree to stdout in human-readable indented format.
+
+**`diff()`**  
+Print which docs would be created/updated/deleted based on current staged changes, without actually running generation.
+
+**`clean()`**  
+Remove the `.project_doc_record` JSON file and optionally the `markdown_docs/` folder from the target repo.
+
+---
+
+### 7. `main.py` (CLI)
+
+Use `typer`. Register these commands:
+
+```
+repoagent run          # Run doc generation or update
+repoagent run --print-hierarchy
+repoagent diff         # Preview what would change
+repoagent clean        # Remove cache
+repoagent configure    # Interactive setup wizard (prompts for settings, writes config.yml)
+repoagent chat-with-repo  # Start the FastAPI+Gradio chat server
+```
+
+All flags from the CLI spec in the README must be implemented:
+`-m/--model`, `-t/--temperature`, `-r/--request-timeout`, `-b/--base-url`, `-tp/--target-repo-path`, `-hp/--hierarchy-path`, `-mdp/--markdown-docs-path`, `-i/--ignore-list`, `-l/--language`, `-ll/--log-level`
+
+Use `rich` for colored console output. Use `loguru` or Python's `logging` with the configured log level.
+
+---
+
+### 8. `chat_with_repo/` (Optional module)
+
+`vectordb.py`: Use `chromadb` (local persistent client). Implement:
+- `index_markdown_docs(markdown_docs_path: Path)` — walk all `.md` files, chunk them by heading, embed with `text-embedding-ada-002`, store in Chroma collection `"repo_docs"`
+- `query(question: str, n_results: int = 5) -> list[str]` — embed the query, retrieve top-n chunks
+
+`rag_pipeline.py`: Implement:
+- `answer_question(question: str, db: VectorDB, llm_client: openai.OpenAI, model: str) -> str` — retrieve context chunks, build a RAG prompt, call LLM, return answer
+
+`gradio_interface.py`: A `gradio.ChatInterface` that wraps `rag_pipeline.answer_question`. Stream the response token-by-token.
+
+`main.py`: A `fastapi.FastAPI` app that mounts the Gradio interface at `/` and exposes a `/api/ask` POST endpoint.
+
+---
+
+## REFERENCE RELATIONSHIP RESOLUTION (Critical Detail)
+
+After building the full project tree, you must resolve cross-file call relationships. Do this with a two-pass approach:
+
+**Pass 1:** For every `FunctionDef` and `ClassDef` node, run a second AST walk on its subtree. Collect all `ast.Call` nodes. For each call:
+- Extract the called name (handle `ast.Name`, `ast.Attribute`, chained attributes)
+- Store in `doc_item.reference_who_name_list`
+
+**Pass 2:** Build a global name→DocItem index. For each item with unresolved `reference_who_name_list`, look up each name in the index. When found, add the `DocItem` to `reference_who` and add `self` to the target's `who_reference_me`. Handle ambiguity (same method name in multiple classes) by preferring items in the same file, then the same directory.
+
+---
+
+## TOPOLOGICAL SORT (Critical Detail)
+
+`get_topology_task_manager` must implement **Kahn's algorithm**:
+1. Build adjacency from `reference_who` edges (item → its dependencies)
+2. Compute in-degree for every node
+3. Enqueue all nodes with in-degree 0 (no dependencies, i.e., leaves)
+4. Process queue: when a node is dequeued, add to result, decrement in-degree of all nodes that depend on it, enqueue those that hit 0
+5. If any cycle is detected (not all nodes processed), fall back to: sort by depth descending, then alphabetically — and log a warning about the cycle
+
+---
+
+## MARKDOWN OUTPUT FORMAT
+
+Each generated `.md` file must follow this exact structure:
+
+```markdown
+# `{object_name}` in `{file_path}`
+
+## Overview
+{Functionality paragraph}
+
+## Parameters
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| ...       | ...  | ...         |
+
+## Returns
+{Description of return value and type}
+
+## Raises
+{Exceptions raised, if any}
+
+## Code Description
+{Step-by-step walkthrough of what the code does internally}
+
+## Notes
+{Usage notes, edge cases, gotchas}
+
+## Examples
+{Concrete usage examples with expected input/output}
+
+## Called By
+{List of objects that call this object, with links}
+
+## Calls
+{List of objects this object calls, with links}
+```
+
+---
+
+## DEPENDENCIES
+
+All of these must be in `requirements.txt` and `pyproject.toml`:
+
+```
+openai>=1.0.0
+gitpython>=3.1.0
+typer[all]>=0.9.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+tenacity>=8.0.0
+tiktoken>=0.5.0
+rich>=13.0.0
+PyYAML>=6.0
+pre-commit>=3.0.0
+chromadb>=0.4.0          # for chat-with-repo
+gradio>=4.0.0            # for chat-with-repo
+fastapi>=0.100.0         # for chat-with-repo
+uvicorn>=0.23.0          # for chat-with-repo
+```
+
+`pyproject.toml` must use PDM format with:
+- `[build-system]` using `pdm-backend`
+- `[project.scripts]` entry: `repoagent = "repo_agent.main:app"`
+- `[project.optional-dependencies]` with `chat-with-repo = [chromadb, gradio, fastapi, uvicorn]`
+- Python requires `>=3.10`
+
+---
+
+## TOKEN LIMIT HANDLING
+
+Before sending any prompt to the LLM:
+1. Use `tiktoken.encoding_for_model(model)` (fall back to `cl100k_base` for unknown models)
+2. Count tokens in the assembled prompt
+3. If the prompt exceeds `model_context_limit - max_document_tokens - 200` tokens:
+   - First, truncate the project tree string (remove deepest nodes first)
+   - Second, truncate child documentation summaries
+   - Third, truncate the code snippet to only show the function signature + first 50 lines
+4. Never truncate the meta information or reference relationships
+
+---
+
+## CONCURRENCY MODEL
+
+Use `concurrent.futures.ThreadPoolExecutor(max_workers=max_thread_count)`.
+- Submit one `generate_doc_for_a_single_item` call per `DocItem`
+- Use a `threading.Lock` around any writes to the `MetaInfo` tree
+- Use a `tqdm` progress bar that updates as futures complete
+- On `KeyboardInterrupt`, call `executor.shutdown(wait=False)`, save the current state via `meta_info.checkpoint()`, then re-raise
+
+---
+
+## ERROR HANDLING & RETRY
+
+Wrap every OpenAI API call with `tenacity.retry`:
+```python
+@retry(
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type((openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError)),
+    reraise=True
+)
+```
+
+On persistent failure after 3 retries: log the error, set `doc_item.item_status = doc_has_not_been_generated`, continue with other items, report summary at the end.
+
+---
+
+## GITIGNORE INTEGRATION
+
+When calling `generate_overall_structure`:
+1. Read `.gitignore` from `target_repo_path` if it exists
+2. Use `pathspec.PathSpec.from_lines("gitwildmatch", lines)` to build a matcher
+3. Skip any file or directory matching the gitignore patterns
+4. Always skip: `__pycache__`, `.git`, `.venv`, `venv`, `node_modules`, `*.pyc`, `*.pyo`
+5. Also skip anything in `project_settings.ignore_list`
+
+Add `pathspec` to dependencies.
+
+---
+
+## TESTS
+
+Write `pytest` tests for:
+
+`test_file_handler.py`:
+- Test `generate_file_structure` on a synthetic `.py` string (use `tmp_path` fixture)
+- Test `get_obj_code_info` returns correct line numbers
+- Test `generate_overall_structure` correctly skips ignored patterns
+
+`test_change_detector.py`:
+- Test `parse_diffs_for_changes` against a known unified diff string
+- Test `identify_changes_in_structure` with two structure snapshots
+
+`test_doc_meta_info.py`:
+- Test `DocItem.get_full_name()` for nested items
+- Test `MetaInfo.get_topology_task_manager()` with a known DAG (check output order)
+- Test serialize/deserialize roundtrip via `to_dict` / `from_dict`
+
+`test_runner.py`:
+- Mock the OpenAI client, test `generate_doc_for_a_single_item` produces non-empty `md_content`
+- Test `first_generate` on a tiny synthetic repo (2 files, 3 functions total)
+
+---
+
+## PRE-COMMIT CONFIG EXAMPLE
+
+Generate a file `.pre-commit-config.yaml.example` with:
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: repo-agent
+        name: RepoAgent Documentation
+        entry: repoagent run
+        language: system
+        pass_filenames: false
+        types: [python]
+```
+
+---
+
+## WHAT TO BUILD FIRST (Suggested Order)
+
+1. `settings.py` — all other modules depend on it
+2. `doc_meta_info.py` — core data model
+3. `file_handler.py` — AST parsing (no LLM dependency)
+4. `change_detector.py` — git integration
+5. `prompt.py` — prompt templates
+6. `runner.py` — orchestration
+7. `main.py` — CLI wiring
+8. Tests
+9. `chat_with_repo/` (optional)
+10. `pyproject.toml`, `requirements.txt`, `README.md`
+
+---
+
+## STRICT REQUIREMENTS
+
+- **No placeholder functions.** Every function must contain full, working implementation.
+- **No `pass` bodies** except in abstract base class stubs if any.
+- **No hardcoded paths.** All paths are derived from `ProjectSettings`.
+- **Python type hints everywhere.** All function signatures must be fully typed.
+- **Docstrings on every public class and method** (Google-style).
+- Use `pathlib.Path` throughout. Never use `os.path` string concatenation.
+- All JSON I/O uses `json.dumps(..., indent=2, ensure_ascii=False)`.
+- Logging via Python `logging` module. Use `logger = logging.getLogger(__name__)` per module.
+- The CLI `configure` command must write a valid `config.yml` to the target repo root.
+- The system must handle repositories with **0 existing documentation** (cold start) and repositories with **existing partial documentation** (warm start with diff).
+- Support Python 3.10, 3.11, and 3.12.
+
+---
+
+## START
+
+Begin with `settings.py`. Output the complete file. Then continue with each file in the order listed under "What to Build First". Do not skip any file. Do not summarize — output full source code for every file.
