@@ -1,0 +1,161 @@
+flowchart LR
+
+%% =========================================================
+%% CODEMIND — ENTERPRISE AI ENGINEERING PLATFORM
+%% =========================================================
+
+classDef title fill:#0B1220,stroke:#2563EB,stroke-width:4px,color:#FFFFFF;
+classDef access fill:#EEF4FF,stroke:#2563EB,stroke-width:3px,color:#111827;
+classDef platform fill:#F5F3FF,stroke:#7C3AED,stroke-width:3px,color:#111827;
+classDef knowledge fill:#ECFDF5,stroke:#16A34A,stroke-width:3px,color:#111827;
+classDef orchestration fill:#FFF7ED,stroke:#EA580C,stroke-width:3px,color:#111827;
+classDef outcomes fill:#F0FDF4,stroke:#15803D,stroke-width:3px,color:#111827;
+
+%% =========================================================
+%% TITLE
+%% =========================================================
+
+TITLE["🚀 CODEMIND<br/>Enterprise AI Engineering Intelligence Platform"]
+
+class TITLE title
+
+%% =========================================================
+%% ACCESS LAYER
+%% =========================================================
+
+subgraph ACCESS["EXPERIENCE & ACCESS LAYER"]
+
+direction TB
+
+UI["🖥️ Codemind Enterprise UI"]
+
+API["🔌 API Gateway<br/>REST APIs • FastAPI"]
+
+CLI["⚡ Developer CLI & SDK"]
+
+CICD["🔄 CI/CD Integration"]
+
+end
+
+class UI,API,CLI,CICD access
+
+%% =========================================================
+%% INTELLIGENCE PLATFORM
+%% =========================================================
+
+subgraph PLATFORM["AGENTIC INTELLIGENCE PLATFORM"]
+
+direction TB
+
+INGEST["📥 Repository Ingestion<br/>AST Parsing • Dependency Discovery"]
+
+CATALOG["📚 Metadata & Catalog Intelligence<br/>Service Mapping • API Discovery"]
+
+SEARCH["🔎 Semantic Search & Context Retrieval"]
+
+GRAPH["🕸️ Dependency & Knowledge Graph"]
+
+DECISION["🎯 Decision Intelligence Engine<br/>Ranking • Optimization • Impact Analysis"]
+
+AUTOMATION["⚙️ Automation & Playbooks"]
+
+end
+
+class INGEST,CATALOG,SEARCH,GRAPH,DECISION,AUTOMATION platform
+
+%% =========================================================
+%% KNOWLEDGE FABRIC
+%% =========================================================
+
+subgraph KNOWLEDGE["KNOWLEDGE & DATA FABRIC"]
+
+direction TB
+
+VECTOR["🧬 Vector Knowledge Layer<br/>Tachyon • LanceDB"]
+
+META["🛢️ Metadata Repository<br/>MongoDB"]
+
+ARTIFACTS["📄 Generated Catalogs & Engineering Insights"]
+
+CACHE["⚡ Intelligent Cache Layer"]
+
+end
+
+class VECTOR,META,ARTIFACTS,CACHE knowledge
+
+%% =========================================================
+%% EXECUTION FABRIC
+%% =========================================================
+
+subgraph EXECUTION["EXECUTION & ENTERPRISE FABRIC"]
+
+direction TB
+
+WORKFLOW["🛠️ Workflow Orchestration"]
+
+EVENTS["📡 Event & Background Processing"]
+
+OBS["📈 Observability & Monitoring"]
+
+INTEGRATIONS["🌐 Enterprise Integrations<br/>Webhooks • Automation Hooks"]
+
+end
+
+class WORKFLOW,EVENTS,OBS,INTEGRATIONS orchestration
+
+%% =========================================================
+%% BUSINESS OUTCOMES
+%% =========================================================
+
+subgraph OUTCOME["BUSINESS OUTCOMES"]
+
+direction TB
+
+DISCOVERY["⚡ Accelerated Code Discovery"]
+
+PRODUCTIVITY["👨‍💻 Improved Developer Productivity"]
+
+VISIBILITY["🏢 Enterprise Engineering Visibility"]
+
+KNOWLEDGE_PLATFORM["🧠 Enterprise Knowledge Platform"]
+
+end
+
+class DISCOVERY,PRODUCTIVITY,VISIBILITY,KNOWLEDGE_PLATFORM outcomes
+
+%% =========================================================
+%% FLOWS
+%% =========================================================
+
+TITLE --> UI
+
+UI ==> SEARCH
+API ==> SEARCH
+CLI ==> AUTOMATION
+CICD ==> AUTOMATION
+
+INGEST ==> CATALOG
+CATALOG ==> GRAPH
+GRAPH ==> SEARCH
+
+SEARCH ==> DECISION
+DECISION ==> AUTOMATION
+
+SEARCH ==> VECTOR
+CATALOG ==> META
+GRAPH ==> CACHE
+
+VECTOR ==> ARTIFACTS
+META ==> ARTIFACTS
+
+AUTOMATION ==> WORKFLOW
+WORKFLOW ==> EVENTS
+EVENTS ==> OBS
+EVENTS ==> INTEGRATIONS
+
+ARTIFACTS ==> DISCOVERY
+DECISION ==> PRODUCTIVITY
+OBS ==> VISIBILITY
+INTEGRATIONS ==> KNOWLEDGE_PLATFORM
+
+```
