@@ -1,0 +1,165 @@
+flowchart TB
+
+%% ==========================================================
+%% CODEMIND - AGENTIC ENTERPRISE KNOWLEDGE PLATFORM
+%% ==========================================================
+
+classDef entry fill:#eef4ff,stroke:#2563eb,stroke-width:2px,color:#0f172a;
+classDef agents fill:#f5f3ff,stroke:#7c3aed,stroke-width:3px,color:#111827;
+classDef intelligence fill:#fff7ed,stroke:#ea580c,stroke-width:3px,color:#111827;
+classDef data fill:#ecfdf5,stroke:#16a34a,stroke-width:3px,color:#111827;
+classDef execution fill:#eff6ff,stroke:#2563eb,stroke-width:3px,color:#111827;
+classDef outcome fill:#f0fdf4,stroke:#15803d,stroke-width:3px,color:#111827;
+
+%% ==========================================================
+%% HEADER
+%% ==========================================================
+
+TITLE["🚀 CODEMIND  
+Agentic Code Intelligence & Knowledge Platform"]
+
+style TITLE fill:#0f172a,color:#ffffff,stroke:#0f172a,stroke-width:3px,font-size:28px
+
+%% ==========================================================
+%% ACCESS LAYER
+%% ==========================================================
+
+subgraph ACCESS["🌐 ACCESS & EXPERIENCE"]
+
+UI([🖥️ Codemind Enterprise UI])
+
+API{{🔌 API Gateway  
+FastAPI / REST APIs}}
+
+CLI[/⚡ Developer CLI & Automation/]
+
+CI[[🔄 CI/CD Integration]]
+
+end
+
+class UI,API,CLI,CI entry
+
+%% ==========================================================
+%% AGENTIC INTELLIGENCE LAYER
+%% ==========================================================
+
+subgraph AGENTS["🧠 AGENTIC INTELLIGENCE LAYER"]
+
+INGEST([📥 Repository & AST Agent  
+Code Parsing • Tree Traversal • Dependency Discovery])
+
+CATALOG([📚 Catalog Intelligence Agent  
+Metadata • Ownership • API Discovery])
+
+SEARCH{{🔎 Semantic Search Agent  
+Hybrid Retrieval • Context Search}}
+
+DECISION([🎯 Decision Intelligence Agent  
+Ranking • Re-ranking • Optimization])
+
+PLAYBOOK([⚙️ Automation & Playbook Agent  
+Workflows • Reporting • Operations])
+
+ORCHESTRATOR{{🧩 Multi-Agent Orchestrator  
+Task Routing • Coordination • Execution}}
+
+end
+
+class INGEST,CATALOG,SEARCH,DECISION,PLAYBOOK,ORCHESTRATOR agents
+
+%% ==========================================================
+%% KNOWLEDGE FABRIC
+%% ==========================================================
+
+subgraph KNOWLEDGE["🗂️ KNOWLEDGE & DATA FABRIC"]
+
+MONGO[(🛢️ MongoDB  
+Metadata & Document Store)]
+
+VECTOR[(🧬 Vector Knowledge Layer  
+Tachyon / LanceDB)]
+
+GRAPH[(🕸️ Knowledge Graph  
+Dependencies • Relationships • Context)]
+
+ARTIFACTS[/📄 Generated Artifacts  
+Catalogs • Reports • Insights/]
+
+end
+
+class MONGO,VECTOR,GRAPH,ARTIFACTS data
+
+%% ==========================================================
+%% EXECUTION FABRIC
+%% ==========================================================
+
+subgraph EXECUTION["⚡ INTELLIGENT EXECUTION FABRIC"]
+
+WORKFLOW{{🛠️ Workflow Orchestrator}}
+
+EVENTS([📡 Event & Job Processing])
+
+PIPELINE[[🚀 Enterprise Integrations  
+CI/CD • Webhooks • Automation Hooks]]
+
+end
+
+class WORKFLOW,EVENTS,PIPELINE execution
+
+%% ==========================================================
+%% OUTCOMES
+%% ==========================================================
+
+subgraph VALUE["📈 BUSINESS OUTCOMES"]
+
+DISCOVERY([⚡ Faster Code Discovery])
+
+PRODUCTIVITY([👨‍💻 Developer Productivity])
+
+CATALOGS([📘 Automated Code Catalogs])
+
+INSIGHTS([🧠 Context-Aware Engineering Insights])
+
+ENTERPRISE([🏢 Enterprise-Scale Knowledge Platform])
+
+end
+
+class DISCOVERY,PRODUCTIVITY,CATALOGS,INSIGHTS,ENTERPRISE outcome
+
+%% ==========================================================
+%% FLOWS
+%% ==========================================================
+
+TITLE --> UI
+TITLE --> API
+
+UI --> INGEST
+API --> INGEST
+CLI --> PLAYBOOK
+CI --> PIPELINE
+
+INGEST --> CATALOG
+CATALOG --> SEARCH
+SEARCH --> DECISION
+DECISION --> PLAYBOOK
+
+PLAYBOOK --> ORCHESTRATOR
+DECISION --> ORCHESTRATOR
+SEARCH --> ORCHESTRATOR
+
+INGEST --> MONGO
+SEARCH --> VECTOR
+CATALOG --> GRAPH
+
+VECTOR --> ARTIFACTS
+GRAPH --> ARTIFACTS
+
+ORCHESTRATOR --> WORKFLOW
+WORKFLOW --> EVENTS
+EVENTS --> PIPELINE
+
+ARTIFACTS --> DISCOVERY
+ARTIFACTS --> CATALOGS
+DECISION --> PRODUCTIVITY
+GRAPH --> INSIGHTS
+PIPELINE --> ENTERPRISE
