@@ -1,0 +1,207 @@
+You are a senior backend + VS Code extension architect.
+
+I have a critical production bug in my VS Code extension ecosystem.
+
+Problem:
+My extension gets automatically uninstalled when the internal marketplace API fails.
+
+Current behavior:
+- Extension installs successfully
+- Extension activates successfully
+- Then internal marketplace API returns HTTP 500
+- My compare/sync engine marks extension as "uninstalled"
+- Extension gets removed automatically
+
+Logs prove this:
+
+ERR Error while getting latest version
+Unexpected HTTP response: 500
+
+installed: []
+uninstalled: [
+  {
+    extensionId: "safishamsi.codegraph-extension"
+  }
+]
+
+Root cause:
+Marketplace failure is incorrectly treated as extension absence/removal.
+
+This is WRONG behavior.
+
+I need you to fully redesign and fix the compare/sync/uninstall pipeline.
+
+Goals:
+1. NEVER uninstall because marketplace failed
+2. NEVER uninstall because HTTP call failed
+3. NEVER uninstall because response is empty/null
+4. NEVER uninstall because of timeout/auth/network issue
+5. Only uninstall if extension is explicitly confirmed obsolete
+6. Make the logic production-grade and resilient
+7. Add retry + fallback handling
+8. Add defensive logging everywhere
+9. Prevent accidental uninstall forever
+
+I want a complete production-ready solution.
+
+Requirements:
+
+-----------------------------------
+FETCH SAFETY
+-----------------------------------
+
+Current unsafe logic probably does:
+
+if (!latestVersion) {
+   uninstall(extension)
+}
+
+REMOVE this behavior completely.
+
+Correct behavior:
+
+try {
+   const latest = await fetchLatestVersion();
+
+   if (!latest) {
+      log("Marketplace unavailable. Skipping compare.");
+      continue;
+   }
+}
+catch(err) {
+   log("Marketplace fetch failed.");
+   continue;
+}
+
+Marketplace failure must NEVER mutate local extension state.
+
+-----------------------------------
+HTTP SAFETY
+-----------------------------------
+
+Handle:
+- 500
+- 404
+- timeout
+- malformed JSON
+- auth failure
+- VPN disconnect
+- DNS failure
+- empty response
+
+Correct handling:
+- retry
+- log warning
+- skip compare cycle
+- DO NOT uninstall
+
+-----------------------------------
+COMPARE SAFETY
+-----------------------------------
+
+Use ONLY:
+
+extension.id.toLowerCase()
+
+Never compare:
+- name
+- publisherName
+- displayName
+
+Correct implementation:
+
+const installedIds = vscode.extensions.all.map(ext =>
+   ext.id.toLowerCase()
+);
+
+const marketplaceIds = marketplaceExtensions.map(ext =>
+   ext.extensionId.toLowerCase()
+);
+
+-----------------------------------
+UNINSTALL SAFETY
+-----------------------------------
+
+Before uninstalling:
+1. Re-verify extension exists
+2. Re-fetch marketplace safely
+3. Require explicit confirmation state
+4. Require multiple validations
+5. Add cooldown/debounce
+
+Correct example:
+
+if (
+   extensionConfirmedRemoved &&
+   marketplaceHealthy &&
+   retryValidationPassed
+) {
+   uninstall();
+}
+
+Otherwise:
+SKIP uninstall.
+
+-----------------------------------
+RETRY MECHANISM
+-----------------------------------
+
+Implement:
+- exponential backoff
+- max retries
+- cooldown
+
+Example:
+- Retry 3 times
+- Wait 2s, 5s, 10s
+
+-----------------------------------
+DEFENSIVE LOGGING
+-----------------------------------
+
+Add logs for:
+- Installed extension IDs
+- Marketplace extension IDs
+- Failed fetch reasons
+- Compare results
+- Uninstall candidates
+- Final uninstall decision
+- Retry attempts
+- Marketplace health status
+
+-----------------------------------
+IMPORTANT SAFETY RULES
+-----------------------------------
+
+If marketplace unavailable:
+- DO NOTHING
+- KEEP extensions intact
+
+If installed list empty:
+- DO NOTHING
+
+If compare uncertain:
+- DO NOTHING
+
+If response malformed:
+- DO NOTHING
+
+Prefer stale state over destructive uninstall.
+
+-----------------------------------
+DELIVERABLES
+-----------------------------------
+
+Provide:
+1. Root cause explanation
+2. Exact bug explanation
+3. Full corrected compare engine
+4. Production-grade retry system
+5. Safe uninstall pipeline
+6. Refactored TypeScript implementation
+7. Defensive logging implementation
+8. Architecture improvements
+9. Edge-case handling
+10. Final hardened solution
+
+The final code should be enterprise-grade, resilient, and impossible to accidentally uninstall extensions due to backend outages.
