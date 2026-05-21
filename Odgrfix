@@ -1,0 +1,239 @@
+You are a senior VS Code extension engineer and Python process orchestration expert.
+
+I need you to deeply debug and completely fix my VS Code extension graph auto-update system.
+
+Current issues:
+
+1. VS Code logs:
+   "Pending response rejected since connection got disposed"
+
+2. Auto-update logs:
+   "Auto-update failed with exit code 1"
+
+3. Graph engine logs:
+   "Loaded GraphQueryEngine... Success: false"
+
+4. The extension executes:
+   python -m graph update <projectPath>
+
+5. The extension remains installed now, but the graph rebuild/update pipeline is failing.
+
+Goals:
+- Make graph auto-update production-safe
+- Prevent disposed connection errors
+- Prevent extension host instability
+- Capture exact Python failures
+- Make subprocess lifecycle resilient
+- Ensure graph rebuild failures never crash the extension
+
+IMPORTANT:
+The current implementation likely:
+- hides Python stderr
+- does not handle child process failures safely
+- does not properly handle process disposal
+- does not safely handle non-zero exit codes
+- may leak async promises after process exit
+
+Tasks:
+
+==================================================
+1. FIND ROOT CAUSE
+==================================================
+
+Analyze:
+- graph update execution flow
+- child_process spawn logic
+- async promise lifecycle
+- GraphQueryEngine initialization
+- graph.json generation flow
+
+Find:
+- why exit code 1 happens
+- why connection gets disposed
+- why GraphQueryEngine loads with Success:false
+
+==================================================
+2. REFACTOR PROCESS EXECUTION
+==================================================
+
+Replace unsafe process execution with production-grade implementation.
+
+Requirements:
+- Use child_process.spawn safely
+- Capture stdout
+- Capture stderr
+- Handle process errors
+- Handle close event
+- Handle timeout
+- Handle cancellation
+- Prevent zombie processes
+- Prevent unresolved promises
+
+Implement robust logging.
+
+Required logging:
+- command executed
+- arguments
+- stdout
+- stderr
+- exit code
+- process errors
+- timeout events
+- graph.json validation results
+
+==================================================
+3. IMPLEMENT SAFE PROCESS HANDLING
+==================================================
+
+Use something similar to:
+
+const { spawn } = require("child_process");
+
+async function runGraphUpdate(projectPath) {
+  return new Promise((resolve, reject) => {
+
+    console.log("[GRAPH] Starting graph update");
+    console.log("[GRAPH] Project:", projectPath);
+
+    const proc = spawn("python", [
+      "-m",
+      "graph",
+      "update",
+      projectPath
+    ], {
+      shell: true
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", data => {
+      const msg = data.toString();
+      stdout += msg;
+      console.log("[GRAPH STDOUT]", msg);
+    });
+
+    proc.stderr.on("data", data => {
+      const msg = data.toString();
+      stderr += msg;
+      console.error("[GRAPH STDERR]", msg);
+    });
+
+    proc.on("error", err => {
+      console.error("[GRAPH PROCESS ERROR]", err);
+      reject(err);
+    });
+
+    proc.on("close", code => {
+      console.log("[GRAPH EXIT CODE]", code);
+
+      if (code !== 0) {
+        reject(new Error(
+          `Graph update failed.\nExit Code: ${code}\n${stderr}`
+        ));
+        return;
+      }
+
+      resolve({
+        stdout,
+        stderr
+      });
+    });
+
+    setTimeout(() => {
+      console.error("[GRAPH TIMEOUT]");
+      proc.kill();
+      reject(new Error("Graph update timeout"));
+    }, 120000);
+
+  });
+}
+
+==================================================
+4. FIX DISPOSED CONNECTION ISSUE
+==================================================
+
+Prevent:
+"Pending response rejected since connection got disposed"
+
+Likely causes:
+- extension host reload during async task
+- unresolved promise after process exit
+- child process crash
+- disposed IPC connection
+
+Implement:
+- safe async cleanup
+- cancellation handling
+- proper process disposal
+- guard clauses before sending responses
+- safe promise rejection handling
+
+==================================================
+5. VALIDATE GRAPH OUTPUT
+==================================================
+
+Before loading GraphQueryEngine:
+- verify graph.json exists
+- verify file size > 0
+- verify valid JSON
+- verify graph-out folder exists
+
+If invalid:
+- log detailed reason
+- skip GraphQueryEngine load safely
+- do NOT crash extension
+
+==================================================
+6. PYTHON ENVIRONMENT SAFETY
+==================================================
+
+Current logs show:
+- python3 failed
+- fallback python succeeded
+
+Implement:
+- interpreter validation
+- version detection
+- venv detection
+- dependency validation
+
+Log:
+- Python executable used
+- Python version
+- Working directory
+- Environment variables
+
+==================================================
+7. EXTENSION HOST SAFETY
+==================================================
+
+Ensure:
+- graph failures never crash extension
+- extension host never reloads
+- background tasks isolated safely
+- errors handled gracefully
+
+Never:
+- throw uncaught async exceptions
+- leave unresolved promises
+- allow child process leaks
+
+==================================================
+8. DELIVERABLES
+==================================================
+
+Provide:
+1. Root cause analysis
+2. Exact failing logic
+3. Production-grade refactor
+4. Full corrected TypeScript implementation
+5. Safe async architecture
+6. Process lifecycle improvements
+7. Timeout/retry handling
+8. Graph validation logic
+9. Error-handling improvements
+10. Final hardened solution
+
+Goal:
+Make the VS Code graph auto-update pipeline enterprise-grade, stable, resilient, and impossible to crash/dispose unexpectedly.
