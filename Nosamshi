@@ -1,0 +1,109 @@
+Find the function that logs:
+- "Compare Extensions"
+- "the complete data are"
+- "installed data is"
+- "Extension ID in Context"
+- "Latest Extension ID"
+
+The compare logic is currently broken.
+
+Current incorrect behavior:
+- "codegraph-extension" exists in BOTH context and latest extension lists
+- But result incorrectly becomes:
+  installed: []
+  uninstalled: [{ extensionId: "codegraph-extension" }]
+
+This means the comparison algorithm is wrong.
+
+Fix the compare engine completely.
+
+Requirements:
+1. Compare ONLY extension IDs.
+2. Never compare full objects.
+3. Normalize all IDs using:
+   trim().toLowerCase()
+4. Use Set<string> for safe comparison.
+5. Never use includes() directly on object arrays.
+6. If an ID exists in BOTH lists:
+   -> it MUST go into installed
+7. Only mark uninstalled if:
+   - extension exists in latest list
+   - but does NOT exist in current/context list
+8. Never auto uninstall extensions.
+9. Disable all uninstall execution temporarily.
+10. Add defensive logs everywhere.
+
+Implement this exact hardened logic:
+
+function normalizeId(id: unknown): string {
+  return String(id ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function compareExtensions(
+  contextExtensions: any[],
+  latestExtensions: any[]
+) {
+  const contextIds = new Set(
+    contextExtensions
+      .map(ext => normalizeId(ext.extensionId ?? ext.id ?? ext.name))
+      .filter(Boolean)
+  );
+
+  const latestIds = new Set(
+    latestExtensions
+      .map(ext => normalizeId(ext.extensionId ?? ext.id ?? ext.name))
+      .filter(Boolean)
+  );
+
+  console.log("Context IDs:", [...contextIds]);
+  console.log("Latest IDs:", [...latestIds]);
+
+  const installed = latestExtensions.filter(ext => {
+    const id = normalizeId(
+      ext.extensionId ?? ext.id ?? ext.name
+    );
+
+    return contextIds.has(id);
+  });
+
+  const uninstalled = latestExtensions.filter(ext => {
+    const id = normalizeId(
+      ext.extensionId ?? ext.id ?? ext.name
+    );
+
+    return !contextIds.has(id);
+  });
+
+  console.log("Installed Extensions:", installed);
+  console.log("Uninstalled Extensions:", uninstalled);
+
+  return {
+    installed,
+    uninstalled
+  };
+}
+
+Also:
+- Search entire codebase for:
+  uninstallExtension
+  removeExtension
+  uninstall
+  uninstalled.push
+
+- Disable ALL uninstall execution temporarily:
+
+console.warn(
+  "AUTO UNINSTALL BLOCKED FOR DEBUG",
+  uninstalled
+);
+
+Important:
+- Never uninstall automatically.
+- Marketplace/API failure must NEVER trigger uninstall.
+- Empty compare results must NEVER trigger uninstall.
+- If comparison uncertain -> do nothing.
+
+Goal:
+Make the extension manager production-safe and impossible to accidentally uninstall "codegraph-extension".
