@@ -1,0 +1,75 @@
+You are a senior VS Code extension engineer.
+
+I have a bug in my VS Code extension where the extension gets automatically uninstalled immediately after installation.
+
+Important findings from logs:
+
+- VS Code successfully installs the extension
+- Then my own compare logic marks it as "uninstalled"
+- Logs show:
+  - installed: []
+  - uninstalled: [{ extensionId: "safishamsi.codegraph-extension" }]
+
+I strongly suspect:
+1. Extension comparison logic is wrong
+2. Case-sensitive mismatch
+3. Using wrong field (name vs id)
+4. Async timing issue
+5. includes() used on object arrays instead of string arrays
+
+I want you to:
+1. Analyze the entire compare/install/uninstall logic
+2. Find the exact bug
+3. Fix the logic safely
+4. Prevent accidental uninstall forever
+5. Add defensive logging
+6. Make comparison case-insensitive
+7. Ensure extension IDs are compared correctly
+8. Prevent uninstall if extension existence check is uncertain
+9. Add null/undefined safety
+10. Refactor the comparison logic into production-grade code
+
+Requirements:
+- Use vscode.extensions.all properly
+- Compare using extension.id only
+- Convert IDs to lowercase before comparison
+- Never uninstall based on partial/incomplete extension state
+- Add proper async handling
+- Add clear logs:
+   - Installed extension IDs
+   - Target extension IDs
+   - Missing IDs
+   - Final uninstall candidates
+- Ensure uninstall only happens if extension truly does not exist
+
+Replace any broken logic like:
+- includes() on objects
+- comparing name instead of id
+- reversed installed/uninstalled arrays
+
+Expected correct implementation style:
+
+const installedIds = vscode.extensions.all.map(ext =>
+    ext.id.toLowerCase()
+);
+
+const targetIds = latestExtensions.map(ext =>
+    ext.extensionId.toLowerCase()
+);
+
+const uninstallCandidates = installedExtensions.filter(ext =>
+    !targetIds.includes(ext.extensionId.toLowerCase())
+);
+
+Also:
+- Detect race conditions after installation
+- Add retry mechanism before uninstall
+- Add guard:
+   if (installedIds.length === 0) DO NOT uninstall anything
+
+Then provide:
+1. Root cause explanation
+2. Corrected code
+3. Refactored production-ready version
+4. Defensive logging version
+5. Explanation of why uninstall was happening
