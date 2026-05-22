@@ -1,0 +1,371 @@
+You are a Principal Enterprise VS Code Platform Architect.
+
+Build a production-grade, organization-wide VS Code extension named:
+
+Copilot Usage Intelligence Enterprise
+
+This is NOT a one-off project.
+This must be a reusable enterprise product that multiple teams can install and use seamlessly.
+
+GOAL:
+Provide a plug-and-play Copilot token/context/cost intelligence layer for all engineering teams.
+
+INSTALLATION EXPERIENCE:
+A developer should only need to:
+
+1. Install the VSIX extension
+2. Open any repository
+3. The extension auto-detects Copilot customization, instructions, skills, hooks, MCP, git diff, open files, and workspace context
+4. The extension shows estimated Copilot context/token/cost usage automatically
+
+No manual setup should be required for basic usage.
+
+====================================================
+PRODUCT MODES
+
+Support 3 operating modes:
+
+1. Individual Mode
+
+* local-only
+* no cloud
+* shows personal token/context estimates
+
+2. Team Mode
+
+* shared repo config
+* common thresholds
+* exportable reports
+
+3. Enterprise Mode
+
+* centralized policy
+* telemetry aggregation optional
+* privacy-safe metrics only
+* no source code upload
+
+====================================================
+NON-NEGOTIABLE LIMITATION HANDLING
+
+GitHub Copilot may not expose exact internal hidden prompt/context.
+
+Therefore:
+
+* Never claim exact Copilot billing tokens.
+* Label every value:
+    * Exact
+    * Observed
+    * Estimated
+    * Inferred
+* Provide confidence score.
+* Use exact token counting only when official VS Code Language Model APIs allow it.
+* Do not use private Copilot APIs.
+* Do not intercept network traffic.
+* Do not scrape credentials or prompts.
+
+====================================================
+TEAM-SEAMLESS ARCHITECTURE
+
+Build as:
+
+VS Code Extension
+↓
+Auto Workspace Detector
+↓
+Context Intelligence Engine
+↓
+Token Measurement Engine
+↓
+Policy Engine
+↓
+Local Dashboard
+↓
+Optional Team Report Export
+↓
+Optional Enterprise Aggregator
+
+The extension must work across any repo without custom coding.
+
+====================================================
+REQUIRED FILE STRUCTURE
+
+src/
+extension.ts
+
+activation/
+activationController.ts
+workspaceBootstrapper.ts
+firstRunExperience.ts
+
+config/
+policyLoader.ts
+defaultPolicy.ts
+orgPolicyResolver.ts
+configSchema.ts
+
+detection/
+workspaceDetector.ts
+copilotCustomizationDetector.ts
+instructionDetector.ts
+promptFileDetector.ts
+skillDetector.ts
+hookDetector.ts
+mcpDetector.ts
+gitDetector.ts
+sonarDetector.ts
+koshDetector.ts
+
+sessions/
+sessionManager.ts
+sessionTracker.ts
+sessionModel.ts
+autoSessionHeuristics.ts
+
+tokens/
+tokenService.ts
+vscodeModelTokenCounter.ts
+heuristicTokenEstimator.ts
+languageAwareEstimator.ts
+tokenConfidence.ts
+
+context/
+contextInventory.ts
+contextSource.ts
+contextAttribution.ts
+deduplicationEngine.ts
+redactionEngine.ts
+contextRiskScorer.ts
+
+analysis/
+bloatAnalyzer.ts
+costEstimator.ts
+complexityAnalyzer.ts
+recommendationEngine.ts
+trendAnalyzer.ts
+
+governance/
+policyEngine.ts
+thresholdEvaluator.ts
+budgetGuard.ts
+teamPolicyReporter.ts
+
+ui/
+statusBar.ts
+activityBar.ts
+dashboardWebview.ts
+sessionTree.ts
+notificationCenter.ts
+
+reports/
+reportModel.ts
+markdownReport.ts
+jsonReport.ts
+htmlReport.ts
+teamSummaryReport.ts
+
+enterprise/
+telemetrySanitizer.ts
+metricsAggregatorClient.ts
+enterprisePolicyClient.ts
+
+performance/
+cache.ts
+fileSizeGuard.ts
+backgroundQueue.ts
+cancellation.ts
+
+tests/
+
+====================================================
+ZERO-CONFIG DEFAULT BEHAVIOR
+
+On activation:
+
+* detect workspace
+* detect repo type
+* detect Copilot customization files
+* detect .github instructions
+* detect prompt files
+* detect skills
+* detect hooks
+* detect MCP configs
+* detect git diff
+* detect open tabs
+* estimate always-on context size
+* show status bar token estimate
+
+Default status bar:
+“Copilot Context: 18k est”
+
+Click opens dashboard.
+
+====================================================
+TEAM POLICY FILE
+
+Support optional repo config:
+
+.copilot-usage-policy.json
+
+Example:
+{
+“mode”: “team”,
+“maxEstimatedInputTokens”: 60000,
+“maxAlwaysOnInstructionTokens”: 8000,
+“maxGitDiffTokens”: 15000,
+“maxHookOutputTokens”: 10000,
+“warnOnBloat”: true,
+“blockOnExtremeBloat”: false,
+“privacyMode”: “strict”,
+“exclude”: [
+“node_modules”,
+“dist”,
+“build”,
+“coverage”,
+“logs”,
+“reports/generated”
+]
+}
+
+====================================================
+WHAT TEAMS GET
+
+Every team gets:
+
+1. Status bar estimate
+2. Copilot context dashboard
+3. Always-on instruction cost report
+4. Git diff token estimate
+5. Hook output bloat warning
+6. MCP output bloat warning
+7. Prompt file/skill impact report
+8. Cost estimation
+9. Recommendations
+10. Exportable governance report
+
+====================================================
+AUTO-DETECTION REQUIREMENTS
+
+Auto-detect and analyze:
+
+* .github/copilot-instructions.md
+* .github/instructions/*.instructions.md
+* .github/prompts/*.prompt.md
+* .github/skills/**
+* .github/hooks/**
+* .vscode/mcp.json
+* AGENTS.md
+* CLAUDE.md
+* README.md
+* Sonar reports
+* KOSH configs
+* git diff
+* open tabs
+* active file
+* selected text
+* diagnostics
+
+====================================================
+ENTERPRISE PRIVACY
+
+Default must be privacy-safe.
+
+Do:
+
+* store metrics locally
+* hash sensitive content
+* redact secrets
+* avoid source-code upload
+* aggregate only numeric metrics
+* allow strict mode
+
+Do not:
+
+* upload prompts by default
+* upload source code
+* upload file contents
+* expose secrets
+* intercept Copilot network traffic
+
+====================================================
+REPORT TYPES
+
+Generate:
+
+1. Developer Report
+
+* current task estimate
+* top token contributors
+* recommendations
+
+2. Team Report
+
+* workspace bloat trends
+* expensive customization files
+* repeated waste patterns
+
+3. Enterprise Report
+
+* anonymized aggregate metrics
+* repo-level trend
+* policy violations
+* adoption insights
+
+====================================================
+PRODUCTION REQUIREMENTS
+
+Must include:
+
+* TypeScript strict mode
+* unit tests
+* integration tests
+* VS Code extension tests
+* proper error handling
+* cancellation tokens
+* caching by file hash
+* debounce expensive scans
+* non-blocking extension host
+* large-file protection
+* generated-folder exclusions
+* structured logs
+* secure local storage
+
+====================================================
+BUILD PHASES
+
+Do not build everything at once.
+
+Phase 1:
+
+* extension scaffold
+* activation
+* status bar
+* policy loader
+* workspace detector
+
+Phase 2:
+
+* Copilot customization detector
+* always-on context estimator
+* dashboard MVP
+
+Phase 3:
+
+* session tracking
+* git diff/open tab/active file estimation
+
+Phase 4:
+
+* bloat analyzer
+* recommendation engine
+* reports
+
+Phase 5:
+
+* team policy support
+* enterprise sanitized telemetry
+
+Start with Phase 1 only.
+Before coding, inspect the existing repo and reuse any existing VS Code extension scaffold.
+No fake Copilot APIs.
+No private API usage.
+Production-grade only.
