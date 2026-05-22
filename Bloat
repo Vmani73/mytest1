@@ -1,0 +1,422 @@
+You are a Principal AI Platform Architect and Enterprise Security Engineering Lead.
+
+IMPORTANT CONTEXT:
+I ALREADY have a mature AI engineering repository structure.
+
+DO NOT create a new greenfield architecture from scratch.
+
+Instead:
+
+* analyze and EXTEND my existing ecosystem
+* preserve existing structure
+* preserve backward compatibility
+* refactor incrementally
+* integrate enterprise-grade hooks into current architecture
+* avoid breaking existing playbooks, kosh configs, runtime folders, or governance systems
+
+====================================================
+CURRENT EXISTING STRUCTURE
+
+My repo already contains structures similar to:
+
+.github/
+agents/
+docs/
+hooks/
+instructions/
+kosh/
+KOSH.json
+KOSH_SCHEMA.json
+
+playbooks/
+access-control-audit/
+accessibility-testing/
+agent-design/
+agent-evaluation/
+agent-memory-design/
+agent-skill-pack-design/
+agent-to-agent-protocol-design/
+agent-tool-security/
+agentic-rag/
+agentic-system-architecture/
+ai-governance/
+ai-red-teaming/
+ai-safety-guardrails/
+analytics-engineering/
+api-security/
+api-gateway-design/
+architecture-as-code/
+and many more…
+
+There are already:
+
+* governance systems
+* security playbooks
+* AI architecture playbooks
+* Sonar findings
+* KOSH orchestration configs
+* runtime systems
+* graph systems
+* documentation systems
+
+====================================================
+CRITICAL REQUIREMENT
+
+DO NOT DUPLICATE existing functionality.
+
+First:
+
+1. Analyze existing folders
+2. Detect reusable components
+3. Detect overlap
+4. Identify extension points
+5. Reuse existing KOSH orchestration
+6. Reuse existing playbook architecture
+7. Reuse existing governance model
+8. Reuse existing runtime model
+9. Reuse existing graph/runtime infrastructure
+
+Then:
+
+* integrate hooks intelligently
+* augment existing systems
+* avoid architectural fragmentation
+
+====================================================
+NEW GOAL
+
+Transform the current ecosystem into an:
+
+“Autonomous AI Governance + Secure Engineering Runtime”
+
+powered by:
+
+* GitHub Copilot Hooks
+* intelligent orchestration
+* reflective learning
+* AI security scanning
+* multi-language AST analysis
+* architecture intelligence
+* agentic AI governance
+* runtime enforcement
+
+====================================================
+PHASE 1 — REPOSITORY ANALYSIS
+
+FIRST TASK:
+Analyze the existing repository structure.
+
+Generate:
+
+1. Architecture map
+2. Existing capabilities inventory
+3. Existing security systems
+4. Existing orchestration systems
+5. Existing governance systems
+6. Existing graph/runtime systems
+7. Existing playbook integrations
+8. Existing overlap with planned hooks
+
+Identify:
+
+* reusable modules
+* duplicate risks
+* conflicting architectures
+* extension opportunities
+* modernization opportunities
+
+Generate:
+reports/repo_analysis.md
+
+DO NOT WRITE NEW CODE YET.
+
+====================================================
+PHASE 2 — HOOK INTEGRATION STRATEGY
+
+After analysis:
+Design a NON-BREAKING integration strategy.
+
+Requirements:
+
+* preserve existing playbooks
+* preserve existing KOSH runtime
+* preserve existing orchestration
+* preserve existing schemas
+* preserve existing governance logic
+
+Hooks must become:
+
+* extensions
+* adapters
+* orchestration plugins
+
+NOT isolated parallel systems.
+
+====================================================
+PHASE 3 — KOSH-AWARE HOOK ORCHESTRATION
+
+Instead of generic hooks.json only:
+
+Integrate hooks deeply with:
+
+* KOSH.json
+* KOSH_SCHEMA.json
+* existing orchestration workflows
+
+Build:
+.github/hooks/kosh_hook_orchestrator.py
+
+Requirements:
+
+* dynamic hook registration
+* playbook-aware execution
+* governance-aware execution
+* dependency-aware orchestration
+* execution DAG
+* plugin lifecycle management
+* async execution
+* failure isolation
+* observability
+* runtime metrics
+
+====================================================
+PHASE 4 — PLAYBOOK-AWARE SECURITY ENGINE
+
+Refactor security engines to integrate with existing playbooks:
+
+Examples:
+
+* api-security/
+* ai-red-teaming/
+* ai-safety-guardrails/
+* agent-tool-security/
+* access-control-audit/
+
+DO NOT create disconnected scanners.
+
+Instead:
+
+* enrich existing playbooks
+* add hook-driven automation
+* add intelligent execution triggers
+* add runtime governance
+
+====================================================
+PHASE 5 — ENTERPRISE MULTI-LANGUAGE ANALYSIS
+
+The system MUST support:
+
+* Python
+* JavaScript
+* TypeScript
+* Java
+* Kotlin
+* Go
+* Rust
+* C#
+* C++
+* PHP
+* Ruby
+* Swift
+* Bash
+* PowerShell
+* YAML
+* Terraform
+* Kubernetes
+* Dockerfiles
+
+Use:
+
+* AST parsing
+* semantic analysis
+* hybrid regex fallback
+* architecture graphing
+
+====================================================
+PHASE 6 — AGENTIC AI SECURITY GOVERNANCE
+
+Deeply integrate AI security into existing AI playbooks.
+
+Detect:
+
+* prompt injection
+* tool injection
+* unsafe autonomous execution
+* insecure MCP exposure
+* unrestricted shell execution
+* unsafe memory persistence
+* insecure vector DB usage
+* context poisoning
+* insecure browser automation
+* unsafe AI plugins
+* jailbreak-prone prompts
+* insecure function calling
+* recursive autonomous execution
+
+Map findings into:
+
+* existing governance playbooks
+* runtime governance dashboards
+* orchestration policies
+
+====================================================
+PHASE 7 — API + NFR GOVERNANCE
+
+Integrate:
+
+* API vulnerability analysis
+* resiliency analysis
+* scalability analysis
+* observability analysis
+* concurrency analysis
+* performance anti-pattern analysis
+
+Reuse:
+
+* existing api-security playbooks
+* architecture-as-code playbooks
+* analytics-engineering playbooks
+
+====================================================
+PHASE 8 — SONAR + STATIC ANALYSIS INTEGRATION
+
+I already have Sonar findings integrated.
+
+DO NOT create duplicate lint systems.
+
+Instead:
+
+* aggregate Sonar findings
+* enrich findings contextually
+* correlate with architecture graphs
+* correlate with dependency graphs
+* correlate with runtime orchestration
+
+Add:
+
+* flaky automation detection
+* brittle locator detection
+* AI-generated code risk scoring
+* autonomous remediation suggestions
+
+====================================================
+PHASE 9 — ARCHITECTURE GRAPH INTELLIGENCE
+
+Integrate with existing:
+
+* graph runtime
+* codegraph systems
+* runtime graphing infrastructure
+
+Generate:
+
+* dependency graphs
+* blast radius graphs
+* governance graphs
+* AI-agent interaction graphs
+* runtime execution graphs
+
+Support:
+
+* Mermaid
+* JSON graph outputs
+* interactive runtime graph metadata
+
+====================================================
+PHASE 10 — REFLECTIVE LEARNING SYSTEM
+
+Build a reflective governance layer.
+
+Purpose:
+Learn recurring:
+
+* vulnerabilities
+* architecture smells
+* flaky automation
+* governance violations
+* AI hallucination patterns
+* dependency risks
+
+Persist:
+
+* structured memory
+* anti-pattern learning
+* confidence scoring
+* recurring issue trends
+
+====================================================
+PHASE 11 — SAFE RUNTIME ENFORCEMENT
+
+Build runtime execution controls.
+
+Requirements:
+
+* command allowlists
+* sandbox execution
+* governance policies
+* restricted shell execution
+* secure tool invocation
+* execution policy enforcement
+
+Block:
+
+* destructive filesystem commands
+* dangerous git operations
+* unrestricted shell access
+* unsafe autonomous execution
+
+====================================================
+PHASE 12 — FINAL ENTERPRISE EXECUTION FLOW
+
+Final architecture flow:
+
+Copilot generates code
+↓
+KOSH-aware orchestration
+↓
+Playbook-aware security governance
+↓
+AI security analysis
+↓
+API vulnerability analysis
+↓
+NFR governance
+↓
+Sonar aggregation
+↓
+Architecture graph correlation
+↓
+Reflective learning analysis
+↓
+Governance policy enforcement
+↓
+Final enterprise governance report
+
+====================================================
+OUTPUT REQUIREMENTS
+
+For EVERY phase:
+
+* deeply analyze existing architecture first
+* NEVER duplicate systems blindly
+* NEVER break compatibility
+* ALWAYS explain integration reasoning
+* ALWAYS explain governance implications
+* ALWAYS explain extension points
+* ALWAYS explain migration safety
+
+IMPORTANT:
+
+* Build incrementally
+* Preserve architecture integrity
+* Reuse existing ecosystem aggressively
+* Avoid architectural sprawl
+* No toy implementations
+* No pseudo-code
+* Production-grade only
+
+Start immediately with:
+PHASE 1 — EXISTING REPOSITORY ANALYSIS
+
+Do NOT generate implementation code yet.
+First deeply analyze the repository architecture and integration opportunities.
