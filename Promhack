@@ -1,0 +1,981 @@
+# Deterministic Runtime Location Platform Developer Package
+
+## Executive summary
+
+The supplied hackathon screenshots define a **deterministic, operator-facing runtime location system**, not a generic observability dashboard. The platform must answer, for a given application, three operational questions in one consolidated view: where major components are running, which site or sites are actively taking traffic or owning state, and how confident an operator should be in that answer. The brief also makes four constraints explicit: distinguish **deterministic or authoritative** data from **derived or inferred** data; show **fresh versus stale** data; correlate **application → component → infrastructure asset → location** explicitly; and surface **UNKNOWN, stale, or low-confidence** instead of guessing when evidence is insufficient. The screenshots further state that the current source-inventory table is **intentionally partial** and should be treated as a starting point rather than a fixed boundary.
+
+For a strict and buildable MVP, the best implementation choice is:
+
+- **FastAPI + PostgreSQL + React**
+- a **rules-driven correlation engine**
+- an **evidence store with provenance**
+- adapters for **CMDB/CSDM, AppDynamics, Prometheus/OpenShift, and MongoDB** first
+- **MSSQL** as the next real adapter
+- the remaining stacks behind the same adapter contract, using live integration only where the brief shows samples are available and mock mode where the brief marks work in progress
+
+That recommendation is technically conservative and aligned with the official capabilities of the chosen backbone. OpenTelemetry Collector is a vendor-agnostic way to receive, process, and export telemetry; Prometheus exposes a stable HTTP API and metadata endpoints; ServiceNow CMDB/CSDM provides CI and service relationships; PostgreSQL supports recursive queries for hierarchical data; and OpenAPI 3.1 gives a machine-readable HTTP API contract. citeturn13view0turn17view3turn21view3turn15view0turn11search2
+
+A few brief items remain **UNKNOWN** because they are not clearly visible in the screenshots and should not be assumed:
+
+| Brief item | Status |
+|---|---|
+| Formal scoring rubric and weightings | **UNKNOWN** |
+| Exact judging checklist beyond the visible deliverables and bonus-credit notes | **UNKNOWN** |
+| Required hosting environment | **UNKNOWN** |
+| Mandatory programming language or framework | **UNKNOWN** |
+| Exact sample file formats and schemas | **UNKNOWN** |
+| Required retention period and hard latency budget | **UNKNOWN** |
+
+## Brief-derived requirements and strict implementation boundary
+
+The screenshots establish the operational intent very clearly. The problem statement says the enterprise cannot reliably determine where an application is actually running, which data centre is actively servicing traffic, and which components are active versus merely deployed or on standby. The brief also says this is not merely a reporting problem, but a data availability, correlation, and control problem. It further says a simplified application model is acceptable, representative data sources may be mocked, and teams are **not expected** to integrate every enterprise platform or solve platform-specific edge cases.
+
+![Requirement excerpt from the supplied screenshots](sandbox:/mnt/data/req_small.jpg)
+
+The source-inventory screenshots are just as important because they define what is currently available versus what is still immature or incomplete. The table explicitly distinguishes topology visibility, live-traffic visibility, source systems, and whether samples are currently available.
+
+![Current source inventory excerpt from the supplied screenshots](sandbox:/mnt/data/table_small.jpg)
+
+A strict reading of the screenshot table gives this practical MVP boundary:
+
+| Scope slice | Build now | Why |
+|---|---|---|
+| One application-centric consolidated view | **Yes** | Directly required by the brief |
+| Questions answered | **Runtime location, traffic posture, state authority, confidence** | Directly required by the brief |
+| Simplified model | **Yes** | Explicitly allowed by the brief |
+| Representative/mocked data | **Yes** | Explicitly allowed by the brief |
+| Enterprise-wide complete inventory | **No** | The brief says the current table is partial |
+| All platforms integrated | **No** | The brief says teams are not expected to integrate every system |
+| Raw telemetry dashboard replacement | **No** | The brief explicitly aims to reduce cognitive load |
+
+A strict MVP should therefore implement only the **minimum end-to-end path** that proves the concept. The most defensible cut is:
+
+| Priority | Scope |
+|---|---|
+| Must-have | CMDB/CSDM topology backbone, Prometheus/OpenShift live runtime signals, AppDynamics application/tier/node model, MongoDB authoritative role signal, snapshot API, single UI |
+| Strong stretch | MSSQL authoritative role signal, Compute-VM signals via AppDynamics, Kafka traffic posture, IBM MQ traffic posture |
+| Contract-only or mock-first | Oracle, NetApp ONTAP, AVI load balancer, object/file storage, Batch-Autosys |
+
+The screenshots also define availability levels. To make them operationally useful, the platform should map them into a **source capability prior**, not a permanent truth ceiling. This matters because the brief explicitly encourages discovering new deterministic sources. If a better authoritative source is found later, the prior should be lifted.
+
+| Brief level | Meaning in the screenshots | Source capability prior | How it affects confidence |
+|---|---|---:|---|
+| 1 | No telemetry or data available | 0.00 | No direct runtime answer from that source; usually yields **UNKNOWN** |
+| 2 | Telemetry exists in a proprietary tool, not enterprise observability | 0.65 | Usable through a direct adapter, but correlation risk is higher |
+| 3 | Available but not standardised | 0.85 | Usable with identifier reconciliation and stronger evidence checks |
+| 4 | Available and standardised | 1.00 | Preferred source; no prior penalty |
+| TBD | Source not yet identified | 0.40 | Candidate only; never sufficient alone for high confidence |
+
+This mapping is a **platform rule**, not a fact from vendor docs. The brief itself states that the table indicates confidence in current data availability, not completeness of coverage, and that the table should evolve as teams discover additional sources.
+
+## Developer-ready implementation prompt
+
+Use the following as the single prompt for a coding team or coding agent.
+
+```text
+Build a developer-ready MVP of a “Deterministic Runtime Location Platform” for an enterprise hackathon.
+
+Strict brief constraints:
+- Treat the supplied screenshots as authoritative.
+- If the brief is unclear, mark the item UNKNOWN and do not assume.
+- Do not build a generic dashboard.
+- The platform must answer, per application:
+  1) where each major component is running,
+  2) which site or sites are actively taking traffic or owning state,
+  3) how confident the operator should be in that answer.
+- The system must distinguish deterministic/authoritative data from derived/inferred data.
+- The system must show freshness/staleness explicitly.
+- The system must show missing/conflicting evidence explicitly.
+- If the system cannot determine an answer confidently, it must output UNKNOWN, stale, or low-confidence instead of guessing.
+- The data model must explicitly connect application -> component -> infrastructure asset -> location.
+- The MVP may use a simplified application model and representative or mocked data where the brief allows it.
+- The MVP is not required to integrate every enterprise system.
+
+Implementation targets:
+- Backend: Python 3.12, FastAPI, SQLAlchemy, Alembic, Pydantic
+- Database: PostgreSQL 16+
+- UI: React + TypeScript
+- Jobs: APScheduler or lightweight worker process; avoid unnecessary distributed queue complexity in the hackathon MVP
+- Schema style: append-only observations with provenance; derived decision snapshots kept separately
+- Contracts: OpenAPI 3.1
+- Containers: Docker Compose for local, Kubernetes manifests for demo/production
+- Testing: pytest + Playwright
+
+Mandatory MVP adapters:
+- CMDB/CSDM: topology backbone
+- AppDynamics: application/tier/node model + metrics/events
+- Prometheus/OpenShift: runtime and traffic corroboration
+- MongoDB: authoritative state role via replica-set status
+
+Next adapter priority:
+- MSSQL AG role adapter
+
+Contract-only or mock-first adapters:
+- Oracle
+- Kafka
+- IBM MQ
+- NetApp ONTAP
+- AVI load balancer
+
+Core architecture:
+- Source adapters pull data from source APIs, files, or events
+- Normalize all source payloads into canonical observations
+- Preserve source provenance, timestamps, identifiers, and raw payload hashes
+- Store raw observations and normalized claims in PostgreSQL
+- Run a rules-based correlation engine that produces DecisionSnapshot records
+- Expose snapshots and evidence through a FastAPI API
+- Show one operator-facing application view in the UI
+- Provide a discovery registry for newly identified deterministic data sources
+
+Canonical ID rules:
+- Preserve native source IDs
+- Use OTel service.namespace + service.name + service.instance.id where present and unambiguous
+- Never invent service.instance.id from pod.name alone
+- If instance identity is ambiguous, keep an internal instance_fingerprint instead
+
+Decision logic:
+- Use explicit per-source authority weights
+- Use freshness factors based on source-specific TTL
+- Use agreement and conflict handling across sources
+- Use coverage of required signal classes
+- Output confidence band: HIGH / MEDIUM / LOW / UNKNOWN
+- Derived-only evidence may not produce HIGH
+
+Deliverables:
+- Source adapter interfaces and 4 working adapters
+- PostgreSQL schema migrations
+- Correlation engine rules YAML
+- FastAPI API with OpenAPI spec
+- React UI with operator view + evidence drill-down
+- Docker Compose
+- Kubernetes manifests
+- Demo data + demo script
+- Unit tests and integration tests
+- README with setup, assumptions, and UNKNOWN items
+
+Do not:
+- use LLM inference to decide runtime truth
+- hide ambiguity
+- treat all “active” semantics as the same across technologies
+- assume missing brief content
+```
+
+The technology choices above are intentionally pragmatic. OpenTelemetry Collector gives a vendor-agnostic ingestion backbone and connectors between pipelines; Prometheus has a stable HTTP API and metadata endpoints; ServiceNow CSDM gives prescriptive service-modelling guidance; and AppDynamics exposes application, tier, node, metric, and event APIs needed for a practical VM/OCP correlation path. citeturn13view0turn13view1turn17view3turn21view3turn17view2turn18view0turn19view0turn23view0
+
+A prioritised build stack for the hackathon is below.
+
+| Layer | Recommended choice | Why this is the right MVP choice |
+|---|---|---|
+| API | FastAPI | Fast build speed, native OpenAPI generation |
+| Rules engine | Python service + YAML rules | Easy to iterate under hackathon time pressure |
+| Primary store | PostgreSQL | Fastest path for explicit hierarchy + audit history |
+| UI | React + TypeScript | Fast single-page operator UI |
+| Ingestion | Adapter workers + OTel Collector where helpful | Clear split between raw ingestion and decision logic |
+| Local runtime | Docker Compose | Fast developer onboarding |
+| Demo/prod runtime | Kubernetes | Easy separation of API, UI, workers, and config |
+| Tests | pytest + Playwright | Covers engine logic and operator flow |
+
+## Architecture and component design
+
+The platform should be built as an **evidence pipeline**, not as a single query over many tools.
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        CMDB[CMDB / CSDM]
+        AD[AppDynamics]
+        PROM[Prometheus / OpenShift]
+        MONGO[MongoDB]
+        MSSQL[MSSQL AG]
+        ORA[Oracle]
+        KAFKA[Kafka]
+        MQ[IBM MQ]
+        ONTAP[NetApp ONTAP]
+        AVI[AVI Controller]
+    end
+
+    subgraph Ingestion
+        ADP[Source Adapters]
+        OTEL[OpenTelemetry Collector]
+        NOR[Normalizer and ID Resolver]
+    end
+
+    subgraph Core
+        PG[(PostgreSQL\nCanonical Model + Evidence Store)]
+        RULES[Rules YAML\nAuthority + Freshness + Coverage]
+        CORR[Correlation Engine\nDecisionSnapshot Builder]
+        DISC[Discovery Registry]
+    end
+
+    subgraph Experience
+        API[FastAPI]
+        UI[Operator UI]
+    end
+
+    CMDB --> ADP
+    AD --> ADP
+    MONGO --> ADP
+    MSSQL --> ADP
+    ORA --> ADP
+    KAFKA --> ADP
+    MQ --> ADP
+    ONTAP --> ADP
+    AVI --> ADP
+    PROM --> OTEL
+    OTEL --> NOR
+    ADP --> NOR
+    NOR --> PG
+    PG --> CORR
+    RULES --> CORR
+    CORR --> PG
+    PG --> API
+    API --> UI
+    ADP --> DISC
+    API --> DISC
+```
+
+**Short explanation.** The adapters only collect and normalise observations. They do not decide truth. The correlation engine reads the evidence store, applies explicit rules, and writes immutable decision snapshots. The UI reads snapshots and evidence separately, which keeps the operator view clean and auditable.
+
+This architecture aligns well with the official tool capabilities. OpenTelemetry Collector is explicitly designed to receive, process, and export telemetry; connectors bridge pipelines; the service-graph connector can infer inter-service relationships from traces, but those derived graphs should remain corroborative rather than authoritative. Prometheus exposes both time-series queries and metadata APIs; ServiceNow CMDB tracks CI relationships and dynamic application services; and OpenShift monitoring already bundles Prometheus, `kube-state-metrics`, `openshift-state-metrics`, and `node-exporter`. citeturn13view0turn13view1turn13view2turn17view3turn22view3turn21view0turn21view1turn14view0turn14view1turn14view2
+
+Component responsibilities should be split as follows.
+
+| Component | Responsibility | Hard rule |
+|---|---|---|
+| Source adapter | Pull source-native payloads and timestamps | Must not collapse semantics across technologies |
+| Normalizer | Convert raw payload into canonical observation + claims | Must preserve provenance and raw payload hash |
+| Canonical ID resolver | Map source-native IDs to internal keys and OTel attributes | Must never invent `service.instance.id` when ambiguous |
+| Evidence store | Persist raw observations, claims, and provenance | Append-only for observations |
+| Correlation engine | Compute snapshots and confidence | Rules-based only, no free-form inference |
+| Snapshot store | Persist immutable point-in-time answers | Must link back to evidence |
+| API | Serve snapshots, evidence, diffs, discoveries | Contract-first, OpenAPI 3.1 |
+| UI | Show single app view + evidence drill-down | No raw-telemetry-first UX |
+| Discovery registry | Record newly discovered deterministic sources | Must support sharing and audit |
+
+For the correlation store, PostgreSQL is the best MVP choice. Its recursive `WITH` queries are explicitly suited to hierarchical or tree-structured data. Neo4j becomes attractive later when variable-length path traversal and graph-first exploration dominate. Neptune is attractive when you specifically want a fully managed graph service and are comfortable with AWS-specific operational boundaries. citeturn15view0turn9search1turn9search7turn16view1
+
+The required comparison is below. The **ops complexity, cost, scaling, and dev speed** entries are an engineering assessment for this specific hackathon problem, based on the official feature and operating models.
+
+| Row | PostgreSQL | Neo4j | Amazon Neptune |
+|---|---|---|---|
+| Query patterns | Excellent for fixed hierarchy, audit joins, time-window snapshots, recursive CTE traversals | Excellent for graph-native traversals, pattern matching, variable-length paths | Excellent for graph-native traversals; supports openCypher, Gremlin, and SPARQL |
+| Ops complexity | Low | Medium if self-managed; lower if managed separately | Low on DB operations, medium on AWS/IAM/network integration |
+| Cost | Lowest MVP baseline | Medium | Highest baseline |
+| Scaling | Strong for transactional workloads and explicit hierarchies; weaker for deep graph-heavy exploration | Strong for graph-heavy traversal workloads | Strong managed HA and read scaling |
+| Dev speed | Fastest for this brief’s explicit hierarchy | Fast once graph model dominates | Slower for a 48-hour hackathon because of cloud setup and service boundaries |
+
+**Recommendation:** use **PostgreSQL for the MVP**, then add optional graph projection in Phase 2. PostgreSQL supports recursive hierarchical queries directly; Neo4j’s Cypher is purpose-built for graph pattern matching and variable-length paths; and Neptune is fully managed and supports open graph APIs, but brings more environment setup and service coupling than this brief needs on day one. citeturn15view0turn9search7turn9search1turn16view1
+
+## Data model, identifiers, evidence store, and correlation rules
+
+The platform should keep **native identity**, **canonical identity**, and **OTel identity** separate.
+
+| Identity field | Purpose | Rule |
+|---|---|---|
+| `source_native_id` | Preserve vendor/source identity | Never discard |
+| `application_key` | Stable internal application key | Prefer CMDB application-service or business-application identity |
+| `component_key` | Stable internal component key | `application_key + component_name` |
+| `asset_key` | Stable infrastructure key | `source_system + native_asset_id` |
+| `location_key` | Stable site/region key | Explicit site/DC/zone mapping table |
+| `service.namespace` | OTel grouping namespace | Use when available |
+| `service.name` | OTel logical service name | Use when available |
+| `service.instance.id` | OTel unique service-instance identity | Use only when source provides it or it is unambiguous to derive |
+
+The OTel rule is important. The official semantic conventions say `service.instance.id` must be unique within the `service.namespace, service.name` pair, and collectors should not set it unless they can **unambiguously** determine the service instance. They also note that scraping receivers often can do that because they know the target address and port. citeturn12view0turn12view1turn12view2
+
+A practical source-to-canonical mapping strategy is below.
+
+| Source | Application mapping | Component mapping | Instance mapping | Location hint |
+|---|---|---|---|---|
+| CMDB/CSDM | application service / business app | CI or service child | usually not instance-level | CMDB location / region / site fields |
+| AppDynamics | application id or name | tier name | node id | machine or node metadata |
+| Prometheus/OpenShift | workload / service labels | deployment/statefulset/pod role | OTel attrs if present; else internal fingerprint from scrape target | node, zone, namespace labels |
+| MongoDB | cluster / app tag | db component name | member `host:port` | site from host/location registry |
+| MSSQL | AG name / app tag | sql component | replica server name | site from server/location registry |
+| Oracle | db unique name / app tag | oracle component | db host + sid/service | site from host/location registry |
+| Kafka | cluster / topic ownership mapping | kafka component | broker id / client id context | site from broker registry |
+| IBM MQ | queue manager / app mapping | mq component | queue manager name | site from queue manager registry |
+| ONTAP | storage VM / volume mapping | storage component | ONTAP object UUID | site/cluster metadata |
+| AVI | virtual service / pool mapping | ingress component | virtual-service UUID | site/controller mapping |
+
+A compact PostgreSQL schema for the MVP is below.
+
+```sql
+CREATE TABLE source_system (
+    id              BIGSERIAL PRIMARY KEY,
+    code            TEXT UNIQUE NOT NULL,          -- cmdb, appd, prom, mongo, mssql...
+    name            TEXT NOT NULL,
+    kind            TEXT NOT NULL,                 -- api, scrape, file, event
+    active          BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE location (
+    id              BIGSERIAL PRIMARY KEY,
+    location_key    TEXT UNIQUE NOT NULL,          -- dc1, dc2, ap-south-1a
+    location_type   TEXT NOT NULL,                 -- datacenter, region, zone
+    display_name    TEXT NOT NULL,
+    parent_id       BIGINT REFERENCES location(id)
+);
+
+CREATE TABLE application (
+    id              BIGSERIAL PRIMARY KEY,
+    application_key TEXT UNIQUE NOT NULL,
+    display_name    TEXT NOT NULL,
+    cmdb_ref        TEXT,
+    owner_team      TEXT
+);
+
+CREATE TABLE component (
+    id              BIGSERIAL PRIMARY KEY,
+    application_id  BIGINT NOT NULL REFERENCES application(id),
+    component_key   TEXT UNIQUE NOT NULL,
+    component_name  TEXT NOT NULL,
+    component_type  TEXT NOT NULL,                 -- web, api, db, mq, kafka, lb
+    intent_json     JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE infrastructure_asset (
+    id              BIGSERIAL PRIMARY KEY,
+    asset_key       TEXT UNIQUE NOT NULL,
+    asset_type      TEXT NOT NULL,                 -- vm, pod, node, db_member, queue_manager, vs
+    display_name    TEXT NOT NULL,
+    native_source   TEXT NOT NULL,
+    native_id       TEXT NOT NULL,
+    location_id     BIGINT REFERENCES location(id),
+    metadata_json   JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE observation (
+    id                      BIGSERIAL PRIMARY KEY,
+    observation_key         TEXT UNIQUE NOT NULL,
+    source_system_id        BIGINT NOT NULL REFERENCES source_system(id),
+    source_object_type      TEXT NOT NULL,
+    source_object_id        TEXT NOT NULL,
+    subject_type            TEXT NOT NULL,         -- application, component, asset
+    subject_key             TEXT NOT NULL,
+    observed_at             TIMESTAMPTZ NOT NULL,
+    collected_at            TIMESTAMPTZ NOT NULL,
+    freshness_ttl_seconds   INTEGER NOT NULL,
+    capability_level        TEXT NOT NULL,         -- 1,2,3,4,TBD
+    authoritative           BOOLEAN NOT NULL DEFAULT FALSE,
+    raw_payload_hash        TEXT NOT NULL,
+    raw_payload_json        JSONB NOT NULL
+);
+
+CREATE TABLE observation_claim (
+    id                  BIGSERIAL PRIMARY KEY,
+    observation_id      BIGINT NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
+    question            TEXT NOT NULL,            -- runtime_location, traffic_posture, state_authority
+    predicate           TEXT NOT NULL,            -- runs_on, active_in, role, writable_in
+    value_text          TEXT,
+    location_id         BIGINT REFERENCES location(id),
+    asset_id            BIGINT REFERENCES infrastructure_asset(id),
+    support_type        TEXT NOT NULL,            -- supports, conflicts, missing
+    authority_weight    NUMERIC(4,3) NOT NULL,
+    metadata_json       JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE decision_snapshot (
+    id                  BIGSERIAL PRIMARY KEY,
+    snapshot_key        TEXT UNIQUE NOT NULL,
+    application_id      BIGINT NOT NULL REFERENCES application(id),
+    evaluated_at        TIMESTAMPTZ NOT NULL,
+    window_start        TIMESTAMPTZ NOT NULL,
+    window_end          TIMESTAMPTZ NOT NULL,
+    summary_json        JSONB NOT NULL
+);
+
+CREATE TABLE decision_snapshot_item (
+    id                  BIGSERIAL PRIMARY KEY,
+    decision_snapshot_id BIGINT NOT NULL REFERENCES decision_snapshot(id) ON DELETE CASCADE,
+    question            TEXT NOT NULL,
+    component_id        BIGINT REFERENCES component(id),
+    location_id         BIGINT REFERENCES location(id),
+    answer_json         JSONB NOT NULL,
+    confidence_raw      NUMERIC(5,2) NOT NULL,
+    confidence_band     TEXT NOT NULL,            -- HIGH, MEDIUM, LOW, UNKNOWN
+    status              TEXT NOT NULL             -- OK, STALE, CONFLICT, UNKNOWN
+);
+
+CREATE TABLE decision_snapshot_evidence (
+    id                      BIGSERIAL PRIMARY KEY,
+    decision_snapshot_item_id BIGINT NOT NULL REFERENCES decision_snapshot_item(id) ON DELETE CASCADE,
+    observation_id          BIGINT NOT NULL REFERENCES observation(id),
+    observation_claim_id    BIGINT NOT NULL REFERENCES observation_claim(id),
+    evidence_role           TEXT NOT NULL,        -- primary, corroborative, conflicting, missing
+    effective_weight        NUMERIC(5,3) NOT NULL
+);
+
+CREATE TABLE discovery_submission (
+    id                  BIGSERIAL PRIMARY KEY,
+    submitted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    submitted_by        TEXT NOT NULL,
+    source_system_name  TEXT NOT NULL,
+    signal_type         TEXT NOT NULL,
+    stack_name          TEXT NOT NULL,
+    justification       TEXT NOT NULL,
+    shared_reference    TEXT,
+    status              TEXT NOT NULL DEFAULT 'PROPOSED'
+);
+```
+
+A sample `Observation` JSON should look like this:
+
+```json
+{
+  "observation_key": "obs-mongo-payments-rs-2026-05-23T10:00:00Z",
+  "source_system": "mongo",
+  "source_object_type": "mongodb.replSetGetStatus",
+  "source_object_id": "payments-rs",
+  "subject_type": "component",
+  "subject_key": "payments:mongodb",
+  "observed_at": "2026-05-23T10:00:00Z",
+  "collected_at": "2026-05-23T10:00:04Z",
+  "freshness_ttl_seconds": 120,
+  "capability_level": "3",
+  "authoritative": true,
+  "raw_payload_hash": "sha256:9f8b...",
+  "claims": [
+    {
+      "question": "state_authority",
+      "predicate": "role",
+      "value_text": "PRIMARY",
+      "location_key": "dc1",
+      "support_type": "supports",
+      "authority_weight": 1.0,
+      "metadata": {
+        "member": "mongo-1:27017",
+        "health": 1,
+        "stateStr": "PRIMARY"
+      }
+    }
+  ]
+}
+```
+
+A sample `DecisionSnapshot` JSON should look like this:
+
+```json
+{
+  "snapshot_key": "snap-payments-2026-05-23T10:05:00Z",
+  "application_key": "payments",
+  "evaluated_at": "2026-05-23T10:05:00Z",
+  "window_start": "2026-05-23T09:50:00Z",
+  "window_end": "2026-05-23T10:05:00Z",
+  "runtime_footprint": [
+    {
+      "component_key": "payments:web",
+      "location_key": "dc1",
+      "status": "OK",
+      "confidence_raw": 88.0,
+      "confidence_band": "HIGH"
+    },
+    {
+      "component_key": "payments:web",
+      "location_key": "dc2",
+      "status": "OK",
+      "confidence_raw": 65.0,
+      "confidence_band": "MEDIUM"
+    }
+  ],
+  "traffic_posture": [
+    {
+      "location_key": "dc1",
+      "answer": "ACTIVE",
+      "status": "OK",
+      "confidence_raw": 91.0,
+      "confidence_band": "HIGH"
+    },
+    {
+      "location_key": "dc2",
+      "answer": "ACTIVE",
+      "status": "STALE",
+      "confidence_raw": 46.0,
+      "confidence_band": "LOW"
+    }
+  ],
+  "state_authority": [
+    {
+      "component_key": "payments:mongodb",
+      "location_key": "dc1",
+      "answer": "WRITABLE_PRIMARY",
+      "status": "OK",
+      "confidence_raw": 94.0,
+      "confidence_band": "HIGH"
+    }
+  ],
+  "missing_signals": [
+    "avi.virtual_service_activity"
+  ],
+  "conflicts": [],
+  "evidence_refs": [
+    "obs-mongo-payments-rs-2026-05-23T10:00:00Z",
+    "obs-prom-payments-web-2026-05-23T10:04:00Z",
+    "obs-appd-payments-tier-2026-05-23T10:03:00Z"
+  ]
+}
+```
+
+The correlation engine should operate on **three questions**, each with required signal classes.
+
+| Question | Required signal classes | Minimum rule |
+|---|---|---|
+| `runtime_location` | topology + liveness | at least one fresh source for liveness and one resolved asset/location path |
+| `traffic_posture` | traffic activity | at least one fresh traffic signal |
+| `state_authority` | stack-native ownership signal | requires stack-native authoritative signal; no heuristic substitution |
+
+Use an explicit confidence formula.
+
+```text
+Let e be an observation claim.
+
+capability_factor(level) =
+  1.00 for level 4
+  0.85 for level 3
+  0.65 for level 2
+  0.00 for level 1
+  0.40 for TBD
+
+freshness_factor(age, ttl) =
+  1.00 if age <= ttl
+  0.60 if ttl < age <= 2*ttl
+  0.30 if 2*ttl < age <= 6*ttl
+  0.00 if age > 6*ttl
+
+effective_weight(e) =
+  authority_weight(e)
+  * capability_factor(level(e))
+  * freshness_factor(age(e), ttl(e))
+
+support = sum(effective_weight for supporting claims)
+conflict = sum(effective_weight for conflicting claims)
+
+agreement =
+  support / (support + conflict + 0.001)
+
+coverage =
+  satisfied_required_signal_classes / required_signal_classes
+
+freshness_mean =
+  average(freshness_factor for primary supporting claims)
+
+raw_score =
+  100 * (
+    0.45 * min(1.0, support) +
+    0.20 * agreement +
+    0.20 * coverage +
+    0.15 * freshness_mean
+  )
+```
+
+Apply the following hard gates:
+
+| Condition | Forced outcome |
+|---|---|
+| No authoritative signal for `state_authority` | `UNKNOWN` |
+| Missing timestamp on all supporting claims | max confidence `LOW` |
+| Only derived evidence exists | max confidence `LOW` |
+| Fresh authoritative conflict exists | status `CONFLICT`, max confidence `LOW` |
+| No required signal classes satisfied | `UNKNOWN` |
+
+Confidence thresholds:
+
+| Raw score | Band |
+|---:|---|
+| 80–100 | HIGH |
+| 60–79.99 | MEDIUM |
+| 35–59.99 | LOW |
+| below 35 | UNKNOWN |
+
+This design aligns with the official source semantics. Prometheus marks absent series stale, queries return no value after staleness, and `timestamp()` returns the sample timestamp; MongoDB `replSetGetStatus` exposes `health` and `stateStr`; SQL Server AG exposes `role` and `synchronization_health`; Oracle `V$DATABASE` exposes `DATABASE_ROLE` and `OPEN_MODE`; and OTel defines the service identity tuple. citeturn22view0turn22view1turn6view0turn6view1turn6view2turn6view3turn6view4turn6view5turn12view0
+
+For later graph projection, the same snapshot can be copied into Neo4j or Neptune. A sample Cypher projection is below.
+
+```cypher
+MERGE (a:Application {key: $application_key, name: $application_name})
+WITH a
+UNWIND $components AS c
+  MERGE (comp:Component {key: c.component_key})
+  SET comp.name = c.component_name,
+      comp.type = c.component_type
+  MERGE (a)-[:HAS_COMPONENT]->(comp)
+
+  MERGE (asset:Asset {key: c.asset_key})
+  SET asset.type = c.asset_type
+
+  MERGE (loc:Location {key: c.location_key})
+  SET loc.type = c.location_type
+
+  MERGE (comp)-[:RUNS_ON]->(asset)
+  MERGE (asset)-[:LOCATED_IN]->(loc)
+
+  MERGE (snap:DecisionSnapshot {key: $snapshot_key})
+  MERGE (a)-[:HAS_SNAPSHOT]->(snap)
+  MERGE (snap)-[:ASSERTS {
+    question: c.question,
+    confidence_band: c.confidence_band,
+    confidence_raw: c.confidence_raw
+  }]->(loc);
+```
+
+## Adapters, API contract, and UI
+
+The adapter layer should be explicit about **what each source is allowed to answer**.
+
+| Source | Official interface to use | Signal types | Authoritative for | Brief sample status | MVP action |
+|---|---|---|---|---|---|
+| CMDB / CSDM | CI relationships, application services, dynamic service relationships | topology, app/component/asset/location mapping | topology backbone | Present across compute/storage rows | **Implement** |
+| AppDynamics | Application Model API, Metric & Snapshot API, Events API | app/tier/node structure, availability/activity, deployment events | runtime and traffic corroboration | Used in compute traffic rows; sample yes | **Implement** |
+| Prometheus / OpenShift | Prometheus HTTP API, OCP monitoring stack | pod/node/workload activity, endpoint presence, metrics timestamps | runtime and traffic corroboration | OCP live traffic level 4; sample yes | **Implement** |
+| MongoDB | `replSetGetStatus` | role, health, optime, primary/secondary | state authority | sample yes | **Implement** |
+| MSSQL | `sys.dm_hadr_availability_replica_states` | replica role, sync health | state authority | sample yes | **Implement next** |
+| Oracle | `V$DATABASE` | role and open mode | state authority | work in progress | contract + mock, then live |
+| Kafka | broker/client metrics | bytes in/out, request rate | traffic posture only by default | sample yes | stretch |
+| IBM MQ | Prometheus-compatible queue-manager metrics | queue-manager activity | traffic posture only by default | sample yes | stretch |
+| NetApp ONTAP | REST performance metrics | IOPS, latency, throughput | storage activity corroboration | work in progress | contract + mock |
+| AVI | virtual-service metrics/API | ingress throughput and service activity | ingress traffic posture | work in progress | contract + mock |
+
+The official source basis for those adapters is strong. ServiceNow application services are logical representations of deployed application stacks, dynamic services update from CMDB relationships, and application services can be created through multiple mapping methods. AppDynamics exposes application, tier, node, metric, and event APIs, and supports `APPLICATION_DEPLOYMENT` events. Prometheus exposes `/api/v1`, metadata endpoints, Kubernetes discovery labels, staleness behaviour, and sample timestamps. OpenShift monitoring includes Prometheus, `kube-state-metrics`, `openshift-state-metrics`, and `node-exporter`. MongoDB, SQL Server, and Oracle expose role and health semantics natively. Kafka exposes throughput and request-rate metrics, IBM MQ exposes Prometheus-compatible queue-manager metrics, ONTAP exposes IOPS/latency/throughput via REST, and AVI exposes virtual-service throughput via API. citeturn21view0turn21view1turn21view2turn17view2turn18view0turn19view0turn23view0turn17view3turn22view3turn4view0turn4view1turn22view0turn22view1turn14view0turn14view1turn14view2turn6view0turn6view2turn6view3turn6view4turn6view5turn6view6turn6view7turn17view1turn17view0turn7search2turn8search0
+
+The API should be contract-first and kept small. OpenAPI 3.1 is the right format because it is a standard interface description for HTTP APIs that both humans and computers can understand. Prometheus itself now publishes OpenAPI specifications from its HTTP API, which is a nice precedent for this platform too. citeturn11search2turn17view3
+
+A compact OpenAPI surface for the MVP is below.
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Deterministic Runtime Location Platform API
+  version: 0.1.0
+paths:
+  /v1/applications:
+    get:
+      summary: List applications
+      responses:
+        "200":
+          description: Application list
+
+  /v1/applications/{appId}/snapshot:
+    get:
+      summary: Get latest decision snapshot for one application
+      parameters:
+        - in: path
+          name: appId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Decision snapshot
+        "404":
+          description: Application not found
+
+  /v1/applications/{appId}/evidence:
+    get:
+      summary: Get evidence for one application
+      parameters:
+        - in: path
+          name: appId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: question
+          schema:
+            type: string
+            enum: [runtime_location, traffic_posture, state_authority]
+      responses:
+        "200":
+          description: Evidence list
+
+  /v1/evaluations/run:
+    post:
+      summary: Trigger an evaluation run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                application_key: { type: string }
+                force_refresh: { type: boolean }
+      responses:
+        "202":
+          description: Evaluation accepted
+
+  /v1/discoveries:
+    post:
+      summary: Submit a newly discovered deterministic source
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_system_name, signal_type, stack_name, justification]
+              properties:
+                source_system_name: { type: string }
+                signal_type: { type: string }
+                stack_name: { type: string }
+                justification: { type: string }
+                shared_reference: { type: string }
+      responses:
+        "201":
+          description: Discovery recorded
+```
+
+Example request and response:
+
+```http
+POST /v1/evaluations/run
+Content-Type: application/json
+
+{
+  "application_key": "payments",
+  "force_refresh": true
+}
+```
+
+```json
+{
+  "status": "accepted",
+  "application_key": "payments",
+  "request_id": "eval-20260523-100501"
+}
+```
+
+```http
+GET /v1/applications/payments/snapshot
+```
+
+```json
+{
+  "application_key": "payments",
+  "evaluated_at": "2026-05-23T10:05:00Z",
+  "runtime_footprint": [
+    {
+      "component_key": "payments:web",
+      "location_key": "dc1",
+      "confidence_band": "HIGH"
+    }
+  ],
+  "traffic_posture": [
+    {
+      "location_key": "dc1",
+      "answer": "ACTIVE",
+      "confidence_band": "HIGH"
+    }
+  ],
+  "state_authority": [
+    {
+      "component_key": "payments:mongodb",
+      "location_key": "dc1",
+      "answer": "WRITABLE_PRIMARY",
+      "confidence_band": "HIGH"
+    }
+  ],
+  "missing_signals": [],
+  "conflicts": []
+}
+```
+
+The UI should remain disciplined. A suitable wireframe is below.
+
+```text
++----------------------------------------------------------------------------------+
+| Application: PAYMENTS                                    Evaluated: 10:05 UTC   |
+| Status: OK         Runtime: HIGH         Traffic: HIGH         State: HIGH       |
++----------------------------------------------------------------------------------+
+| Component              | Running In            | Traffic In      | State Owner    |
+|----------------------- |----------------------|-----------------|----------------|
+| web                    | dc1 HIGH, dc2 MEDIUM | dc1 ACTIVE      | n/a            |
+| api                    | dc1 HIGH             | dc1 ACTIVE      | n/a            |
+| mongodb                | dc1, dc2             | n/a             | dc1 PRIMARY    |
++----------------------------------------------------------------------------------+
+| Missing signals: none                                                         ▼  |
+| Conflicts: none                                                               ▼  |
++----------------------------------------------------------------------------------+
+| Evidence tabs: [Supporting] [Conflicting] [Missing] [Freshness] [Raw Source]    |
++----------------------------------------------------------------------------------+
+```
+
+UI requirements:
+
+| Area | Requirement |
+|---|---|
+| Header | app, timestamp, overall status, confidence summary |
+| Main table | component-by-site answer matrix |
+| Labels | explicit `OK`, `STALE`, `CONFLICT`, `UNKNOWN` |
+| Evidence | drill-down to supporting, conflicting, and missing evidence |
+| Freshness | last-updated per source and per key claim |
+| Confidence | band plus short explanation, not opaque score-only |
+| Unknowns | visually explicit; never hidden behind green defaults |
+| Discovery | small form or link to record newly found deterministic sources |
+
+## Delivery plan, testing, roadmap, and checklist
+
+A practical deployment plan should support both local hackathon work and a clean demo environment.
+
+| Environment | Recommendation |
+|---|---|
+| Local dev | Docker Compose with `api`, `worker`, `ui`, `postgres` |
+| Demo cluster | Kubernetes namespace `drlp` |
+| Config | ConfigMaps for rules and adapter schedules; Secrets for credentials |
+| Ingestion cadence | worker loops or CronJobs per source |
+| API/UI | separate Deployments |
+| Database | PostgreSQL StatefulSet for demo, managed PostgreSQL for production |
+| CI/CD | GitHub Actions: lint → tests → image build → manifest/Helm render |
+
+A sample Kubernetes deployment fragment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drlp-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: drlp-api
+  template:
+    metadata:
+      labels:
+        app: drlp-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/example/drlp-api:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: drlp-secrets
+                  key: database-url
+            - name: RULES_PATH
+              value: /etc/drlp/rules/rules.yaml
+          volumeMounts:
+            - name: rules
+              mountPath: /etc/drlp/rules
+      volumes:
+        - name: rules
+          configMap:
+            name: drlp-rules
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: drlp-ingest-mongo
+spec:
+  schedule: "*/2 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest-mongo
+              image: ghcr.io/example/drlp-worker:latest
+              args: ["python", "-m", "workers.ingest_mongo"]
+```
+
+A minimal OTel Collector fragment for Prometheus/OpenShift intake:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: ocp-workloads
+          kubernetes_sd_configs:
+            - role: pod
+
+processors:
+  batch: {}
+
+exporters:
+  otlphttp:
+    endpoint: http://drlp-worker:4318
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [batch]
+      exporters: [otlphttp]
+```
+
+The 48-hour hackathon plan should stay ruthless.
+
+| Time block | Deliverable |
+|---|---|
+| Day one morning | Create repo, DB schema, adapter interfaces, rules YAML, FastAPI skeleton |
+| Day one afternoon | Implement CMDB adapter, Prometheus/OpenShift adapter, canonical ID resolver |
+| Day one evening | Implement MongoDB adapter, first DecisionSnapshot path, basic API responses |
+| Day two morning | Build React operator view, evidence drill-down, stale/unknown indicators |
+| Day two afternoon | Add AppDynamics adapter, end-to-end demo data, snapshot refresh flow |
+| Day two evening | Tests, screenshots, demo script, deployment polish, discovery registry form |
+
+A four-week production roadmap should look like this.
+
+| Week | Milestone |
+|---|---|
+| Week one | Stabilise schema, complete CMDB/AppDynamics/Prometheus/Mongo/MSSQL adapters, add auth and role-based access |
+| Week two | Add Oracle, Kafka, IBM MQ live adapters; improve identifier reconciliation; add snapshot diffing |
+| Week three | Production hardening: retries, backoff, secrets handling, audit logging, performance tuning, SLO dashboards |
+| Week four | Add optional graph projection, richer evidence exploration, natural-language explainability layer, source-onboarding workflow |
+
+The test plan and acceptance criteria should map directly to the brief.
+
+| Test area | Acceptance condition |
+|---|---|
+| Deterministic vs derived | UI and API clearly label each evidence item as authoritative or derived |
+| Freshness | every evidence item has `observed_at`, `collected_at`, and stale/fresh status |
+| Correlation model | the system materialises `application -> component -> asset -> location` |
+| Runtime answer | at least one application demo shows where each major component is running |
+| Traffic answer | the system shows which site is actively taking traffic |
+| State answer | for a stateful component, the system shows which site owns writable state |
+| Missing data | missing signals are shown explicitly |
+| Conflicts | fresh conflicting authoritative signals force `CONFLICT` or `UNKNOWN`, never green |
+| Cognitive load | operator can understand the answer without reading raw telemetry first |
+| Explainability | evidence panel shows which data was used, which was missing, how correlation worked, and how confidence was computed |
+
+The demo should be short and operational.
+
+| Step | Action | What judges should see |
+|---|---|---|
+| Intro | open one application | single consolidated application view |
+| Runtime | show component/site matrix | clear runtime footprint |
+| Traffic | show active site(s) | traffic posture separated from deployment presence |
+| State | show Mongo or MSSQL ownership | writable-state authority made explicit |
+| Evidence | open evidence drill-down | supporting, missing, and conflicting signals |
+| Failure mode | age one source or inject conflict | `STALE`, `LOW`, or `UNKNOWN`, not guesswork |
+| Discovery | submit one new source proposal | alignment with the brief’s discovery requirement |
+
+The main risks are semantic, not just technical.
+
+| Risk | Why it matters | Mitigation |
+|---|---|---|
+| Identifier mismatch | same runtime object appears differently across tools | explicit native IDs + canonical IDs + mapping tables |
+| Semantic overreach | “active” means different things in DB, MQ, Kafka, LB | per-source question authority map |
+| Stale data | old evidence can look valid | TTL + freshness factor + visible timestamps |
+| Conflicting authoritative sources | drift or lag can produce contradictory answers | hard conflict gate and evidence drill-down |
+| Over-automation | LLM-style summaries may invent certainty | rules-only decision engine |
+| Adapter sprawl | too many integrations for 48 hours | strict MVP cut and common adapter contract |
+| Environment access | real enterprise APIs may not be reachable in time | mock mode allowed by the brief |
+
+Phase 2 should add two things only after the MVP is stable. The first is **graph projection**, not graph-first storage: project snapshots and evidence into Neo4j or Neptune once graph exploration becomes a real need. The second is **AI explainability**, but only as a narrative layer over already-computed evidence and decisions. The model may explain *why* the engine returned LOW or UNKNOWN; it must not decide runtime truth itself. For derived topology aids, the OTel service-graph connector is useful but should remain corroborative because it infers edges from traces rather than establishing authoritative ownership. citeturn13view2turn9search7turn9search1turn16view1
+
+**Deliverables checklist**
+
+- [ ] FastAPI service with OpenAPI 3.1 spec
+- [ ] PostgreSQL schema + Alembic migrations
+- [ ] Rules YAML for authority, freshness, agreement, and coverage
+- [ ] Working adapters for CMDB, AppDynamics, Prometheus/OpenShift, and MongoDB
+- [ ] MSSQL adapter or clearly marked stretch stub
+- [ ] React UI with consolidated application view and evidence drill-down
+- [ ] Docker Compose for local run
+- [ ] Kubernetes manifests for demo deployment
+- [ ] Demo dataset and scripted failover/stale-data scenario
+- [ ] Unit, integration, and UI smoke tests
+- [ ] README with assumptions, UNKNOWN items, and source-discovery workflow
