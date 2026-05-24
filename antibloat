@@ -1,0 +1,163 @@
+You are working inside my repository that contains a custom GitHub Copilot / VS Code agent framework called CodeMindIDEAgent.
+
+Your task is to refactor and harden this repository so that the custom agent architecture is reliable, fast, and auditable.
+
+Operate in two phases:
+1. Inspect the existing repo and produce a precise change plan mapped to actual files.
+2. Implement the changes after the plan, keeping existing intent where possible and avoiding unnecessary rewrites.
+
+Mandatory goals
+
+A. Persona routing must be real, not just described in prose
+- Keep CodeMindIDEAgent as the single top-level user-selected entry point.
+- Convert the current logical personas into actual native custom agents / subagents:
+  - orchestrator
+  - developer
+  - quality-enforcer
+  - auditor
+  - security-validator
+- If useful, add planner/researcher as internal helper agents.
+- Internal agents should normally be hidden from the picker and used as subagents only.
+- The top-level agent must explicitly restrict which agents it may invoke.
+- Persona transitions must be visible:
+  - before any user-visible work or code-editing work, emit one concise line such as:
+    "Active persona: Developer — implementing the approved scope."
+  - when switching personas mid-task, emit one concise transition line.
+- Use real subagent invocation and/or handoffs where appropriate, not only narrative instructions.
+
+B. De-bloat the always-on context
+- Reduce .github/copilot-instructions.md to universal rules only:
+  - evidence discipline
+  - safety and minimal-change policy
+  - KOSH requirements
+  - output contract
+  - high-level orchestration policy
+- Move file-type-, language-, framework-, and domain-specific guidance into
+  .github/instructions/*.instructions.md using applyTo frontmatter.
+- Convert reusable task workflows currently buried in playbooks into the right native primitive:
+  - .github/prompts/*.prompt.md for manually triggered repeatable workflows
+  - .github/skills/**/SKILL.md for reusable capabilities that include scripts/resources/examples
+- Keep existing playbooks if they contain valuable domain detail, but stop forcing the agent to scan all of them on every task.
+
+C. Sonar enforcement must become deterministic
+- Reuse and improve any existing Sonar files/adapters already present in the repo.
+- Treat Sonar as a gate, not a suggestion.
+- Make Developer and/or Quality Enforcer trigger validation after edits using native hooks and repo scripts.
+- Add or update native hook entry points in .github/hooks/*.json.
+- If hooks.yaml or other custom routing config exists, keep it only as an internal config source if needed, but make the native .json hooks the actual entry point.
+- After code changes, run the repo’s Sonar validation path with the fastest reliable local workflow.
+- If local Sonar validation is unavailable, detect and report that clearly.
+- If Sonar returns blocker/critical findings or quality-gate failure evidence, do not allow the task to finish as successful.
+- Route remediation back to Developer once, then re-validate.
+- Prevent infinite validation loops.
+
+D. Token accounting must be robust and reported at the end of each task
+- Implement exact token accounting where the platform exposes exact data.
+- Prefer documented telemetry / trace / debug sources over guesswork.
+- Add a repo script that aggregates per-iteration and per-task token consumption into a compact summary:
+  - total input tokens
+  - total output tokens
+  - cache read/write tokens if available
+  - number of model calls / iterations
+  - model(s) used if available
+  - task duration
+- Persist the usage summary into KOSH / audit artefacts for significant tasks.
+- Also present the final task usage summary in the user-visible final response.
+- If exact token counts are not available on a given surface, implement the best documented fallback and label it clearly as approximate.
+- Do not hardcode secrets or expose tokens.
+
+E. Keep hooks fast and safe
+- Hooks must be lightweight and deterministic.
+- Expensive aggregation should happen at Stop/session-end, not after every tiny tool action.
+- Add timeouts and guardrails.
+- Avoid agent self-modification of hook scripts unless manually approved.
+- Add tests for hook parsing / routing / aggregation where practical.
+
+Repository inspection scope
+
+Inspect at least these areas before editing:
+- .github/copilot-instructions.md
+- .github/agents/**
+- .github/hooks/**
+- .github/instructions/**
+- .github/prompts/**
+- .github/skills/**
+- .github/playbooks/**
+- .github/workflows/**
+- .github/kosh/**
+- any Sonar-related files or settings
+- .vscode/** if present
+- docs/** if present
+
+Implementation requirements
+
+1. Top-level orchestrator
+- Refactor CodeMindIDEAgent into a coordinator agent with a small, explicit responsibility:
+  - inspect context
+  - choose the right internal agents
+  - define checkpoints
+  - synthesise final output
+- Do not keep all persona logic as one long body of prose.
+
+2. Internal agents
+- Create or update dedicated agent files for:
+  - developer
+  - quality-enforcer
+  - auditor
+  - security-validator
+- Give each agent the minimum tools it needs.
+- Ensure the quality/security/audit agents are read-mostly where possible.
+- If the current repo uses deprecated infer behaviour, modernise it.
+
+3. Prompt and skill design
+- Create one reusable prompt file for “harden custom agent architecture”.
+- Create one skill for “sonar-governance-validation” if a skill-based capability makes sense.
+- Create one skill or prompt for “token-usage-summary” if that improves reuse.
+
+4. Hook design
+- Implement native .github/hooks/*.json wrapper hooks that call repo scripts.
+- Add at least:
+  - SessionStart or equivalent context initialisation
+  - PostToolUse validation hook for code edits
+  - Stop hook for final validation + usage summary
+- Make the Stop hook safe against endless reruns.
+
+5. Sonar workflow
+- Keep local validation fast.
+- If GitHub workflow / PR quality gate integration exists, improve it.
+- If missing, add the minimal robust workflow/config needed so PRs can fail on quality-gate failure.
+- Document manual prerequisites separately if server-side binding is required.
+
+6. Documentation
+- Update docs so a future maintainer can understand:
+  - how persona routing works
+  - which files are native Copilot customisation files
+  - how Sonar enforcement works locally and in CI
+  - how token accounting works
+  - any platform limitations, especially around inline suggestions vs chat/agent mode
+
+Output contract
+
+First, give me:
+- a repo-aware plan
+- the exact files you will create/update
+- any limitations you detect
+
+Then implement the changes.
+
+At the end, provide:
+- changed-file summary
+- final architecture summary
+- persona-routing summary
+- Sonar enforcement summary
+- token-accounting summary
+- any manual setup steps I must complete
+- any remaining limitations that cannot be solved purely in-repo
+
+Important constraints
+
+- Preserve my existing KOSH / audit / governance intent.
+- Prefer small, reviewable edits over big rewrites.
+- Do not invent capabilities that the current platform cannot support; if something is impossible, document the limitation and implement the nearest robust fallback.
+- Do not leave persona switching as a soft instruction only.
+- Do not rely solely on .github/copilot-instructions.md for enforcement.
