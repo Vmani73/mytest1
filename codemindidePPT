@@ -1,0 +1,206 @@
+# CodemindIDEagent Deep Research
+
+## Executive summary
+
+Your repository already contains a serious control-plane design for Copilot: a custom agent profile, a five-persona operating model, a KOSH memory layer, a playbook catalog, and a hook-oriented Python runtime. The strongest conclusion from the evidence is that the design is **policy-rich but enforcement-light**. In other words, the repo clearly states what Copilot *should* do, but the current behavior problems you described—slow responses, missing persona announcements, Sonar non-enforcement, and general bloat—are best explained by a gap between your Markdown governance layer and Copilot’s supported runtime control points. Repository evidence: `.github/agents/codemindIDEagent.agent.md:1-95`; `.github/copilot-instructions.md:1-145`; `.github/hooks/` inventory screenshot. GitHub’s current docs confirm that repository instructions are added to requests as context, while hooks are the mechanism that can actually control tool execution, inject follow-up guidance, and block finalization for another turn. citeturn19view5turn24view6turn27view2turn41view4
+
+The most important fix is not “write more prompt text.” It is to **bind your existing Python governance modules to official Copilot hook events under `.github/hooks/*.json`**, then add a strict stop-hook response contract that forces persona announcements, explicit playbook selection, Sonar status, token summary, KOSH references, and an audit verdict before a task can complete. GitHub’s hooks reference explicitly supports `preToolUse` decisions, `postToolUse` context injection, and `agentStop` / `subagentStop` blocking behavior, which is exactly what your current design is missing as an executable backstop. citeturn25view5turn27view2turn27view5turn27view7turn41view4
+
+Your slowdown problem also has a concrete design explanation. GitHub documents that hooks run synchronously and block agent execution, and recommends keeping them under about five seconds when possible, caching expensive computations, and offloading heavy work. At the same time, your visible repository design asks the agent to inspect KOSH, inspect playbooks, inspect skills, sometimes inspect graph artifacts, produce a plan, and route across multiple personas before work begins. Combined with a broad `.github` control plane and non-trivial directories such as `generated/`, `graph-out/`, `.codegraph-runtime/`, `my_venv/`, and caches, that is a credible recipe for a sluggish agent unless routing is aggressively narrowed and low-value paths are ignored. Repository evidence: root/explorer screenshot; `.github/agents/codemindIDEagent.agent.md:18-28`; `.github/copilot-instructions.md:34-145`. citeturn25view0turn34view0turn34view2
+
+A second major finding is that your Sonar expectation is already written into the repo. The Quality Enforcer section says SonarQube for IDE / SonarLint should run when configured and applicable, and the hooks directory visibly contains `sonar_adapter.py`. That means the present failure is **not** a missing requirement; it is a missing or ineffective enforcement path. The right remediation is a dual-path model: local, fast-path Sonar checks for changed files where possible, plus CI as the hard merge gate using SonarQube analysis and a required branch check. SonarQube’s documentation supports GitHub Actions integration for scan execution, and GitHub supports required status checks before merge. Repository evidence: `.github/agents/codemindIDEagent.agent.md:47-52`; `.github/hooks/sonar_adapter.py` visible in hooks explorer screenshot. citeturn45view0turn7view1
+
+A third finding concerns token accounting. GitHub’s Copilot docs describe requests, premium requests, weekly token limits, and strategies such as plan mode and reducing parallel workflows, but the documented hook payloads for `userPromptSubmitted`, `preToolUse`, `postToolUse`, and `agentStop` do not include an explicit per-turn token usage field. That means a repository-local hook can report a robust **exact-or-estimated** token summary, but it should not pretend to have exact model usage unless the runtime is actually exposing it. The most defensible design is a dual-mode token meter that uses real usage metadata when available and a tokenizer-backed estimate otherwise, with the final response labeling the mode honestly. citeturn33view2turn34view0turn35view2turn35view3
+
+## What the repository shows
+
+The screenshots show a control-heavy `.github/` tree with `agents`, `docs`, `hooks`, `instructions`, `kosh`, `playbooks`, `prompts`, `skills`, `templates`, `workflows`, and `copilot-instructions.md`. The root of the repo also appears to contain runtime- and artifact-heavy paths such as `.codegraph-runtime/`, `generated/`, `graph-out/`, `my_venv/`, plus caches and application code. That strongly suggests your repository is using `.github` as an internal governance platform layered on top of normal source code, which raises the importance of narrow routing and explicit ignore rules. Repository evidence: explorer screenshots showing the repo root and `.github` tree.
+
+![Repository explorer showing the `.github` control plane and adjacent generated/runtime directories](sandbox:/mnt/data/IMG_3297CFF6-E997-446C-99FF-F8975683F862.jpeg)
+
+Your custom agent file is structurally aligned with GitHub’s documented agent profile pattern: GitHub says custom agents live in `.github/agents/*.agent.md`, use Markdown with YAML frontmatter, and can define the agent’s name, description, tools, optional model, optional target, and behavioral prompt. The screenshots show `codemindIDEagent.agent.md` using YAML frontmatter for `name` and `description`, followed by behavioral instructions and persona rules. That means your repo is not conceptually “off platform”; it is already using the right kind of surface, but it is asking that surface to do too much without enough executable validation. Repository evidence: `.github/agents/codemindIDEagent.agent.md:1-29`. citeturn47view0turn47view2turn47view4
+
+The agent file explicitly defines five logical personas—Orchestrator, Developer, Quality Enforcer, Auditor, and Security Validator—and explicitly says that when the agent adopts or switches personas, it must first tell the user which persona is active in one concise sentence. The same section says the Quality Enforcer should run SonarQube for IDE / SonarLint analysis when configured and applicable, and should report explicitly when Sonar lint is unavailable or unsupported. That is highly relevant because it means the persona-announcement failure and Sonar-enforcement failure are both **execution failures against already-written policy**, not missing requirements in the prompt. Repository evidence: `.github/agents/codemindIDEagent.agent.md:30-69`.
+
+![The custom agent file visibly requires persona announcement and Sonar-based quality validation](sandbox:/mnt/data/IMG_C8514050-15AA-4237-B5D2-BBCA992F0605.jpeg)
+
+Your `copilot-instructions.md` file is similarly strict. It says the system must not assume or hallucinate, must inspect repository and KOSH before making claims, must cite repository evidence, must prefer minimal reversible changes, and must not release output without an audit verdict. It also contains a canonical playbook routing section and a “Hook Runtime” section that describes `.github/hooks/` as the programmatic gateway to the five-persona chain. This document is strong as a constitution, but GitHub’s own docs make clear that repository custom instructions are context attached to requests; they are not by themselves a hard execution guarantee. The same GitHub documentation also supports path-specific instruction files under `.github/instructions/**/*.instructions.md` and reusable prompt files under `.github/prompts`, which is directly relevant to reducing your current prompt bloat. Repository evidence: `.github/copilot-instructions.md:1-145`. citeturn19view5turn30view0turn30view4turn28view3
+
+The hooks explorer screenshot is especially important. It shows a meaningful Python runtime already present under `.github/hooks/`, including `kosh_hook_orchestrator.py`, `resolver.py`, `policy_evaluator.py`, `reflective_aggregator.py`, `sonar_adapter.py`, `language_matrix.yaml`, tests, policies, and a governance workflow YAML. But GitHub’s current Copilot hook docs define repository-level hooks through `.github/hooks/*.json`, and the hook reference defines exactly how those hook events receive payloads and how they can return control JSON to block, allow, or modify behavior. That creates a high-confidence inference: **your repo appears to have a custom internal runtime, but the screenshots do not show evidence that this runtime is currently wired into Copilot’s official hook contract.** Repository evidence: `.github/hooks/` explorer screenshot. citeturn25view5turn25view6turn27view2turn41view4
+
+### Limits of the available evidence
+
+I did **not** have a direct checkout of your repository content in this session. The repository findings above are grounded in the screenshots you provided, and the file path plus line-range references reflect what is visible in those images. Because of that, I cannot prove whether there are additional unseen files—such as existing `.github/hooks/*.json` configs, hidden settings files, or IDE-local settings—that already partially implement some of the recommended behavior. Where I infer a gap, I am doing so because the current screenshots show the policy layer clearly but do not show the runtime glue that GitHub’s official docs describe. Repository evidence based on screenshots; official execution semantics from GitHub Docs. citeturn25view5turn26view0
+
+## Why the current design is failing
+
+The deepest design problem is that your repo currently appears to treat Copilot instructions as if they were equivalent to policy enforcement. GitHub’s docs say repository instructions are added to requests and can be verified in references, but that same doc set also says multiple instruction layers can apply at once and warns users to avoid conflicting sets of instructions. In practice, that means long global instructions plus large agent prompts plus many playbooks is not a stronger control system; it is often just a noisier one. Your repo-wide file appears to combine immutable rules, process routing, hook-runtime descriptions, KOSH behavior, and agent workflow requirements into a single large always-on surface. That is likely part of why the experience feels bloated. Repository evidence: `.github/copilot-instructions.md:1-145`. citeturn19view5turn30view1turn28view3
+
+A second cause is that your current persona model is textual rather than runtime-native. GitHub custom agents are documented as behavioral prompt profiles, not as built-in finite-state machines with guaranteed user-facing transition announcements. So if you want persona transitions to happen *reliably*, you need to add a validator that checks the response contract and blocks finalization when persona labels are missing. GitHub’s hook reference gives you the exact primitive for that: `agentStop` and `subagentStop` can return `{"decision":"block","reason":"..."}` to force another turn. Without that, the persona rule is aspirational. Repository evidence: `.github/agents/codemindIDEagent.agent.md:30-69`. citeturn47view2turn27view2turn27view7
+
+A third cause is the Sonar execution gap. The repo says SonarQube for IDE / SonarLint should run when configured, and there is a visible `sonar_adapter.py`. But there is no visible proof in the screenshots that edit or create operations are bound to a Sonar invocation, nor that stop events are blocked when Sonar policy is violated. GitHub hooks can absolutely support this pattern: `postToolUse` can append additional context or stage analysis state, and `agentStop` can block finalization. SonarQube’s GitHub Actions guidance then gives you the hard CI gate. This combination matches your needs much better than treating Sonar as a best-effort instruction inside the Quality Enforcer text. Repository evidence: `.github/hooks/sonar_adapter.py` visible; `.github/agents/codemindIDEagent.agent.md:47-52`. citeturn27view5turn41view4turn45view0turn7view1
+
+A fourth cause is performance pressure from both instructions and hooks. GitHub states plainly that hooks run synchronously and block agent execution, and recommends tight execution budgets, caching, and backgrounding expensive work. Your current visible design asks the agent to do a lot before implementation begins and appears to include many governance files, playbooks, and graph artifacts in the same repository. That means the runtime should be explicitly designed to do the **minimum** necessary on prompt submission and tool use, then defer heavier checks to stop events and CI. Otherwise your own governance layer becomes the latency source. Repository evidence: `.github/agents/codemindIDEagent.agent.md:18-28`; `.github/copilot-instructions.md:34-145`; root explorer screenshot. citeturn25view0turn25view4turn34view0
+
+The token question also matters analytically because it is easy to solve poorly. GitHub’s billing and usage docs talk about prompt requests, premium requests, model multipliers, weekly token limits, plan mode reducing overall token consumption, and parallel workflows increasing token usage. But the documented hook payloads for prompt submission, tool use, and stop events contain prompt text, tool arguments, tool results, timestamps, and transcript paths—not explicit token counters. So if you implement “token consumed by Copilot in each iteration,” the robust design is a truthful **metering service** that reports `exact`, `estimated`, or `unavailable`, rather than a fake exact number. citeturn33view1turn33view2turn34view0turn35view2turn35view3
+
+### Current versus proposed behavior
+
+| Area | Current behavior | Proposed behavior |
+|---|---|---|
+| Persona transitions | Best-effort prompt rule | Stop-hook-validated response contract |
+| Playbook routing | Broad narrative scan | Cached manifest with minimal selected chain |
+| Sonar enforcement | Stated in prompt | Local fast-path plus CI hard gate |
+| Hook runtime | Python modules visible, binding unclear | Official `.github/hooks/*.json` invoking existing modules |
+| Token reporting | Not visible | Exact-or-estimated per-turn summary |
+| KOSH | Required by policy | Automatic additive writes from supported events |
+| Performance | Large always-on instruction surface | Smaller globals, path-specific instructions, bounded hooks |
+
+This table synthesizes the repository evidence above with GitHub’s official runtime semantics and SonarQube’s CI gating model. Repository evidence: `.github/agents/codemindIDEagent.agent.md:1-95`; `.github/copilot-instructions.md:1-145`; `.github/hooks/` explorer screenshot. citeturn19view5turn30view4turn25view5turn27view2turn41view4turn45view0turn7view1
+
+## Recommended target design
+
+The cleanest redesign is to preserve your current architecture but split it into four control layers. Keep `.github/copilot-instructions.md` as the small global constitution. Keep `codemindIDEagent.agent.md` as the focused behavioral profile and response contract. Move directory-specific rules into `.github/instructions/**/*.instructions.md` so they only apply when relevant. Then put actual policy execution in `.github/hooks/*.json` calling the Python modules you already have. GitHub explicitly supports repo-wide instructions, path-specific instruction files, prompt files for reusable tasks, and custom agent profiles with optional `tools`, `model`, and `target` properties. citeturn19view5turn30view4turn28view3turn47view2turn47view4
+
+A practical persona-enforcement strategy is to make the required output contract machine-checkable. For significant tasks, require the response to begin with a single line like `Active persona: Developer — implementing approved governance changes`, followed by `selected_playbooks`, `success_criteria`, and, at task end, `sonar_status`, `token_usage`, `audit_verdict`, and `kosh_ref`. Then add an `agentStop` hook that parses the transcript for those fields and returns a blocking reason when they are absent. GitHub’s documented `agentStop` blocking mechanism is exactly designed for this kind of “revise before completion” policy. citeturn27view2turn27view7turn35view3
+
+A practical routing-and-bloat strategy is to stop making the agent rediscover the full playbook universe on every turn. Instead, create or generate a compact playbook manifest that maps request classes to minimal chains, and make `resolver.py` cache it. At the same time, give the resolver and any repo-scan logic an ignore list for `my_venv/`, `.pytest_cache/`, `__pycache__/`, `generated/`, `graph-out/`, and `.codegraph-runtime/`, plus anything else bulky and low-value. GitHub’s prompt-files and path-specific instruction support mean you can move long task-specific material out of the global prompt and only load it when the request or edited path requires it. GitHub also notes that custom agent prompts can be large, but large is not the same as efficient. citeturn30view4turn28view2turn28view3turn47view2turn25view0
+
+For Sonar, the strongest operational design is a two-stage gate. Locally, after `edit` or `create`, stage changed files and run a fast, bounded Sonar adapter pass when the runtime is available, returning a structured status such as `passed`, `failed`, or `unavailable_local`. At finalization, the stop hook should block if local Sonar found threshold-breaching issues. In CI, run the full SonarQube scan and make the resulting governance or quality check a required branch check. This preserves your desire for standards enforcement without making every small local event unbearably slow. Repository evidence: `.github/hooks/sonar_adapter.py` visible; `.github/agents/codemindIDEagent.agent.md:47-52`. citeturn45view0turn7view1turn25view0
+
+For token metering, the right design is a sidecar rather than a fantasy. Use `userPromptSubmitted` to meter prompt size, `postToolUse` to meter tool-output size and stage changed files, and `agentStop` to parse the transcript response text. If the runtime ever exposes actual usage metadata, record `metering_mode: exact`; otherwise use a tokenizer-backed estimate with a conservative fallback and record `metering_mode: estimated`. Because GitHub’s docs explicitly discuss request counts and token limits but not per-hook token fields, a truthful estimate is the governance-safe answer. citeturn33view2turn34view0turn35view2turn35view3
+
+### Target architecture diagram
+
+The following Mermaid diagram is the recommended architecture for the hardened version of your current design:
+
+```mermaid
+flowchart TB
+    UI[VS Code and GitHub Copilot UI]
+
+    subgraph Agent["codemindIDEagent"]
+        O[Orchestrator]
+        D[Developer]
+        Q[Quality Enforcer]
+        A[Auditor]
+        S[Security Validator]
+    end
+
+    subgraph Hooks[".github/hooks runtime"]
+        HJSON[Official hook config .github/hooks/*.json]
+        RES[resolver.py and playbook manifest]
+        POL[policy_evaluator.py]
+        SONAR[sonar_adapter.py]
+        TOK[token_meter.py]
+        RESP[response_contract.py]
+        KOG[kosh_hook_orchestrator.py]
+        REF[reflective_aggregator.py]
+    end
+
+    subgraph PB["Playbooks"]
+        P1[codemindide-agent-orchestration]
+        P2[developer]
+        P3[qa-engineer and quality-gates]
+        P4[auditor]
+        P5[security-testing]
+        P6[governance-aggregation and hook-orchestration]
+    end
+
+    KOSH[(KOSH session store)]
+    SQ[SonarQube and SonarQube for IDE]
+    CI[GitHub Actions and governance gates]
+    TEL[(Telemetry and JSONL logs)]
+
+    UI --> O
+    O --> D
+    O --> Q
+    O --> A
+    O --> S
+
+    UI --> HJSON
+    HJSON --> RES
+    HJSON --> POL
+    HJSON --> SONAR
+    HJSON --> TOK
+    HJSON --> RESP
+    HJSON --> KOG
+    HJSON --> REF
+
+    RES --> PB
+    O --> PB
+    D --> P2
+    Q --> P3
+    A --> P4
+    S --> P5
+
+    SONAR <--> SQ
+    Q --> SQ
+    SQ --> CI
+    CI --> UI
+
+    KOG <--> KOSH
+    TOK --> KOSH
+    RESP --> KOSH
+    REF --> KOSH
+
+    TOK --> TEL
+    SONAR --> TEL
+    POL --> TEL
+    KOG --> TEL
+    CI --> TEL
+```
+
+This design is directly aligned with the components visible in your screenshots and with GitHub’s documented hook and agent model. Repository evidence: `.github/agents/`, `.github/hooks/`, `.github/playbooks/`, `.github/kosh/`. citeturn47view2turn25view5turn41view4
+
+## Rollout, gating, and observability
+
+The rollout should be phased so that you do not turn the governance layer into the new source of friction. Start by adding observability and non-blocking contract checks, then add blocking `agentStop` enforcement, then add local Sonar fast-path checks, and only after that make CI governance and quality gates required branch checks. GitHub’s custom-agent testing guidance explicitly recommends testing custom agents privately before release, and GitHub’s protected-branch documentation supports required checks before merging. citeturn36view3turn36view4turn7view1
+
+A rational implementation timeline is shown below:
+
+```mermaid
+gantt
+    title codemindIDEagent hardening rollout
+    dateFormat  YYYY-MM-DD
+    axisFormat  %d %b
+
+    section Baseline
+    Repository audit and manifest design        :a1, 2026-05-26, 3d
+    Contract and telemetry schema design        :a2, after a1, 2d
+
+    section Runtime
+    Official hook JSON wiring                   :b1, after a2, 4d
+    Response contract validator                 :b2, after b1, 3d
+    Token meter implementation                  :b3, after b1, 3d
+
+    section Quality
+    Sonar adapter hardening                     :c1, after b2, 4d
+    CI quality gate and summaries               :c2, after c1, 3d
+
+    section Optimization
+    Instruction slimming and path-specific split :d1, after b3, 4d
+    Resolver cache and ignore-list rollout      :d2, after d1, 3d
+
+    section Release
+    Dry-run test window                         :e1, after c2, 4d
+    Protected-branch enablement                 :e2, after e1, 2d
+    Monitoring and tuning                       :e3, after e2, 7d
+```
+
+For metrics, the most useful indicators are operational correctness rather than generic productivity numbers: persona-announcement compliance rate, percentage of code-change turns with local Sonar attempted, percentage ending with `sonar_status: unavailable_local`, p50 and p95 hook latency by event, average selected-playbook count per task, blocked-finalization rate, estimated total tokens per task, and governance-gate pass rate. GitHub’s docs explicitly say hooks can log tool usage, track usage statistics, monitor performance metrics, and generate audit trails, while GitHub Actions job summaries provide a lightweight human-facing CI view using `GITHUB_STEP_SUMMARY`. citeturn24view6turn27view5turn7view0
+
+The main risks are over-blocking, false precision in token accounting, local Sonar unavailability, instruction drift, and hook latency. Those are manageable if you keep the stop-hook contract short and deterministic, clearly label token numbers as `exact` or `estimated`, treat CI as the hard quality gate when local Sonar is unavailable, add tests for hook behavior and KOSH backward compatibility, and aggressively cache or defer expensive work so synchronous hooks stay light. GitHub’s hook docs are useful here because they explicitly describe fail-open behavior for hook failures, configurable timeouts, and the performance costs of synchronous execution. citeturn25view0turn25view6turn41view4
+
+### Open questions and limitations
+
+The largest remaining unknown is whether you already have hidden or out-of-frame `.github/hooks/*.json` configs, local IDE settings, or other generated runtime artifacts that were not visible in the screenshots. If those already exist, the recommendation changes from “add official hook wiring” to “audit and simplify the existing hook wiring.” A second unknown is the exact local Sonar execution method your environment can support; the screenshots show `sonar_adapter.py`, but they do not prove whether your preferred path is SonarQube for IDE integration, SonarScanner, language-specific plugins, or a custom wrapper. Those unknowns do not change the architectural conclusion, but they do affect implementation detail.
+
+## Deliverables
+
+The requested artifacts have been prepared as downloadable files:
+
+- [Download the Markdown slide deck with full PPT contents and speaker notes](sandbox:/mnt/data/codemindIDEagent_deep_research_ppt_contents.md)
+- [Download the Mermaid architecture diagram](sandbox:/mnt/data/codemindIDEagent_architecture.mmd)
+- [Download the ready-to-run Copilot prompt](sandbox:/mnt/data/codemindIDEagent_ready_to_run_copilot_prompt.md)
+
+The ready-to-run prompt is designed to make Copilot change only your `.github` control plane, prioritize the files visible in your screenshots, add official hook wiring, enforce persona announcements, harden Sonar enforcement, implement per-iteration token accounting with honest exact-versus-estimated labeling, add tests, and produce a merge-ready PR checklist. Its structure is intentionally strict because your current repo already has strong policy language; what it needs now is code that converts those policies into runtime guarantees. Repository evidence: `.github/agents/`, `.github/hooks/`, `.github/playbooks/`, `.github/kosh/`, `.github/copilot-instructions.md`. GitHub and SonarQube docs support the runtime and CI mechanisms used in the prompt. citeturn47view2turn25view5turn27view2turn41view4turn45view0turn7view0turn7view1
