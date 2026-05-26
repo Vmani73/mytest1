@@ -1,0 +1,127 @@
+import os
+import re
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from rich.console import Console
+from rich.table import Table
+console = Console()
+TOKEN_REGEXES = [
+    r'"prompt_tokens"\s*:\s*(\d+)',
+    r'"completion_tokens"\s*:\s*(\d+)',
+    r'"total_tokens"\s*:\s*(\d+)',
+]
+stats = {
+    "requests": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+}
+history = []
+def find_latest_log_dir():
+    base = Path(os.getenv("APPDATA")) / "Code" / "logs"
+    if not base.exists():
+        raise Exception("VS Code logs folder not found")
+    dirs = sorted(base.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+    return dirs[0]
+def find_candidate_logs(log_dir):
+    candidates = []
+    for root, _, files in os.walk(log_dir):
+        for file in files:
+            full = os.path.join(root, file)
+            lower = full.lower()
+            if (
+                "copilot" in lower
+                or "chat" in lower
+                or "exthost" in lower
+            ):
+                candidates.append(full)
+    return candidates
+def render_dashboard():
+    table = Table(title="VS Code Copilot Token Monitor")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Requests", str(stats["requests"]))
+    table.add_row("Prompt Tokens", str(stats["prompt_tokens"]))
+    table.add_row("Completion Tokens", str(stats["completion_tokens"]))
+    table.add_row("Total Tokens", str(stats["total_tokens"]))
+    console.clear()
+    console.print(table)
+class LogHandler(FileSystemEventHandler):
+    def process_file(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()[-200:]
+            joined = "\n".join(lines)
+            prompt_match = re.findall(
+                TOKEN_REGEXES[0], joined
+            )
+            completion_match = re.findall(
+                TOKEN_REGEXES[1], joined
+            )
+            total_match = re.findall(
+                TOKEN_REGEXES[2], joined
+            )
+            if not total_match:
+                return
+            prompt_tokens = int(prompt_match[-1]) if prompt_match else 0
+            completion_tokens = int(completion_match[-1]) if completion_match else 0
+            total_tokens = int(total_match[-1])
+            # avoid duplicates
+            if history and history[-1]["total_tokens"] == total_tokens:
+                return
+            stats["requests"] += 1
+            stats["prompt_tokens"] += prompt_tokens
+            stats["completion_tokens"] += completion_tokens
+            stats["total_tokens"] += total_tokens
+            event = {
+                "timestamp": datetime.now().isoformat(),
+                "file": path,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens
+            }
+            history.append(event)
+            with open("copilot_usage_history.json", "w") as out:
+                json.dump(history, out, indent=2)
+            render_dashboard()
+            console.print("\nLatest:")
+            console.print(json.dumps(event, indent=2))
+        except Exception as e:
+            console.print(f"[red]ERROR[/red] {e}")
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        self.process_file(event.src_path)
+def main():
+    log_dir = find_latest_log_dir()
+    console.print(f"[green]Monitoring:[/green] {log_dir}")
+    files = find_candidate_logs(log_dir)
+    if not files:
+        console.print("[red]No Copilot logs found[/red]")
+        return
+    console.print("\nCandidate Logs:\n")
+    for f in files:
+        console.print(f)
+    observer = Observer()
+    handler = LogHandler()
+    for file in files:
+        folder = os.path.dirname(file)
+        observer.schedule(
+            handler,
+            folder,
+            recursive=False
+        )
+    observer.start()
+    render_dashboard()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+if __name__ == "__main__":
+    main()
