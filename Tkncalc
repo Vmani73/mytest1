@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+VS Code Copilot Token Usage Fetcher
+====================================
+Reads GitHub Copilot chat session JSON files from VS Code's local storage
+and extracts / aggregates token consumption data.
+
+No network calls. No credentials needed. Everything is local.
+
+Supported data sources:
+  1. workspaceStorage/<hash>/chatSessions/*.json   — per-workspace chat sessions
+  2. globalStorage/emptyWindowChatSessions/*.json  — global (no-workspace) chats
+  3. globalStorage/github.copilot-chat/**/*.json   — copilot-chat extension storage
+  4. Agent debug log OTLP exports (*.json with OTel span format)
+
+Usage:
+  python copilot_token_usage.py                     # pretty summary
+  python copilot_token_usage.py --json              # machine-readable JSON
+  python copilot_token_usage.py --days 7            # last N days only
+  python copilot_token_usage.py --verbose           # show per-session detail
+  python copilot_token_usage.py --path /custom/path # custom VS Code user dir
+  python copilot_token_usage.py --export out.csv    # export to CSV
+"""
+
+import json
+import os
+import sys
+import csv
+import glob
+import argparse
+import platform
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+# ──────────────────────────────────────────────────────────────
+# Data structures
+# ──────────────────────────────────────────────────────────────
+
+@dataclass
+class TurnStats:
+    """Token stats for a single request/response turn."""
+    turn_index: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
+    timestamp: Optional[str] = None
+
+    @property
+    def total(self):
+        return self.total_tokens or (self.prompt_tokens + self.completion_tokens)
+
+
+@dataclass
+class SessionStats:
+    """Token stats for an entire chat session."""
+    session_id: str
+    source_file: str
+    workspace: str = ""
+    model: str = ""
+    created_at: Optional[str] = None
+    turns: list = field(default_factory=list)
+
+    @property
+    def prompt_tokens(self):
+        return sum(t.prompt_tokens for t in self.turns)
+
+    @property
+    def completion_tokens(self):
+        return sum(t.completion_tokens for t in self.turns)
+
+    @property
+    def total_tokens(self):
+        return sum(t.total for t in self.turns)
+
+    @property
+    def turn_count(self):
+        return len(self.turns)
+
+
+@dataclass
+class Summary:
+    total_sessions: int = 0
+    total_turns: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    by_model: dict = field(default_factory=dict)
+    by_date: dict = field(default_factory=dict)
+    sessions: list = field(default_factory=list)
+
+
+# ──────────────────────────────────────────────────────────────
+# Path discovery
+# ──────────────────────────────────────────────────────────────
+
+def get_vscode_user_paths() -> list[Path]:
+    """Return all plausible VS Code user data directories for this OS."""
+    system = platform.system()
+    home = Path.home()
+    paths = []
+
+    if system == "Windows":
+        appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        variants = ["Code", "Code - Insiders", "Code - Exploration",
+                    "VSCodium", "Cursor", "Windsurf"]
+        for v in variants:
+            p = appdata / v / "User"
+            if p.exists():
+                paths.append(p)
+
+    elif system == "Darwin":
+        base = home / "Library" / "Application Support"
+        variants = ["Code", "Code - Insiders", "Code - Exploration",
+                    "VSCodium", "Cursor", "Windsurf"]
+        for v in variants:
+            p = base / v / "User"
+            if p.exists():
+                paths.append(p)
+
+    else:  # Linux / BSD
+        xdg = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        variants = ["Code", "Code - Insiders", "Code - Exploration",
+                    "VSCodium", "Cursor", "Windsurf"]
+        for v in variants:
+            p = xdg / v / "User"
+            if p.exists():
+                paths.append(p)
+
+    return paths
+
+
+def find_session_files(user_paths: list[Path]) -> list[tuple[Path, str]]:
+    """
+    Returns list of (json_file_path, editor_label) tuples.
+    """
+    found = []
+
+    for user_path in user_paths:
+        label = user_path.parts[-3] if len(user_path.parts) >= 3 else str(user_path)
+
+        # 1. workspaceStorage/<hash>/chatSessions/*.json
+        ws_pattern = user_path / "workspaceStorage" / "*" / "chatSessions" / "*.json"
+        for f in glob.glob(str(ws_pattern)):
+            found.append((Path(f), label))
+
+        # 2. globalStorage/emptyWindowChatSessions/*.json
+        gs_empty = user_path / "globalStorage" / "emptyWindowChatSessions"
+        if gs_empty.exists():
+            for f in gs_empty.glob("*.json"):
+                found.append((f, label))
+
+        # 3. globalStorage/github.copilot-chat/**/*.json
+        copilot_ext = user_path / "globalStorage" / "github.copilot-chat"
+        if copilot_ext.exists():
+            for f in copilot_ext.rglob("*.json"):
+                found.append((f, label))
+
+    # De-duplicate by resolved path
+    seen = set()
+    unique = []
+    for f, label in found:
+        key = str(f.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append((f, label))
+
+    return unique
+
+
+def get_workspace_label(session_file: Path) -> str:
+    """Try to read workspace.json to get a human-readable project name."""
+    try:
+        ws_json = session_file.parent.parent / "workspace.json"
+        if ws_json.exists():
+            data = json.loads(ws_json.read_text(encoding="utf-8"))
+            folder = data.get("folder", "")
+            if folder:
+                # uri like file:///home/user/myproject → myproject
+                return Path(folder.replace("file:///", "/").replace("file://", "/")).name
+    except Exception:
+        pass
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────
+# Parsers
+# ──────────────────────────────────────────────────────────────
+
+def _safe_int(val) -> int:
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_timestamp(request: dict) -> Optional[str]:
+    """Pull a timestamp string from various possible locations in a request."""
+    for key in ("timestamp", "requestIsoDate", "providerRequestId"):
+        val = request.get(key)
+        if val and isinstance(val, str) and "T" in val:
+            return val
+    result = request.get("result", {})
+    if isinstance(result, dict):
+        ts = result.get("timestamp") or result.get("requestIsoDate")
+        if ts:
+            return ts
+    return None
+
+
+def _parse_token_usage(data: dict) -> tuple[int, int]:
+    """
+    Extract (prompt_tokens, completion_tokens) from a chunk of JSON.
+    Handles multiple schema variants seen across VS Code versions.
+    """
+    # Schema variant A: result.metadata.tokenUsage
+    result = data.get("result") or {}
+    if isinstance(result, dict):
+        meta = result.get("metadata") or {}
+        usage = meta.get("tokenUsage") or meta.get("usage") or {}
+        if usage:
+            p = _safe_int(usage.get("promptTokens") or usage.get("input_tokens") or usage.get("prompt"))
+            c = _safe_int(usage.get("completionTokens") or usage.get("output_tokens") or usage.get("completion"))
+            if p or c:
+                return p, c
+
+    # Schema variant B: top-level tokenUsage
+    usage = data.get("tokenUsage") or data.get("usage") or {}
+    if usage:
+        p = _safe_int(usage.get("promptTokens") or usage.get("input_tokens") or usage.get("prompt"))
+        c = _safe_int(usage.get("completionTokens") or usage.get("output_tokens") or usage.get("completion"))
+        if p or c:
+            return p, c
+
+    # Schema variant C: result.usage (newer copilot-chat builds)
+    usage = (result.get("usage") or {}) if isinstance(result, dict) else {}
+    if usage:
+        p = _safe_int(usage.get("prompt_tokens") or usage.get("promptTokens"))
+        c = _safe_int(usage.get("completion_tokens") or usage.get("completionTokens"))
+        if p or c:
+            return p, c
+
+    return 0, 0
+
+
+def _extract_model(data: dict) -> str:
+    for key in ("model", "modelId", "agentId"):
+        val = data.get(key)
+        if val and isinstance(val, str):
+            return val
+    result = data.get("result") or {}
+    if isinstance(result, dict):
+        for key in ("model", "modelId"):
+            val = result.get(key)
+            if val:
+                return val
+    return ""
+
+
+def parse_session_file(file_path: Path) -> Optional[SessionStats]:
+    """
+    Parse a VS Code Copilot chat session JSON file.
+    Returns None if the file doesn't look like a session file.
+    """
+    try:
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception:
+        return None
+
+    # A session file must have a "requests" array
+    requests = None
+
+    # Format A: top-level requests array
+    if isinstance(data, dict) and "requests" in data:
+        requests = data.get("requests", [])
+        session_id = data.get("sessionId") or data.get("id") or file_path.stem
+
+    # Format B: data is a list of sessions (some global storage layouts)
+    elif isinstance(data, list):
+        session_id = file_path.stem
+        requests = []
+        for item in data:
+            if isinstance(item, dict) and "requests" in item:
+                requests.extend(item.get("requests", []))
+
+    else:
+        return None
+
+    if not isinstance(requests, list):
+        return None
+
+    ws_label = get_workspace_label(file_path)
+    session_model = _extract_model(data) if isinstance(data, dict) else ""
+
+    stats = SessionStats(
+        session_id=str(session_id),
+        source_file=str(file_path),
+        workspace=ws_label,
+        model=session_model,
+        created_at=data.get("creationDate") if isinstance(data, dict) else None,
+    )
+
+    for i, req in enumerate(requests):
+        if not isinstance(req, dict):
+            continue
+        p, c = _parse_token_usage(req)
+        model = _extract_model(req) or session_model
+        ts = _extract_timestamp(req)
+
+        turn = TurnStats(
+            turn_index=i,
+            prompt_tokens=p,
+            completion_tokens=c,
+            total_tokens=p + c,
+            model=model,
+            timestamp=ts,
+        )
+        stats.turns.append(turn)
+
+    # Only return sessions that have at least one turn (even with 0 tokens)
+    if not stats.turns:
+        return None
+
+    # Infer session model from most common turn model
+    if not stats.model and stats.turns:
+        models = [t.model for t in stats.turns if t.model]
+        if models:
+            stats.model = max(set(models), key=models.count)
+
+    return stats
+
+
+# ──────────────────────────────────────────────────────────────
+# Date filtering
+# ──────────────────────────────────────────────────────────────
+
+def _parse_dt(ts: str) -> Optional[datetime]:
+    """Try to parse an ISO timestamp into a timezone-aware datetime."""
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            dt = datetime.strptime(ts[:26], fmt[:len(ts[:26])])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+
+def _session_date(session: SessionStats) -> Optional[datetime]:
+    # Try session creation date first, then first turn timestamp, then file mtime
+    dt = _parse_dt(session.created_at or "")
+    if dt:
+        return dt
+    for turn in session.turns:
+        dt = _parse_dt(turn.timestamp or "")
+        if dt:
+            return dt
+    try:
+        mtime = os.path.getmtime(session.source_file)
+        return datetime.fromtimestamp(mtime, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def filter_by_days(sessions: list[SessionStats], days: int) -> list[SessionStats]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    result = []
+    for s in sessions:
+        dt = _session_date(s)
+        if dt is None or dt >= cutoff:
+            result.append(s)
+    return result
+
+
+# ──────────────────────────────────────────────────────────────
+# Aggregation
+# ──────────────────────────────────────────────────────────────
+
+def aggregate(sessions: list[SessionStats]) -> Summary:
+    summary = Summary()
+    summary.sessions = sessions
+    summary.total_sessions = len(sessions)
+
+    for s in sessions:
+        summary.total_turns += s.turn_count
+        summary.total_prompt_tokens += s.prompt_tokens
+        summary.total_completion_tokens += s.completion_tokens
+        summary.total_tokens += s.total_tokens
+
+        # by model
+        model = s.model or "unknown"
+        if model not in summary.by_model:
+            summary.by_model[model] = {"sessions": 0, "turns": 0, "tokens": 0,
+                                       "prompt_tokens": 0, "completion_tokens": 0}
+        summary.by_model[model]["sessions"] += 1
+        summary.by_model[model]["turns"] += s.turn_count
+        summary.by_model[model]["tokens"] += s.total_tokens
+        summary.by_model[model]["prompt_tokens"] += s.prompt_tokens
+        summary.by_model[model]["completion_tokens"] += s.completion_tokens
+
+        # by date (using session date)
+        dt = _session_date(s)
+        date_key = dt.strftime("%Y-%m-%d") if dt else "unknown"
+        if date_key not in summary.by_date:
+            summary.by_date[date_key] = {"sessions": 0, "turns": 0, "tokens": 0}
+        summary.by_date[date_key]["sessions"] += 1
+        summary.by_date[date_key]["turns"] += s.turn_count
+        summary.by_date[date_key]["tokens"] += s.total_tokens
+
+    return summary
+
+
+# ──────────────────────────────────────────────────────────────
+# Output
+# ──────────────────────────────────────────────────────────────
+
+def fmt_num(n: int) -> str:
+    return f"{n:,}"
+
+
+def print_summary(summary: Summary, verbose: bool = False):
+    sep = "─" * 60
+    print(f"\n{'═' * 60}")
+    print("  VS Code Copilot — Token Consumption Report")
+    print(f"{'═' * 60}")
+    print(f"  Sessions analysed : {fmt_num(summary.total_sessions)}")
+    print(f"  Total turns       : {fmt_num(summary.total_turns)}")
+    print(f"  Prompt tokens     : {fmt_num(summary.total_prompt_tokens)}")
+    print(f"  Completion tokens : {fmt_num(summary.total_completion_tokens)}")
+    print(f"  TOTAL tokens      : {fmt_num(summary.total_tokens)}")
+
+    if summary.by_model:
+        print(f"\n{sep}")
+        print("  By Model")
+        print(sep)
+        for model, stats in sorted(summary.by_model.items(),
+                                   key=lambda x: x[1]["tokens"], reverse=True):
+            print(f"  {model}")
+            print(f"    sessions={fmt_num(stats['sessions'])}  "
+                  f"turns={fmt_num(stats['turns'])}  "
+                  f"prompt={fmt_num(stats['prompt_tokens'])}  "
+                  f"completion={fmt_num(stats['completion_tokens'])}  "
+                  f"total={fmt_num(stats['tokens'])}")
+
+    if summary.by_date:
+        print(f"\n{sep}")
+        print("  By Date (most recent first)")
+        print(sep)
+        for date in sorted(summary.by_date.keys(), reverse=True)[:30]:
+            ds = summary.by_date[date]
+            print(f"  {date}  sessions={fmt_num(ds['sessions'])}  "
+                  f"turns={fmt_num(ds['turns'])}  tokens={fmt_num(ds['tokens'])}")
+
+    if verbose and summary.sessions:
+        print(f"\n{sep}")
+        print("  Session Detail")
+        print(sep)
+        for s in sorted(summary.sessions,
+                        key=lambda x: _session_date(x) or datetime.min.replace(tzinfo=timezone.utc),
+                        reverse=True):
+            ws = f" [{s.workspace}]" if s.workspace else ""
+            dt = _session_date(s)
+            date_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "?"
+            print(f"\n  {date_str}{ws}  model={s.model or '?'}  "
+                  f"turns={s.turn_count}  "
+                  f"prompt={fmt_num(s.prompt_tokens)}  "
+                  f"completion={fmt_num(s.completion_tokens)}  "
+                  f"total={fmt_num(s.total_tokens)}")
+            print(f"    {s.source_file}")
+
+    print(f"\n{'═' * 60}\n")
+
+
+def export_csv(sessions: list[SessionStats], output_path: str):
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "session_id", "workspace", "model",
+                         "turns", "prompt_tokens", "completion_tokens", "total_tokens",
+                         "source_file"])
+        for s in sorted(sessions,
+                        key=lambda x: _session_date(x) or datetime.min.replace(tzinfo=timezone.utc),
+                        reverse=True):
+            dt = _session_date(s)
+            writer.writerow([
+                dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "",
+                s.session_id,
+                s.workspace,
+                s.model,
+                s.turn_count,
+                s.prompt_tokens,
+                s.completion_tokens,
+                s.total_tokens,
+                s.source_file,
+            ])
+    print(f"✓ Exported {len(sessions)} sessions to {output_path}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch VS Code Copilot token consumption from local session logs."
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="Output machine-readable JSON instead of pretty print")
+    parser.add_argument("--days", type=int, default=0,
+                        help="Limit to sessions from the last N days (0 = all time)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show per-session detail")
+    parser.add_argument("--path", type=str, default="",
+                        help="Custom VS Code user data directory (skips auto-discovery)")
+    parser.add_argument("--export", type=str, default="",
+                        help="Export sessions to a CSV file")
+    args = parser.parse_args()
+
+    # Discover VS Code user paths
+    if args.path:
+        user_paths = [Path(args.path)]
+    else:
+        user_paths = get_vscode_user_paths()
+
+    if not user_paths:
+        print("❌ No VS Code user data directories found on this machine.", file=sys.stderr)
+        print("   Try: python copilot_token_usage.py --path /path/to/VSCode/User", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.json:
+        print(f"🔍 Searching {len(user_paths)} VS Code installation(s)…")
+        for p in user_paths:
+            print(f"   {p}")
+
+    # Find session files
+    session_files = find_session_files(user_paths)
+
+    if not args.json:
+        print(f"📂 Found {len(session_files)} candidate session file(s)")
+
+    # Parse sessions
+    sessions = []
+    parse_errors = 0
+    for file_path, label in session_files:
+        s = parse_session_file(file_path)
+        if s:
+            sessions.append(s)
+        else:
+            parse_errors += 1
+
+    if not args.json:
+        print(f"✅ Parsed {len(sessions)} session(s) "
+              f"({parse_errors} file(s) skipped — not session files)")
+
+    # Date filter
+    if args.days > 0:
+        before = len(sessions)
+        sessions = filter_by_days(sessions, args.days)
+        if not args.json:
+            print(f"📅 Filtered to last {args.days} day(s): {len(sessions)} of {before} sessions")
+
+    if not sessions:
+        print("\n⚠️  No Copilot chat session data found.\n")
+        print("Tips:")
+        print("  • Have you used Copilot Chat in VS Code? Open a chat and send a message.")
+        print("  • Check that your VS Code user path is correct with --path.")
+        print("  • Token counts only appear in the JSON when VS Code records them.")
+        return
+
+    # Aggregate
+    summary = aggregate(sessions)
+
+    # Output
+    if args.json:
+        out = {
+            "total_sessions": summary.total_sessions,
+            "total_turns": summary.total_turns,
+            "total_prompt_tokens": summary.total_prompt_tokens,
+            "total_completion_tokens": summary.total_completion_tokens,
+            "total_tokens": summary.total_tokens,
+            "by_model": summary.by_model,
+            "by_date": dict(sorted(summary.by_date.items(), reverse=True)),
+            "sessions": [
+                {
+                    "session_id": s.session_id,
+                    "workspace": s.workspace,
+                    "model": s.model,
+                    "turns": s.turn_count,
+                    "prompt_tokens": s.prompt_tokens,
+                    "completion_tokens": s.completion_tokens,
+                    "total_tokens": s.total_tokens,
+                    "source_file": s.source_file,
+                }
+                for s in sorted(sessions,
+                                key=lambda x: _session_date(x) or datetime.min.replace(tzinfo=timezone.utc),
+                                reverse=True)
+            ],
+        }
+        print(json.dumps(out, indent=2))
+    else:
+        print_summary(summary, verbose=args.verbose)
+
+    if args.export:
+        export_csv(sessions, args.export)
+
+
+if __name__ == "__main__":
+    main()
