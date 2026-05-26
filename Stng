@@ -1,0 +1,68 @@
+{
+  "github.copilot.chat.otel.enabled": true,
+  "github.copilot.chat.otel.exporterType": "file",
+  "github.copilot.chat.otel.outfile": "C:/temp/copilot-otel.jsonl",
+  "github.copilot.chat.otel.captureContent": true
+
+
+
+
+}import json
+import time
+from pathlib import Path
+
+OTEL_FILE = Path("C:/temp/copilot-otel.jsonl")
+
+seen = set()
+
+print("Monitoring Copilot telemetry...\n")
+
+while True:
+
+    if OTEL_FILE.exists():
+
+        with open(OTEL_FILE, "r", encoding="utf-8") as f:
+
+            for line in f:
+
+                if line in seen:
+                    continue
+
+                seen.add(line)
+
+                try:
+                    data = json.loads(line)
+
+                    attrs = (
+                        data.get("attributes", {})
+                        if isinstance(data, dict)
+                        else {}
+                    )
+
+                    input_tokens = attrs.get(
+                        "gen_ai.usage.input_tokens"
+                    )
+
+                    output_tokens = attrs.get(
+                        "gen_ai.usage.output_tokens"
+                    )
+
+                    model = attrs.get(
+                        "gen_ai.request.model"
+                    )
+
+                    if input_tokens or output_tokens:
+
+                        print("=" * 60)
+                        print(f"Model: {model}")
+                        print(f"Input Tokens: {input_tokens}")
+                        print(f"Output Tokens: {output_tokens}")
+                        print(
+                            f"Total Tokens: "
+                            f"{(input_tokens or 0) + (output_tokens or 0)}"
+                        )
+
+                except Exception:
+                    pass
+
+    time.sleep(2)
