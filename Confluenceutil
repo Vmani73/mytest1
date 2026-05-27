@@ -1,0 +1,61 @@
+Here is a highly detailed, ready-to-use prompt you can copy and paste directly into Copilot (Agent mode) to implement your Confluence MCP VS Code extension.
+
+Prompt:
+You are an expert full-stack VS Code extension developer specializing in MCP (Model Context Protocol) servers.
+Project Goal: Create a complete, production-ready VS Code extension called “Org Confluence Knowledge Base” that bundles a local MCP server. The purpose is to allow GitHub Copilot Agent mode (and other MCP clients) to automatically search our organization’s Confluence wiki first before answering technical, architectural, process, or project-related questions. It should return relevant pages, summaries, point-of-contacts (POCs), and links.
+Requirements:
+	1	Extension Structure
+	◦	Use TypeScript + modern VS Code extension template (with src/extension.ts).
+	◦	Bundle the MCP server inside the VSIX (use stdio transport).
+	◦	Support both development and packaged mode.
+	◦	Include proper package.json with activation events, contributes, and files to be packaged.
+	2	Authentication
+	◦	Support Atlassian Cloud (most common) using Basic Auth (email + API token).
+	◦	Store credentials securely using vscode.SecretStorage.
+	◦	Provide a command confluence-mcp.setupCredentials to set email and token.
+	◦	Allow configuration of Confluence base URL (e.g., https://yourcompany.atlassian.net) and default spaces via settings.
+	3	MCP Server Implementation
+	◦	Use @modelcontextprotocol/sdk for the server.
+	◦	Register the server via vscode.McpStdioServerDefinition in extension.ts.
+	◦	The server should be in src/mcp/ folder and bundled to dist/server.js.
+	4	Core Tools (with excellent descriptions for LLM usage):
+	◦	searchConfluence(query: string, limit: number = 5, spaces?: string[]) Search using natural language or CQL. Prioritize recent and relevant pages. Return title, URL, summary, last updated, author.
+	◦	getConfluencePage(pageIdOrUrl: string) Fetch full page content and convert to clean Markdown. Include metadata.
+	◦	getPageSummary(pageIdOrUrl: string) Return concise executive summary + key sections + POCs.
+	◦	findPointOfContact(topic: string) Search for pages with “Owner”, “POC”, “Responsible”, or similar labels and return people.
+	◦	listRelevantSpaces() Return list of spaces the user has access to, with focus on project-related ones.
+	◦	getRecentUpdates(days: number = 7) Show recently updated pages in default spaces.
+	5	Smart Behavior
+	◦	Auto-detect current workspace/project name and bias search toward related Confluence spaces.
+	◦	Tool descriptions must strongly encourage the LLM to call these tools first for any question related to company processes, architecture, services, onboarding, troubleshooting, or best practices.
+	◦	Implement basic caching (using VS Code globalState) for frequent searches.
+	6	Security & UX
+	◦	All tools are read-only by default.
+	◦	Add clear error handling and user-friendly messages.
+	◦	Include status bar item showing “Confluence MCP: Connected”.
+	◦	Add commands: Setup Credentials, Refresh Connection, Search Confluence (manual).
+	7	Bundling & Packaging
+	◦	Use esbuild or webpack to bundle the MCP server into a single file.
+	◦	Make sure all necessary files are included in the VSIX.
+	◦	Provide package script in package.json.
+Deliverables I want:
+	•	Complete folder structure
+	•	Full code for package.json
+	•	Full code for src/extension.ts
+	•	Full code for the MCP server and tools
+	•	Confluence API client wrapper
+	•	README with setup instructions
+	•	Any necessary configuration files
+Start by showing the complete project structure, then implement file by file. Ask me for my Confluence base URL or any specific spaces if needed, but keep it configurable.
+Make the tool descriptions as effective as possible so Copilot prefers this MCP over generic knowledge.
+
+How to use this prompt:
+	1	Open your new extension project in VS Code.
+	2	Make sure your Confluence MCP extension is installed and active.
+	3	Paste the entire prompt above into Copilot Chat in Agent mode.
+	4	Follow up with specific details (e.g., your Confluence URL, preferred spaces, etc.).
+Would you like me to also give you:
+	•	A shorter version of this prompt?
+	•	A version optimized for Python MCP instead of TypeScript?
+	•	Additional tool ideas (like “compare page with current code”)?
+Just say the word and I’ll refine it further.
