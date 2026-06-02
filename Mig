@@ -1,0 +1,40 @@
+                           ┌─────────────────────┐
+                           │ Migration Objective │
+                           └──────────┬──────────┘
+                                      │
+                                      ▼
+                    ┌──────────────────────────────┐
+                    │ Migration Orchestrator Agent │
+                    └───────┬─────────┬────────────┘
+                            │         │
+             ┌──────────────┘         └──────────────┐
+             ▼                                       ▼
+ ┌─────────────────────┐              ┌─────────────────────┐
+ │ Planner Agent       │              │ Implementer Agent   │
+ │ Discovery           │              │ Code Changes        │
+ │ Boundary Analysis   │              │ Feature Flags       │
+ │ Dependency Mapping  │              │ Testing             │
+ └──────────┬──────────┘              └──────────┬──────────┘
+            │                                    │
+            └──────────────┬─────────────────────┘
+                           ▼
+                ┌─────────────────────┐
+                │ Auditor Agent       │
+                │ Validation          │
+                │ Risk Analysis       │
+                │ Readiness Check     │
+                └──────────┬──────────┘
+                           ▼
+                ┌─────────────────────┐
+                │ Human Approval Gate │
+                └──────────┬──────────┘
+                           ▼
+                     Production Cutover
+
+
+ Shared Across All Agents
+ ─────────────────────────────────────────
+ 📚 Evidence Store
+ 🗂 Migration State
+ ⚠️ Risk Register
+ 👤 Approval Records
