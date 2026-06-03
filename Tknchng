@@ -1,0 +1,1719 @@
+# COPILOT PROMPT — Build CodeGraph as a VS Code VSIX Extension
+
+## MISSION
+
+Build a production-ready VS Code extension (`.vsix`) called **CodeGraph** that replicates every capability of `colbymchenry/codegraph` — but instead of an MCP server, it exposes all intelligence directly inside VS Code via commands, a sidebar panel, CodeLens, hover providers, and an inline chat participant. Zero MCP. Zero external servers. Zero pre-requisites. 100% local SQLite graph (sql.js WASM — no native binaries), tree-sitter ASTs (web-tree-sitter WASM), native VS Code file watching. The VSIX must install and run on Windows, macOS, and Linux with a single double-click — no Node.js, no npm, no compiler toolchain required on the end user's machine.
+
+---
+
+## EXACT WORKING LOGIC OF THE ORIGINAL (study this before writing a single line)
+
+### Phase 1 — Indexing (`codegraph index`)
+
+1. `ExtractionOrchestrator` scans the workspace recursively, obeying `.gitignore` and a configurable `exclude` glob list. It skips: `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and binary files.
+2. For each source file it computes a SHA-256 content hash and compares against the stored hash in SQLite. Files whose hash is unchanged are skipped (incremental indexing).
+3. Changed / new files are parsed with **web-tree-sitter** (WASM build, `--liftoff-only` flag on Node ≥ 22 to avoid OOM). Each language has its own grammar WASM file and a set of **Tree-sitter queries** (`.scm` files) that extract:
+   - **Nodes** — `NodeKind` enum: `file | module | class | struct | interface | trait | protocol | function | method | property | field | variable | constant | enum | enum_member | type_alias | namespace | parameter | import | export | route | component`
+   - **Edges** — `EdgeKind` enum: `contains | calls | imports | exports | extends | implements | references | type_of | returns | instantiates | overrides | decorates`
+4. For every source file a `file` node is created first. All symbols inside are linked to it via `contains` edges, forming the containment hierarchy.
+5. Call sites, import statements, extends/implements clauses are recorded as provisional edges with raw name strings (not yet resolved to node IDs).
+
+### Phase 2 — Resolution (`ReferenceResolver`)
+
+1. After all files are extracted, resolution runs in a second pass.
+2. For each provisional edge, the resolver does a name-lookup against the node table: exact match first, then fuzzy match by stripping module path prefixes.
+3. Import edges are resolved by mapping the import path string to the `file` node at that path (relative and absolute, `tsconfig`/`jsconfig` path aliases resolved when a config is present).
+4. Class inheritance (`extends`/`implements`) is resolved across files.
+5. Framework-specific synthesis: React `setState` → `render`, Java `Interface` → `Impl`, dynamic dispatch patterns are inferred and added as synthetic edges.
+6. Unresolvable references are stored as dangling edges with `resolved: false` flag — they're never deleted, they just don't participate in traversal.
+
+### Phase 3 — Storage (SQLite, `node:sqlite`, FTS5)
+
+Schema — all in `.codegraph/codegraph.db`:
+
+```sql
+CREATE TABLE files (
+  id       TEXT PRIMARY KEY,  -- SHA-256 of absolute path
+  path     TEXT UNIQUE NOT NULL,
+  rel_path TEXT NOT NULL,
+  lang     TEXT NOT NULL,
+  hash     TEXT NOT NULL,     -- SHA-256 of file content
+  size     INTEGER,
+  indexed_at INTEGER
+);
+
+CREATE TABLE nodes (
+  id        TEXT PRIMARY KEY,  -- deterministic: sha256(file_id + kind + name + start_line)
+  file_id   TEXT NOT NULL REFERENCES files(id),
+  kind      TEXT NOT NULL,     -- NodeKind
+  name      TEXT NOT NULL,
+  fqn       TEXT,              -- fully-qualified name
+  start_line INTEGER,
+  end_line   INTEGER,
+  start_col  INTEGER,
+  end_col    INTEGER,
+  signature  TEXT,
+  docstring  TEXT,
+  source     TEXT,             -- raw source slice when trackCallSites=true
+  FOREIGN KEY(file_id) REFERENCES files(id)
+);
+
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+  name, fqn, docstring, content='nodes', content_rowid='rowid'
+);
+
+CREATE TABLE edges (
+  id        TEXT PRIMARY KEY,
+  from_id   TEXT NOT NULL,
+  to_id     TEXT,              -- NULL when unresolved
+  to_name   TEXT,              -- raw name for unresolved
+  kind      TEXT NOT NULL,     -- EdgeKind
+  resolved  INTEGER DEFAULT 1,
+  call_site_line INTEGER,
+  FOREIGN KEY(from_id) REFERENCES nodes(id)
+);
+
+CREATE TABLE meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+```
+
+Indexes: `nodes(file_id)`, `nodes(kind)`, `nodes(name)`, `edges(from_id)`, `edges(to_id)`, `edges(kind)`.
+
+WAL mode enabled. All writes go through a single `DatabaseConnection` singleton with a `FileLock` (`.codegraph/codegraph.lock`) to prevent concurrent corruption.
+
+### Phase 4 — Auto-Sync (File Watcher)
+
+The MCP server registers a native OS file watcher:
+- **macOS**: FSEvents
+- **Linux**: inotify
+- **Windows**: ReadDirectoryChangesW
+
+Events are debounced with a **2-second quiet window**. On trigger:
+1. Re-hash changed files.
+2. Run extraction only on changed files.
+3. Delete all old nodes/edges for those files from the DB.
+4. Insert fresh nodes/edges.
+5. Re-run resolution for the affected file's edges only.
+
+Multi-agent scenario: a single background **daemon** process owns the SQLite connection and file watcher. Clients connect via a local Unix socket (Windows: named pipe). Daemon idles for 5 minutes after last client disconnects, then exits.
+
+### Phase 5 — Query / Retrieval
+
+**`codegraph_search(query, kind?, limit?)`**
+- Hits `nodes_fts` with FTS5 BM25 ranking.
+- Optional `kind` filter added as `WHERE kind = ?`.
+- Returns: `{ id, name, fqn, kind, file, start_line, end_line, signature, docstring }[]`
+
+**`codegraph_node(id, includeSource?)`**
+- `SELECT * FROM nodes WHERE id = ?`
+- Optionally reads the raw source slice from disk (or from `nodes.source` if stored).
+
+**`codegraph_callers(nodeId, depth?)`**
+- BFS/DFS up `edges WHERE to_id = ? AND kind = 'calls'`.
+- Depth defaults to 3.
+
+**`codegraph_callees(nodeId, depth?)`**
+- BFS/DFS down `edges WHERE from_id = ? AND kind = 'calls'`.
+
+**`codegraph_impact(nodeId, depth?)`**
+- Union of callers + any node referencing this node via any EdgeKind.
+- Returns the full "blast radius" — every node that would need attention if this symbol changed.
+
+**`codegraph_context(task, maxNodes?, format?)`** — `ContextBuilder`
+1. Tokenize `task` into search terms.
+2. FTS5 search for each term → collect candidate nodes.
+3. For top-N candidates, expand with callers/callees (depth 1).
+4. Score nodes by term frequency × graph centrality (in-degree + out-degree).
+5. De-duplicate, sort by score, truncate to `maxNodes` (default 20).
+6. Build output: for each node, include signature + docstring + optionally source.
+7. Return as Markdown or JSON.
+
+**`codegraph_explore(question, budget?)`** — the main tool used by AI agents
+- Wraps `codegraph_context` but also includes entry-point detection: nodes with 0 in-degree callers that match the query are flagged as entry points.
+- Budget (max nodes returned) scales with indexed file count: `budget = clamp(fileCount / 10, 10, 60)`.
+- Returns full source sections, not just signatures.
+
+**`codegraph_files(maxDepth?, filter?)`**
+- Hierarchical file tree from the `files` table, filtered by glob.
+
+**`codegraph_status()`**
+- `SELECT COUNT(*) FROM files`, `nodes`, `edges`, last indexed timestamp from `meta`.
+
+**`codegraph_affected(changedFiles[])`**
+- Transitive import traversal: for each changed file, find all files that import it (directly or transitively), up to depth 5.
+- Filter results to test files by auto-detecting test file patterns (`*.test.*`, `*.spec.*`, `__tests__/**`).
+
+---
+
+## WHAT TO BUILD — VS CODE EXTENSION (VSIX)
+
+Replace the MCP server surface with native VS Code APIs. Every query capability above must be reachable from inside VS Code with zero external process.
+
+### Extension ID and manifest
+
+```
+name: codegraph
+displayName: CodeGraph
+publisher: your-publisher-id
+version: 0.1.0
+engines: { vscode: "^1.90.0" }
+categories: ["Other", "Programming Languages"]
+activationEvents: ["workspaceContains:.codegraph/"]
+main: ./dist/extension.js
+```
+
+### File layout (build with esbuild, output to `dist/`)
+
+```
+codegraph-vsix/
+  package.json
+  tsconfig.json
+  esbuild.config.mjs
+  src/
+    extension.ts              # activate() / deactivate()
+    types.ts                  # NodeKind, EdgeKind, GraphNode, GraphEdge, GraphFile enums/types
+    db/
+      connection.ts           # DatabaseConnection — wraps node:sqlite (VS Code ships Node 20+, use better-sqlite3 as fallback)
+      schema.ts               # CREATE TABLE statements, migration runner
+      queries.ts              # All prepared statement helpers
+    extraction/
+      orchestrator.ts         # ExtractionOrchestrator — scans workspace, dispatches per-language
+      languages/
+        typescript.ts         # tree-sitter queries for TS/JS/TSX/JSX
+        python.ts
+        go.ts
+        rust.ts
+        java.ts
+        csharp.ts
+        cpp.ts
+        swift.ts
+        kotlin.ts
+        php.ts
+        ruby.ts
+        dart.ts
+      base-extractor.ts       # Abstract class: parseFile(content, lang) → { nodes, edges }
+    resolution/
+      resolver.ts             # ReferenceResolver — two-pass, resolves provisional edges
+    sync/
+      watcher.ts              # VS Code FileSystemWatcher + debounce logic
+      incremental.ts          # Incremental re-index for changed files
+    graph/
+      search.ts               # FTS5 search → GraphNode[]
+      callers.ts              # BFS up call graph
+      callees.ts              # BFS down call graph
+      impact.ts               # Blast radius traversal
+      context.ts              # ContextBuilder — ranks nodes for a task description
+      explore.ts              # codegraph_explore logic + entry point detection
+      affected.ts             # Transitive import traversal for affected test files
+    ui/
+      sidebar-provider.ts     # TreeDataProvider — Symbols, Files, Graph Stats panels
+      webview-panel.ts        # Graph visualization panel (D3 force graph)
+      codelens-provider.ts    # CodeLens: "N callers | N callees" above each function
+      hover-provider.ts       # Hover: show callers/callees/docstring inline
+      status-bar.ts           # "CodeGraph: 1,204 edges" status bar item
+    commands/
+      index.ts                # codegraph.index command
+      search.ts               # codegraph.search quick pick
+      showCallers.ts          # codegraph.showCallers
+      showCallees.ts          # codegraph.showCallees
+      showImpact.ts           # codegraph.showImpact
+      showContext.ts          # codegraph.showContext
+      explore.ts              # codegraph.explore (opens result in new editor tab)
+      affected.ts             # codegraph.affected
+      init.ts                 # codegraph.init — creates .codegraph/ directory + initial index
+    chat/
+      participant.ts          # VS Code Chat API participant: @codegraph
+  grammars/                   # WASM grammar files for each language (copied from node_modules)
+  resources/
+    icons/                    # SVG icons for sidebar nodes by NodeKind
+```
+
+---
+
+## COMPLETE IMPLEMENTATION SPECIFICATIONS
+
+### `src/extension.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import { DatabaseConnection } from './db/connection'
+import { ExtractionOrchestrator } from './extraction/orchestrator'
+import { ReferenceResolver } from './resolution/resolver'
+import { WorkspaceWatcher } from './sync/watcher'
+import { SidebarProvider } from './ui/sidebar-provider'
+import { CodeLensProvider } from './ui/codelens-provider'
+import { HoverProvider } from './ui/hover-provider'
+import { StatusBar } from './ui/status-bar'
+import { registerCommands } from './commands/index'
+import { registerChatParticipant } from './chat/participant'
+import * as path from 'path'
+
+export let db: DatabaseConnection | null = null
+export let orchestrator: ExtractionOrchestrator | null = null
+export let watcher: WorkspaceWatcher | null = null
+
+export async function activate(context: vscode.ExtensionContext) {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (!workspaceRoot) return
+
+  const dbPath = path.join(workspaceRoot, '.codegraph', 'codegraph.db')
+  const grammarDir = context.asAbsolutePath('grammars')
+
+  db = new DatabaseConnection(dbPath)
+  await db.initialize()  // runs schema migration
+
+  orchestrator = new ExtractionOrchestrator(db, grammarDir, workspaceRoot)
+  watcher = new WorkspaceWatcher(workspaceRoot, db, orchestrator)
+  watcher.start()
+
+  // UI
+  const sidebar = new SidebarProvider(context.extensionUri, db)
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('codegraph.symbols', sidebar),
+    vscode.window.registerTreeDataProvider('codegraph.files', sidebar),
+    vscode.languages.registerCodeLensProvider({ scheme: 'file' }, new CodeLensProvider(db)),
+    vscode.languages.registerHoverProvider({ scheme: 'file' }, new HoverProvider(db)),
+    new StatusBar(db, context)
+  )
+
+  registerCommands(context, db, orchestrator)
+  registerChatParticipant(context, db)
+
+  // Auto-trigger index if .codegraph/codegraph.db is fresh/empty
+  const stats = db.getStats()
+  if (stats.fileCount === 0) {
+    vscode.window.showInformationMessage(
+      'CodeGraph: No index found. Run "CodeGraph: Index Workspace" to build the knowledge graph.',
+      'Index Now'
+    ).then(action => {
+      if (action === 'Index Now') vscode.commands.executeCommand('codegraph.index')
+    })
+  }
+}
+
+export function deactivate() {
+  watcher?.stop()
+  db?.close()
+}
+```
+
+### `src/types.ts`
+
+Define every type with zero any/unknown:
+
+```typescript
+export const NodeKind = {
+  File: 'file', Module: 'module', Class: 'class', Struct: 'struct',
+  Interface: 'interface', Trait: 'trait', Protocol: 'protocol',
+  Function: 'function', Method: 'method', Property: 'property',
+  Field: 'field', Variable: 'variable', Constant: 'constant',
+  Enum: 'enum', EnumMember: 'enum_member', TypeAlias: 'type_alias',
+  Namespace: 'namespace', Parameter: 'parameter', Import: 'import',
+  Export: 'export', Route: 'route', Component: 'component'
+} as const
+export type NodeKind = typeof NodeKind[keyof typeof NodeKind]
+
+export const EdgeKind = {
+  Contains: 'contains', Calls: 'calls', Imports: 'imports', Exports: 'exports',
+  Extends: 'extends', Implements: 'implements', References: 'references',
+  TypeOf: 'type_of', Returns: 'returns', Instantiates: 'instantiates',
+  Overrides: 'overrides', Decorates: 'decorates'
+} as const
+export type EdgeKind = typeof EdgeKind[keyof typeof EdgeKind]
+
+export interface GraphFile {
+  id: string
+  path: string
+  relPath: string
+  lang: string
+  hash: string
+  size: number
+  indexedAt: number
+}
+
+export interface GraphNode {
+  id: string
+  fileId: string
+  kind: NodeKind
+  name: string
+  fqn: string | null
+  startLine: number
+  endLine: number
+  startCol: number
+  endCol: number
+  signature: string | null
+  docstring: string | null
+  source: string | null
+}
+
+export interface GraphEdge {
+  id: string
+  fromId: string
+  toId: string | null
+  toName: string | null
+  kind: EdgeKind
+  resolved: boolean
+  callSiteLine: number | null
+}
+
+export interface IndexProgress {
+  phase: 'scanning' | 'extracting' | 'resolving' | 'done'
+  current: number
+  total: number
+  currentFile?: string
+}
+
+export interface SearchResult {
+  node: GraphNode
+  file: GraphFile
+  score: number
+}
+
+export interface ContextResult {
+  nodes: Array<GraphNode & { file: GraphFile; score: number }>
+  entryPoints: string[]
+  totalNodes: number
+}
+```
+
+### `src/db/connection.ts`
+
+## DATABASE LAYER — PLATFORM-INDEPENDENT: USE `sql.js` (WASM SQLite)
+
+Do NOT use `better-sqlite3`. It is a native Node addon with pre-compiled `.node` binaries tied to a specific Node ABI and OS/arch. A VSIX built on macOS will crash on Windows or Linux without recompilation.
+
+Use `sql.js` instead — it is a pure WASM build of SQLite that runs identically on Windows, macOS, and Linux with zero native binaries. The user installs the extension and it works immediately, no pre-requisites.
+
+Key differences from better-sqlite3:
+- All operations are synchronous (same API feel)
+- Database must be loaded into memory: `const db = new SQL.Database(existingBuffer)` or `new SQL.Database()` for new
+- To persist: call `db.export()` → returns Uint8Array → write to disk with `fs.writeFileSync(dbPath, Buffer.from(db.export()))`
+- Persist after every batch write (use a dirty-flag pattern: mark dirty on write, flush to disk at the end of each transaction)
+- FTS5 is fully supported in the sql.js WASM build
+- WAL mode: NOT supported in sql.js (it uses a single in-memory DB). Use a write-lock file instead to prevent concurrent access.
+
+sql.js initialization pattern:
+```typescript
+import initSqlJs from 'sql.js'
+import * as fs from 'fs'
+import * as path from 'path'
+
+const SQL = await initSqlJs({
+  locateFile: (file: string) => path.join(extensionContext.asAbsolutePath('wasm'), file)
+})
+
+const dbBuffer = fs.existsSync(dbPath) ? fs.readFileSync(dbPath) : null
+const db = dbBuffer ? new SQL.Database(dbBuffer) : new SQL.Database()
+```
+
+Persistence flush (call after every batch of writes):
+```typescript
+function flush() {
+  const data = db.export()
+  fs.writeFileSync(dbPath, Buffer.from(data))
+}
+```
+
+Use `db.run(sql)` for DDL/DML, `db.prepare(sql)` for prepared statements, `stmt.getAsObject()` to get rows.
+
+```typescript
+import Database from 'better-sqlite3'
+import * as fs from 'fs'
+import * as path from 'path'
+import { SCHEMA_SQL } from './schema'
+import type { GraphNode, GraphFile, GraphEdge, NodeKind } from '../types'
+
+export class DatabaseConnection {
+  private db: Database.Database
+  private stmts: Record<string, Database.Statement> = {}
+
+  constructor(private dbPath: string) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true })
+    this.db = new Database(dbPath)
+    this.db.pragma('journal_mode = WAL')
+    this.db.pragma('synchronous = NORMAL')
+    this.db.pragma('cache_size = -64000')  // 64MB
+    this.db.pragma('foreign_keys = ON')
+  }
+
+  async initialize() {
+    this.db.exec(SCHEMA_SQL)
+    this.prepareStatements()
+  }
+
+  // --- File operations ---
+  upsertFile(file: GraphFile): void { /* INSERT OR REPLACE */ }
+  getFileByPath(absPath: string): GraphFile | null { /* SELECT */ }
+  getFileHash(absPath: string): string | null { /* SELECT hash */ }
+  deleteFile(fileId: string): void {
+    // Cascades: delete nodes WHERE file_id = fileId
+    // Then delete edges WHERE from_id IN (deleted node ids)
+    // Use transaction
+  }
+  getAllFiles(): GraphFile[] { /* SELECT * FROM files */ }
+
+  // --- Node operations ---
+  insertNodes(nodes: GraphNode[]): void { /* batch INSERT via transaction */ }
+  searchNodes(query: string, kind?: NodeKind, limit = 20): GraphNode[] {
+    // SELECT n.*, snippet(nodes_fts, 0, '<b>', '</b>', '...', 10) as snippet
+    // FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid
+    // WHERE nodes_fts MATCH ? [AND n.kind = ?]
+    // ORDER BY rank LIMIT ?
+  }
+  getNode(id: string): GraphNode | null { /* SELECT */ }
+  getNodesByFile(fileId: string): GraphNode[] { /* SELECT */ }
+
+  // --- Edge operations ---
+  insertEdges(edges: GraphEdge[]): void { /* batch INSERT via transaction */ }
+  getCallers(nodeId: string, depth = 3): GraphNode[] {
+    // BFS: SELECT from_id FROM edges WHERE to_id = ? AND kind = 'calls'
+    // Expand up to `depth` levels, collect unique node IDs, return nodes
+  }
+  getCallees(nodeId: string, depth = 3): GraphNode[] {
+    // BFS: SELECT to_id FROM edges WHERE from_id = ? AND kind = 'calls' AND resolved = 1
+  }
+  getImpact(nodeId: string, depth = 2): GraphNode[] {
+    // BFS over ALL edge kinds where to_id = nodeId
+  }
+  getImporters(fileId: string, depth = 5): string[] {
+    // Transitive: find all files that import this file
+    // edges WHERE kind = 'imports' AND to_id = fileId → get from_id file nodes
+  }
+
+  // --- Stats ---
+  getStats(): { fileCount: number; nodeCount: number; edgeCount: number; lastIndexed: number | null } {
+    // COUNT queries + meta table
+  }
+
+  // --- Resolution helpers ---
+  resolveByName(name: string): GraphNode | null {
+    // SELECT * FROM nodes WHERE name = ? OR fqn = ? LIMIT 1
+  }
+  updateEdgeResolution(edgeId: string, toId: string): void {
+    // UPDATE edges SET to_id = ?, resolved = 1 WHERE id = ?
+  }
+
+  close(): void { this.db.close() }
+
+  transaction<T>(fn: () => T): T { return this.db.transaction(fn)() }
+
+  private prepareStatements(): void {
+    // Pre-compile all hot-path statements here
+  }
+}
+```
+
+### `src/db/schema.ts`
+
+```typescript
+export const SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    rel_path TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    fqn TEXT,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    start_col INTEGER NOT NULL DEFAULT 0,
+    end_col INTEGER NOT NULL DEFAULT 0,
+    signature TEXT,
+    docstring TEXT,
+    source TEXT,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
+  CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+  CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+  CREATE INDEX IF NOT EXISTS idx_nodes_fqn ON nodes(fqn);
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+    name,
+    fqn,
+    signature,
+    docstring,
+    content='nodes',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+  );
+
+  CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
+    INSERT INTO nodes_fts(rowid, name, fqn, signature, docstring)
+    VALUES (new.rowid, new.name, new.fqn, new.signature, new.docstring);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, signature, docstring)
+    VALUES ('delete', old.rowid, old.name, old.fqn, old.signature, old.docstring);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, fqn, signature, docstring)
+    VALUES ('delete', old.rowid, old.name, old.fqn, old.signature, old.docstring);
+    INSERT INTO nodes_fts(rowid, name, fqn, signature, docstring)
+    VALUES (new.rowid, new.name, new.fqn, new.signature, new.docstring);
+  END;
+
+  CREATE TABLE IF NOT EXISTS edges (
+    id TEXT PRIMARY KEY,
+    from_id TEXT NOT NULL,
+    to_id TEXT,
+    to_name TEXT,
+    kind TEXT NOT NULL,
+    resolved INTEGER NOT NULL DEFAULT 1,
+    call_site_line INTEGER,
+    FOREIGN KEY(from_id) REFERENCES nodes(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
+  CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
+  CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
+  CREATE INDEX IF NOT EXISTS idx_edges_to_kind ON edges(to_id, kind);
+`
+```
+
+### `src/extraction/orchestrator.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import * as fs from 'fs'
+import * as path from 'path'
+import * as crypto from 'crypto'
+import { minimatch } from 'minimatch'
+import type { DatabaseConnection } from '../db/connection'
+import type { GraphFile, GraphNode, GraphEdge, IndexProgress } from '../types'
+import { TypeScriptExtractor } from './languages/typescript'
+import { PythonExtractor } from './languages/python'
+import { GoExtractor } from './languages/go'
+import { RustExtractor } from './languages/rust'
+import { JavaExtractor } from './languages/java'
+// ... other extractors
+
+const DEFAULT_EXCLUDE = [
+  'node_modules/**', 'vendor/**', 'dist/**', 'build/**',
+  'target/**', '.venv/**', 'Pods/**', '.next/**', '.git/**',
+  '**/*.min.js', '**/*.min.css', '**/*.map', '**/*.d.ts'
+]
+
+const LANG_MAP: Record<string, string> = {
+  '.ts': 'typescript', '.tsx': 'typescript', '.js': 'javascript',
+  '.jsx': 'javascript', '.mjs': 'javascript', '.py': 'python',
+  '.go': 'go', '.rs': 'rust', '.java': 'java', '.cs': 'csharp',
+  '.cpp': 'cpp', '.cc': 'cpp', '.hpp': 'cpp', '.c': 'c', '.h': 'c',
+  '.swift': 'swift', '.kt': 'kotlin', '.kts': 'kotlin',
+  '.php': 'php', '.rb': 'ruby', '.dart': 'dart', '.svelte': 'svelte'
+}
+
+export class ExtractionOrchestrator {
+  private extractors: Map<string, BaseExtractor>
+
+  constructor(
+    private db: DatabaseConnection,
+    private grammarDir: string,
+    private workspaceRoot: string
+  ) {
+    this.extractors = new Map([
+      ['typescript', new TypeScriptExtractor(grammarDir)],
+      ['javascript', new TypeScriptExtractor(grammarDir)],
+      ['python', new PythonExtractor(grammarDir)],
+      ['go', new GoExtractor(grammarDir)],
+      ['rust', new RustExtractor(grammarDir)],
+      ['java', new JavaExtractor(grammarDir)],
+      // ... others
+    ])
+  }
+
+  async indexAll(
+    onProgress?: (p: IndexProgress) => void,
+    force = false
+  ): Promise<void> {
+    onProgress?.({ phase: 'scanning', current: 0, total: 0 })
+
+    const files = await this.collectSourceFiles()
+    const total = files.length
+
+    onProgress?.({ phase: 'extracting', current: 0, total })
+
+    const allProvisionalEdges: ProvisionalEdge[] = []
+
+    for (let i = 0; i < files.length; i++) {
+      const filePath = files[i]
+      onProgress?.({ phase: 'extracting', current: i + 1, total, currentFile: filePath })
+
+      try {
+        await this.indexFile(filePath, force, allProvisionalEdges)
+      } catch (err) {
+        console.error(`CodeGraph: failed to index ${filePath}`, err)
+      }
+    }
+
+    onProgress?.({ phase: 'resolving', current: 0, total: allProvisionalEdges.length })
+
+    const resolver = new ReferenceResolver(this.db, this.workspaceRoot)
+    resolver.resolve(allProvisionalEdges, (i) => {
+      onProgress?.({ phase: 'resolving', current: i, total: allProvisionalEdges.length })
+    })
+
+    this.db.setMeta('last_indexed', Date.now().toString())
+    onProgress?.({ phase: 'done', current: total, total })
+  }
+
+  async indexFile(
+    filePath: string,
+    force = false,
+    provisionalEdges?: ProvisionalEdge[]
+  ): Promise<void> {
+    const content = fs.readFileSync(filePath, 'utf8')
+    const hash = crypto.createHash('sha256').update(content).digest('hex')
+    const ext = path.extname(filePath).toLowerCase()
+    const lang = LANG_MAP[ext]
+    if (!lang) return
+
+    const extractor = this.extractors.get(lang)
+    if (!extractor) return
+
+    const existingHash = this.db.getFileHash(filePath)
+    if (!force && existingHash === hash) return  // unchanged
+
+    const fileId = crypto.createHash('sha256').update(filePath).digest('hex')
+    const relPath = path.relative(this.workspaceRoot, filePath)
+
+    const file: GraphFile = {
+      id: fileId,
+      path: filePath,
+      relPath,
+      lang,
+      hash,
+      size: Buffer.byteLength(content, 'utf8'),
+      indexedAt: Date.now()
+    }
+
+    // Remove old data for this file
+    this.db.deleteFile(fileId)
+
+    // Extract
+    const { nodes, edges } = await extractor.extract(file, content)
+
+    // Create file node first
+    const fileNode: GraphNode = {
+      id: fileId + ':file',
+      fileId,
+      kind: 'file',
+      name: path.basename(filePath),
+      fqn: relPath,
+      startLine: 1,
+      endLine: content.split('\n').length,
+      startCol: 0,
+      endCol: 0,
+      signature: null,
+      docstring: null,
+      source: null
+    }
+
+    this.db.transaction(() => {
+      this.db.upsertFile(file)
+      this.db.insertNodes([fileNode, ...nodes])
+      // Insert only resolved edges now; collect unresolved as provisional
+      const resolvedEdges = edges.filter(e => e.resolved)
+      const unresolved = edges.filter(e => !e.resolved)
+      this.db.insertEdges(resolvedEdges)
+      if (provisionalEdges) {
+        provisionalEdges.push(...unresolved.map(e => ({ ...e, fileId })))
+      }
+    })
+  }
+
+  private async collectSourceFiles(): Promise<string[]> {
+    const config = this.db.getMeta('config')
+    const cfg = config ? JSON.parse(config) : {}
+    const excludeGlobs: string[] = [...DEFAULT_EXCLUDE, ...(cfg.exclude ?? [])]
+
+    const results: string[] = []
+    const walk = (dir: string) => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        const relPath = path.relative(this.workspaceRoot, fullPath)
+        const excluded = excludeGlobs.some(g => minimatch(relPath, g, { dot: true }))
+        if (excluded) continue
+        if (entry.isDirectory()) { walk(fullPath); continue }
+        const ext = path.extname(entry.name).toLowerCase()
+        if (LANG_MAP[ext]) results.push(fullPath)
+      }
+    }
+    walk(this.workspaceRoot)
+    return results
+  }
+}
+```
+
+### `src/extraction/base-extractor.ts`
+
+```typescript
+import type { GraphFile, GraphNode, GraphEdge } from '../types'
+
+export interface ExtractResult {
+  nodes: GraphNode[]
+  edges: GraphEdge[]  // edges with resolved=false have toName set, toId null
+}
+
+export abstract class BaseExtractor {
+  protected parser: any  // tree-sitter Parser instance
+
+  constructor(protected grammarDir: string) {}
+
+  abstract init(): Promise<void>
+  abstract extract(file: GraphFile, content: string): Promise<ExtractResult>
+
+  protected nodeId(fileId: string, kind: string, name: string, startLine: number): string {
+    const crypto = require('crypto')
+    return crypto.createHash('sha256')
+      .update(`${fileId}:${kind}:${name}:${startLine}`)
+      .digest('hex')
+      .slice(0, 16)
+  }
+}
+```
+
+### `src/extraction/languages/typescript.ts`
+
+Implement TypeScript/JavaScript/TSX/JSX extractor. Use `web-tree-sitter` WASM.
+
+```typescript
+import Parser from 'web-tree-sitter'
+import * as path from 'path'
+import * as fs from 'fs'
+import { BaseExtractor, ExtractResult } from '../base-extractor'
+import type { GraphFile, GraphNode, GraphEdge } from '../../types'
+
+export class TypeScriptExtractor extends BaseExtractor {
+  private initialized = false
+
+  async init() {
+    if (this.initialized) return
+    await Parser.init({ locateFile: () => path.join(this.grammarDir, 'tree-sitter.wasm') })
+    const lang = await Parser.Language.load(path.join(this.grammarDir, 'tree-sitter-typescript.wasm'))
+    this.parser = new Parser()
+    this.parser.setLanguage(lang)
+    this.initialized = true
+  }
+
+  async extract(file: GraphFile, content: string): Promise<ExtractResult> {
+    await this.init()
+    const tree = this.parser.parse(content)
+    const nodes: GraphNode[] = []
+    const edges: GraphEdge[] = []
+
+    this.walk(tree.rootNode, file, content, nodes, edges, null)
+
+    return { nodes, edges }
+  }
+
+  private walk(
+    node: Parser.SyntaxNode,
+    file: GraphFile,
+    content: string,
+    nodes: GraphNode[],
+    edges: GraphEdge[],
+    parentNodeId: string | null
+  ) {
+    switch (node.type) {
+      case 'class_declaration':
+      case 'abstract_class_declaration': {
+        const nameNode = node.childForFieldName('name')
+        if (!nameNode) break
+        const name = nameNode.text
+        const id = this.nodeId(file.id, 'class', name, node.startPosition.row + 1)
+        const gNode: GraphNode = {
+          id,
+          fileId: file.id,
+          kind: 'class',
+          name,
+          fqn: null,  // resolved later from imports
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column,
+          endCol: node.endPosition.column,
+          signature: `class ${name}`,
+          docstring: this.extractJSDoc(node, content),
+          source: null
+        }
+        nodes.push(gNode)
+
+        // extends
+        const heritageNode = node.childForFieldName('type_parameters') ?? node.children.find(c => c.type === 'class_heritage')
+        // Walk extends_clause / implements_clause
+        for (const child of node.children) {
+          if (child.type === 'extends_clause') {
+            const baseNameNode = child.children.find(c => c.type === 'identifier')
+            if (baseNameNode) {
+              edges.push({
+                id: this.nodeId(file.id, 'edge:extends', id + baseNameNode.text, node.startPosition.row),
+                fromId: id,
+                toId: null,
+                toName: baseNameNode.text,
+                kind: 'extends',
+                resolved: false,
+                callSiteLine: null
+              })
+            }
+          }
+          if (child.type === 'implements_clause') {
+            for (const impl of child.children.filter(c => c.type === 'type_identifier')) {
+              edges.push({
+                id: this.nodeId(file.id, 'edge:implements', id + impl.text, node.startPosition.row),
+                fromId: id,
+                toId: null,
+                toName: impl.text,
+                kind: 'implements',
+                resolved: false,
+                callSiteLine: null
+              })
+            }
+          }
+        }
+
+        if (parentNodeId) {
+          edges.push({ id: `${parentNodeId}:contains:${id}`, fromId: parentNodeId, toId: id, toName: null, kind: 'contains', resolved: true, callSiteLine: null })
+        }
+
+        // Recurse into class body
+        for (const child of node.children) this.walk(child, file, content, nodes, edges, id)
+        return
+      }
+
+      case 'function_declaration':
+      case 'function': {
+        const nameNode = node.childForFieldName('name')
+        if (!nameNode) break
+        const name = nameNode.text
+        const id = this.nodeId(file.id, 'function', name, node.startPosition.row + 1)
+        const params = this.extractParams(node)
+        nodes.push({
+          id, fileId: file.id, kind: 'function', name, fqn: null,
+          startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column, endCol: node.endPosition.column,
+          signature: `function ${name}(${params})`,
+          docstring: this.extractJSDoc(node, content),
+          source: content.slice(node.startIndex, node.endIndex)
+        })
+        if (parentNodeId) edges.push({ id: `${parentNodeId}:contains:${id}`, fromId: parentNodeId, toId: id, toName: null, kind: 'contains', resolved: true, callSiteLine: null })
+        for (const child of node.children) this.walk(child, file, content, nodes, edges, id)
+        return
+      }
+
+      case 'method_definition': {
+        const nameNode = node.childForFieldName('name')
+        if (!nameNode) break
+        const name = nameNode.text
+        const id = this.nodeId(file.id, 'method', (parentNodeId ?? '') + ':' + name, node.startPosition.row + 1)
+        const params = this.extractParams(node)
+        nodes.push({
+          id, fileId: file.id, kind: 'method', name, fqn: null,
+          startLine: node.startPosition.row + 1, endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column, endCol: node.endPosition.column,
+          signature: `${name}(${params})`,
+          docstring: this.extractJSDoc(node, content), source: null
+        })
+        if (parentNodeId) edges.push({ id: `${parentNodeId}:contains:${id}`, fromId: parentNodeId, toId: id, toName: null, kind: 'contains', resolved: true, callSiteLine: null })
+        for (const child of node.children) this.walk(child, file, content, nodes, edges, id)
+        return
+      }
+
+      case 'call_expression': {
+        // Record a provisional call edge from the enclosing function/method
+        if (parentNodeId) {
+          const calleeNameNode = node.childForFieldName('function')
+          if (calleeNameNode) {
+            const calleeName = calleeNameNode.type === 'member_expression'
+              ? calleeNameNode.childForFieldName('property')?.text ?? calleeNameNode.text
+              : calleeNameNode.text
+            edges.push({
+              id: this.nodeId(file.id, 'edge:calls', parentNodeId + calleeName + node.startPosition.row, node.startPosition.row),
+              fromId: parentNodeId, toId: null, toName: calleeName,
+              kind: 'calls', resolved: false,
+              callSiteLine: node.startPosition.row + 1
+            })
+          }
+        }
+        break
+      }
+
+      case 'import_statement': {
+        // import { Foo } from './foo'
+        const sourceNode = node.childForFieldName('source')
+        if (sourceNode) {
+          const importPath = sourceNode.text.replace(/['"]/g, '')
+          edges.push({
+            id: this.nodeId(file.id, 'edge:imports', importPath, node.startPosition.row),
+            fromId: file.id + ':file',
+            toId: null, toName: importPath,
+            kind: 'imports', resolved: false,
+            callSiteLine: node.startPosition.row + 1
+          })
+        }
+        break
+      }
+    }
+
+    for (const child of node.children) {
+      this.walk(child, file, content, nodes, edges, parentNodeId)
+    }
+  }
+
+  private extractJSDoc(node: Parser.SyntaxNode, content: string): string | null {
+    const prevSibling = node.previousNamedSibling
+    if (prevSibling?.type === 'comment' && prevSibling.text.startsWith('/**')) {
+      return prevSibling.text
+        .replace(/^\/\*\*|\*\/$/g, '').replace(/^\s*\* ?/gm, '').trim()
+    }
+    return null
+  }
+
+  private extractParams(node: Parser.SyntaxNode): string {
+    const paramsNode = node.childForFieldName('parameters')
+    if (!paramsNode) return ''
+    return paramsNode.children
+      .filter(c => c.type === 'required_parameter' || c.type === 'optional_parameter')
+      .map(c => c.text)
+      .join(', ')
+  }
+}
+```
+
+Implement `PythonExtractor`, `GoExtractor`, `RustExtractor`, `JavaExtractor` etc. following the same pattern — adapt the tree-sitter node types per language.
+
+### `src/resolution/resolver.ts`
+
+```typescript
+import type { DatabaseConnection } from '../db/connection'
+import type { GraphEdge } from '../types'
+import * as path from 'path'
+import * as fs from 'fs'
+
+export interface ProvisionalEdge extends GraphEdge {
+  fileId: string
+}
+
+export class ReferenceResolver {
+  constructor(
+    private db: DatabaseConnection,
+    private workspaceRoot: string
+  ) {}
+
+  resolve(provisionalEdges: ProvisionalEdge[], onProgress?: (i: number) => void): void {
+    for (let i = 0; i < provisionalEdges.length; i++) {
+      const edge = provisionalEdges[i]
+      onProgress?.(i)
+
+      if (edge.kind === 'imports') {
+        this.resolveImport(edge)
+      } else if (edge.kind === 'calls') {
+        this.resolveCall(edge)
+      } else if (edge.kind === 'extends' || edge.kind === 'implements') {
+        this.resolveTypeRef(edge)
+      }
+    }
+  }
+
+  private resolveImport(edge: ProvisionalEdge): void {
+    if (!edge.toName) return
+    const sourceFile = this.db.getFileById(edge.fileId)
+    if (!sourceFile) return
+
+    // Resolve relative imports
+    let resolved: string | null = null
+    if (edge.toName.startsWith('.')) {
+      const dir = path.dirname(sourceFile.path)
+      const candidates = [
+        path.resolve(dir, edge.toName),
+        path.resolve(dir, edge.toName + '.ts'),
+        path.resolve(dir, edge.toName + '.tsx'),
+        path.resolve(dir, edge.toName + '/index.ts'),
+        path.resolve(dir, edge.toName + '.js'),
+        path.resolve(dir, edge.toName + '/index.js'),
+      ]
+      resolved = candidates.find(c => fs.existsSync(c)) ?? null
+    }
+
+    if (resolved) {
+      const targetFile = this.db.getFileByPath(resolved)
+      if (targetFile) {
+        this.db.updateEdgeResolution(edge.id, targetFile.id + ':file')
+      }
+    }
+  }
+
+  private resolveCall(edge: ProvisionalEdge): void {
+    if (!edge.toName) return
+    // Exact name match
+    const target = this.db.resolveByName(edge.toName)
+    if (target) this.db.updateEdgeResolution(edge.id, target.id)
+  }
+
+  private resolveTypeRef(edge: ProvisionalEdge): void {
+    if (!edge.toName) return
+    const target = this.db.resolveByName(edge.toName)
+    if (target) this.db.updateEdgeResolution(edge.id, target.id)
+  }
+}
+```
+
+### `src/sync/watcher.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+import type { ExtractionOrchestrator } from '../extraction/orchestrator'
+
+export class WorkspaceWatcher {
+  private watcher: vscode.FileSystemWatcher | null = null
+  private debounceTimers = new Map<string, NodeJS.Timeout>()
+  private DEBOUNCE_MS = 2000
+
+  constructor(
+    private workspaceRoot: string,
+    private db: DatabaseConnection,
+    private orchestrator: ExtractionOrchestrator
+  ) {}
+
+  start() {
+    this.watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(this.workspaceRoot, '**/*.{ts,tsx,js,jsx,py,go,rs,java,cs,cpp,cc,swift,kt,rb,dart}')
+    )
+
+    const handle = (uri: vscode.Uri) => this.enqueue(uri.fsPath)
+
+    this.watcher.onDidChange(handle)
+    this.watcher.onDidCreate(handle)
+    this.watcher.onDidDelete(uri => {
+      const fileId = require('crypto').createHash('sha256').update(uri.fsPath).digest('hex')
+      this.db.deleteFile(fileId)
+    })
+  }
+
+  private enqueue(filePath: string) {
+    const existing = this.debounceTimers.get(filePath)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(async () => {
+      this.debounceTimers.delete(filePath)
+      await this.orchestrator.indexFile(filePath, true)
+    }, this.DEBOUNCE_MS)
+    this.debounceTimers.set(filePath, timer)
+  }
+
+  stop() {
+    this.watcher?.dispose()
+    for (const t of this.debounceTimers.values()) clearTimeout(t)
+    this.debounceTimers.clear()
+  }
+}
+```
+
+### `src/graph/context.ts` — ContextBuilder
+
+```typescript
+import type { DatabaseConnection } from '../db/connection'
+import type { GraphNode, GraphFile, ContextResult } from '../types'
+
+export class ContextBuilder {
+  constructor(private db: DatabaseConnection) {}
+
+  build(task: string, maxNodes = 20, includeSource = true): ContextResult {
+    // 1. Tokenize task
+    const terms = task
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length > 2)
+
+    // 2. FTS5 search for each term, collect with scores
+    const seen = new Map<string, { node: GraphNode; score: number }>()
+    for (const term of terms) {
+      const results = this.db.searchNodes(term, undefined, 10)
+      for (let i = 0; i < results.length; i++) {
+        const node = results[i]
+        const score = (seen.get(node.id)?.score ?? 0) + (1 / (i + 1))
+        seen.set(node.id, { node, score })
+      }
+    }
+
+    // 3. Expand top candidates by callers/callees
+    const topCandidates = [...seen.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10)
+
+    for (const { node } of topCandidates) {
+      const callers = this.db.getCallers(node.id, 1)
+      const callees = this.db.getCallees(node.id, 1)
+      for (const n of [...callers, ...callees]) {
+        if (!seen.has(n.id)) seen.set(n.id, { node: n, score: 0.1 })
+      }
+    }
+
+    // 4. Score by graph centrality
+    const allNodes = [...seen.values()]
+    for (const entry of allNodes) {
+      const inDegree = this.db.getInDegree(entry.node.id)
+      const outDegree = this.db.getOutDegree(entry.node.id)
+      entry.score += (inDegree + outDegree) * 0.05
+    }
+
+    // 5. Sort, truncate, attach file info
+    const sorted = allNodes.sort((a, b) => b.score - a.score).slice(0, maxNodes)
+
+    const entryPoints = sorted
+      .filter(e => this.db.getInDegree(e.node.id) === 0)
+      .map(e => e.node.id)
+
+    const filesById = new Map<string, GraphFile>()
+    const result = sorted.map(({ node, score }) => {
+      let file = filesById.get(node.fileId)
+      if (!file) {
+        file = this.db.getFileById(node.fileId)!
+        filesById.set(node.fileId, file)
+      }
+      return { ...node, file, score }
+    })
+
+    return {
+      nodes: result,
+      entryPoints,
+      totalNodes: seen.size
+    }
+  }
+
+  toMarkdown(result: ContextResult): string {
+    const lines: string[] = ['# Code Context\n']
+    for (const node of result.nodes) {
+      lines.push(`## ${node.name} (${node.kind}) — ${node.file.relPath}:${node.startLine}`)
+      if (node.signature) lines.push(`\`\`\`\n${node.signature}\n\`\`\``)
+      if (node.docstring) lines.push(node.docstring)
+      if (node.source) lines.push(`\`\`\`\n${node.source}\n\`\`\``)
+      lines.push('')
+    }
+    return lines.join('\n')
+  }
+}
+```
+
+### `src/ui/sidebar-provider.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+import type { GraphNode } from '../types'
+
+export class SidebarProvider implements vscode.TreeDataProvider<SidebarItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<SidebarItem | undefined>()
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event
+
+  constructor(
+    private extensionUri: vscode.Uri,
+    private db: DatabaseConnection
+  ) {}
+
+  refresh(): void { this._onDidChangeTreeData.fire(undefined) }
+
+  getTreeItem(element: SidebarItem): vscode.TreeItem { return element }
+
+  getChildren(element?: SidebarItem): SidebarItem[] {
+    if (!element) {
+      // Root: show stats + kind categories
+      const stats = this.db.getStats()
+      return [
+        new SidebarItem(`Files: ${stats.fileCount}`, vscode.TreeItemCollapsibleState.None),
+        new SidebarItem(`Symbols: ${stats.nodeCount}`, vscode.TreeItemCollapsibleState.None),
+        new SidebarItem(`Edges: ${stats.edgeCount}`, vscode.TreeItemCollapsibleState.None),
+        new SidebarItem('Functions', vscode.TreeItemCollapsibleState.Collapsed, 'function'),
+        new SidebarItem('Classes', vscode.TreeItemCollapsibleState.Collapsed, 'class'),
+        new SidebarItem('Methods', vscode.TreeItemCollapsibleState.Collapsed, 'method'),
+      ]
+    }
+
+    if (element.kind) {
+      return this.db.searchNodes('', element.kind as any, 100)
+        .map(n => new SidebarItem(
+          n.name, vscode.TreeItemCollapsibleState.None, undefined,
+          { command: 'codegraph.goToSymbol', title: 'Go to Symbol', arguments: [n] }
+        ))
+    }
+
+    return []
+  }
+}
+
+class SidebarItem extends vscode.TreeItem {
+  constructor(
+    label: string,
+    collapsibleState: vscode.TreeItemCollapsibleState,
+    public readonly kind?: string,
+    command?: vscode.Command
+  ) {
+    super(label, collapsibleState)
+    if (command) this.command = command
+    if (kind) this.contextValue = kind
+  }
+}
+```
+
+### `src/ui/codelens-provider.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+
+export class CodeLensProvider implements vscode.CodeLensProvider {
+  constructor(private db: DatabaseConnection) {}
+
+  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+    const filePath = document.uri.fsPath
+    const file = this.db.getFileByPath(filePath)
+    if (!file) return []
+
+    const nodes = this.db.getNodesByFile(file.id)
+    const lenses: vscode.CodeLens[] = []
+
+    for (const node of nodes) {
+      if (node.kind !== 'function' && node.kind !== 'method' && node.kind !== 'class') continue
+
+      const range = new vscode.Range(node.startLine - 1, 0, node.startLine - 1, 0)
+      const callerCount = this.db.getCallerCount(node.id)
+      const calleeCount = this.db.getCalleeCount(node.id)
+
+      if (callerCount > 0) {
+        lenses.push(new vscode.CodeLens(range, {
+          title: `$(arrow-up) ${callerCount} caller${callerCount !== 1 ? 's' : ''}`,
+          command: 'codegraph.showCallers',
+          arguments: [node.id]
+        }))
+      }
+
+      if (calleeCount > 0) {
+        lenses.push(new vscode.CodeLens(range, {
+          title: `$(arrow-down) ${calleeCount} callee${calleeCount !== 1 ? 's' : ''}`,
+          command: 'codegraph.showCallees',
+          arguments: [node.id]
+        }))
+      }
+    }
+
+    return lenses
+  }
+}
+```
+
+### `src/ui/hover-provider.ts`
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+
+export class HoverProvider implements vscode.HoverProvider {
+  constructor(private db: DatabaseConnection) {}
+
+  provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | null {
+    const file = this.db.getFileByPath(document.uri.fsPath)
+    if (!file) return null
+
+    const nodes = this.db.getNodesByFile(file.id)
+    const node = nodes.find(n =>
+      position.line + 1 >= n.startLine &&
+      position.line + 1 <= n.endLine
+    )
+    if (!node) return null
+
+    const callers = this.db.getCallers(node.id, 1)
+    const callees = this.db.getCallees(node.id, 1)
+
+    const md = new vscode.MarkdownString()
+    md.isTrusted = true
+    md.appendMarkdown(`**CodeGraph** — \`${node.kind}\` \`${node.name}\`\n\n`)
+    if (node.docstring) md.appendMarkdown(`${node.docstring}\n\n`)
+    if (node.signature) md.appendCodeblock(node.signature, 'typescript')
+    if (callers.length) md.appendMarkdown(`\n**Callers (${callers.length}):** ${callers.map(c => `\`${c.name}\``).join(', ')}\n`)
+    if (callees.length) md.appendMarkdown(`\n**Calls (${callees.length}):** ${callees.map(c => `\`${c.name}\``).join(', ')}\n`)
+
+    return new vscode.Hover(md)
+  }
+}
+```
+
+### `src/commands/index.ts` — register all commands
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+import type { ExtractionOrchestrator } from '../extraction/orchestrator'
+import { ContextBuilder } from '../graph/context'
+
+export function registerCommands(
+  context: vscode.ExtensionContext,
+  db: DatabaseConnection,
+  orchestrator: ExtractionOrchestrator
+) {
+  // codegraph.index — full index with progress notification
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.index', async () => {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'CodeGraph: Indexing...', cancellable: false },
+        async (progress) => {
+          await orchestrator.indexAll((p) => {
+            progress.report({ message: `${p.phase} ${p.current}/${p.total}${p.currentFile ? ': ' + p.currentFile : ''}` })
+          })
+        }
+      )
+      vscode.window.showInformationMessage(`CodeGraph: Indexed. ${db.getStats().nodeCount} symbols.`)
+    })
+  )
+
+  // codegraph.search — quick pick over all symbols
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.search', async () => {
+      const query = await vscode.window.showInputBox({ prompt: 'Search symbols (CodeGraph)', placeHolder: 'e.g. UserService' })
+      if (!query) return
+      const results = db.searchNodes(query, undefined, 30)
+      const items = results.map(n => ({
+        label: `$(symbol-${n.kind}) ${n.name}`,
+        description: `${n.kind} — ${n.fqn ?? ''}`,
+        detail: db.getFileById(n.fileId)?.relPath,
+        node: n
+      }))
+      const picked = await vscode.window.showQuickPick(items, { matchOnDescription: true, matchOnDetail: true })
+      if (picked) {
+        const file = db.getFileById(picked.node.fileId)
+        if (file) {
+          const uri = vscode.Uri.file(file.path)
+          const doc = await vscode.workspace.openTextDocument(uri)
+          await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Range(picked.node.startLine - 1, 0, picked.node.startLine - 1, 0)
+          })
+        }
+      }
+    })
+  )
+
+  // codegraph.showCallers — show callers in quick pick
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.showCallers', async (nodeId: string) => {
+      const callers = db.getCallers(nodeId, 3)
+      showNodePick(callers, db, 'Callers')
+    })
+  )
+
+  // codegraph.showCallees
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.showCallees', async (nodeId: string) => {
+      const callees = db.getCallees(nodeId, 3)
+      showNodePick(callees, db, 'Callees')
+    })
+  )
+
+  // codegraph.showImpact
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.showImpact', async (nodeId: string) => {
+      const impact = db.getImpact(nodeId, 2)
+      showNodePick(impact, db, 'Impact Radius')
+    })
+  )
+
+  // codegraph.explore — builds context for a natural language question, opens in new editor
+  context.subscriptions.push(
+    vscode.commands.registerCommand('codegraph.explore', async () => {
+      const question = await vscode.window.showInputBox({ prompt: 'CodeGraph Explore: ask a question about your codebase', placeHolder: 'How does authentication work?' })
+      if (!question) return
+      const builder = new ContextBuilder(db)
+      const result = builder.build(question, 30, true)
+      const markdown = builder.toMarkdown(result)
+      const uri = vscode.Uri.parse('codegraph-explore:' + encodeURIComponent(question))
+      // Open virtual document
+      const provider = new (class implements vscode.TextDocumentContentProvider {
+        provideTextDocumentContent() { return markdown }
+      })()
+      context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('codegraph-explore', provider))
+      const doc = await vscode.workspace.openTextDocument(uri)
+      await vscode.window.showTextDocument(doc, { preview: false })
+    })
+  )
+}
+
+async function showNodePick(nodes: any[], db: DatabaseConnection, title: string) {
+  if (!nodes.length) { vscode.window.showInformationMessage(`CodeGraph: No ${title.toLowerCase()} found.`); return }
+  const items = nodes.map(n => ({
+    label: `$(symbol-${n.kind}) ${n.name}`,
+    description: n.kind,
+    detail: db.getFileById(n.fileId)?.relPath,
+    node: n
+  }))
+  const picked = await vscode.window.showQuickPick(items, { placeHolder: title })
+  if (picked) {
+    const file = db.getFileById(picked.node.fileId)
+    if (file) {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file.path))
+      await vscode.window.showTextDocument(doc, {
+        selection: new vscode.Range(picked.node.startLine - 1, 0, picked.node.startLine - 1, 0)
+      })
+    }
+  }
+}
+```
+
+### `src/chat/participant.ts` — VS Code Chat Participant (`@codegraph`)
+
+```typescript
+import * as vscode from 'vscode'
+import type { DatabaseConnection } from '../db/connection'
+import { ContextBuilder } from '../graph/context'
+
+export function registerChatParticipant(context: vscode.ExtensionContext, db: DatabaseConnection) {
+  const participant = vscode.chat.createChatParticipant('codegraph', async (request, _ctx, stream, token) => {
+    const builder = new ContextBuilder(db)
+    const result = builder.build(request.prompt, 25, true)
+
+    stream.markdown(`**CodeGraph found ${result.nodes.length} relevant symbols** (${result.totalNodes} total candidates)\n\n`)
+
+    for (const node of result.nodes) {
+      stream.markdown(`### \`${node.name}\` — ${node.kind} in \`${node.file.relPath}:${node.startLine}\`\n`)
+      if (node.signature) stream.markdown(`\`\`\`typescript\n${node.signature}\n\`\`\`\n`)
+      if (node.docstring) stream.markdown(`${node.docstring}\n`)
+      if (node.source) stream.markdown(`\`\`\`typescript\n${node.source}\n\`\`\`\n`)
+    }
+
+    stream.markdown('\n---\n*Use `codegraph.explore` command for the full context view.*')
+  })
+
+  participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'resources', 'icons', 'codegraph.svg')
+  context.subscriptions.push(participant)
+}
+```
+
+### `package.json` — full manifest
+
+```json
+{
+  "name": "codegraph",
+  "displayName": "CodeGraph",
+  "description": "Pre-indexed code knowledge graph: semantic search, call graphs, impact analysis — 100% local",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other", "Programming Languages"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "codegraph.index", "title": "CodeGraph: Index Workspace" },
+      { "command": "codegraph.search", "title": "CodeGraph: Search Symbols" },
+      { "command": "codegraph.explore", "title": "CodeGraph: Explore (natural language)" },
+      { "command": "codegraph.showCallers", "title": "CodeGraph: Show Callers" },
+      { "command": "codegraph.showCallees", "title": "CodeGraph: Show Callees" },
+      { "command": "codegraph.showImpact", "title": "CodeGraph: Show Impact Radius" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "codegraph", "title": "CodeGraph", "icon": "resources/icons/codegraph.svg" }
+      ]
+    },
+    "views": {
+      "codegraph": [
+        { "id": "codegraph.symbols", "name": "Symbols" },
+        { "id": "codegraph.files", "name": "Files" }
+      ]
+    },
+    "keybindings": [
+      { "command": "codegraph.search", "key": "ctrl+shift+g", "mac": "cmd+shift+g" },
+      { "command": "codegraph.explore", "key": "ctrl+shift+e", "mac": "cmd+shift+e" }
+    ],
+    "configuration": {
+      "title": "CodeGraph",
+      "properties": {
+        "codegraph.exclude": {
+          "type": "array",
+          "default": [],
+          "description": "Additional glob patterns to exclude from indexing"
+        },
+        "codegraph.maxFileSize": {
+          "type": "number",
+          "default": 1048576,
+          "description": "Max file size in bytes to index"
+        },
+        "codegraph.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show caller/callee CodeLens above functions and methods"
+        },
+        "codegraph.hover.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show CodeGraph info in hover tooltips"
+        },
+        "codegraph.watchDebounceMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Milliseconds to debounce file change events before re-indexing"
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "codegraph",
+        "name": "codegraph",
+        "description": "Ask questions about your codebase using the local knowledge graph",
+        "isSticky": false
+      }
+    ]
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0",
+    "minimatch": "^9.0.4",
+    "web-tree-sitter": "^0.22.6"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && vsce package",
+    "watch": "node esbuild.config.mjs --watch"
+  }
+}
+```
+
+### `esbuild.config.mjs`
+
+```javascript
+import * as esbuild from 'esbuild'
+
+const production = process.argv.includes('--production')
+const watch = process.argv.includes('--watch')
+
+const ctx = await esbuild.context({
+  entryPoints: ['src/extension.ts'],
+  bundle: true,
+  outfile: 'dist/extension.js',
+  external: ['vscode'],  // vscode is provided by the host
+  format: 'cjs',
+  platform: 'node',
+  target: 'node18',
+  sourcemap: !production,
+  minify: production,
+  // better-sqlite3 is a native addon — must be copied to dist, not bundled
+  // Mark it external and use __dirname to locate it
+  plugins: [{
+    name: 'mark-sqljs-external',
+    setup(build) {
+      // sql.js is loaded via locateFile pointing to wasm/sql-wasm.wasm
+      // The JS shim is bundled normally; only the .wasm file is external (copied to wasm/ dir)
+      build.onResolve({ filter: /sql-wasm\.wasm$/ }, args => ({
+        path: args.path,
+        external: true
+      }))
+    }
+  }]
+})
+
+if (watch) {
+  await ctx.watch()
+  console.log('Watching...')
+} else {
+  await ctx.rebuild()
+  await ctx.dispose()
+}
+```
+
+**`sql.js` is the database engine.** It ships as a single `sql-wasm.wasm` file — pure WASM, no native binaries, no platform-specific compilation. Copy `node_modules/sql.js/dist/sql-wasm.wasm` into your `wasm/` directory at build time (add a `postinstall` script or esbuild plugin). The VSIX bundles `wasm/sql-wasm.wasm` and loads it via `locateFile`. Result: the extension installs and runs identically on Windows, macOS, and Linux with zero user setup required.
+
+### esbuild config update for sql.js
+Mark `sql.js` as external so esbuild doesn't try to bundle the WASM binary inline. Add to `package.json`:
+```json
+"scripts": {
+  "copy-wasm": "cp node_modules/sql.js/dist/sql-wasm.wasm wasm/sql-wasm.wasm",
+  "build": "npm run copy-wasm && node esbuild.config.mjs",
+  "package": "npm run build && vsce package"
+}
+```
+Add `wasm/` to the VSIX by ensuring it's NOT in `.vscodeignore`.
+
+---
+
+## BUILD SEQUENCE
+
+Build files in this exact order:
+
+1. `package.json`
+2. `tsconfig.json`
+3. `esbuild.config.mjs`
+4. `src/types.ts`
+5. `src/db/schema.ts`
+6. `src/db/connection.ts` (implement ALL methods fully — no stubs)
+7. `src/db/queries.ts` (all prepared statements)
+8. `src/extraction/base-extractor.ts`
+9. `src/extraction/languages/typescript.ts` (full walk implementation)
+10. `src/extraction/languages/python.ts`
+11. `src/extraction/languages/go.ts`
+12. `src/extraction/languages/rust.ts`
+13. `src/extraction/languages/java.ts`
+14. `src/extraction/languages/csharp.ts`
+15. `src/extraction/languages/cpp.ts`
+16. `src/extraction/languages/swift.ts`
+17. `src/extraction/languages/kotlin.ts`
+18. `src/extraction/orchestrator.ts`
+19. `src/resolution/resolver.ts`
+20. `src/sync/watcher.ts`
+21. `src/sync/incremental.ts`
+22. `src/graph/search.ts`
+23. `src/graph/callers.ts`
+24. `src/graph/callees.ts`
+25. `src/graph/impact.ts`
+26. `src/graph/context.ts`
+27. `src/graph/explore.ts`
+28. `src/graph/affected.ts`
+29. `src/ui/sidebar-provider.ts`
+30. `src/ui/codelens-provider.ts`
+31. `src/ui/hover-provider.ts`
+32. `src/ui/status-bar.ts`
+33. `src/ui/webview-panel.ts` (D3 force graph visualization of the knowledge graph)
+34. `src/commands/index.ts`
+35. `src/commands/search.ts`
+36. `src/commands/explore.ts`
+37. `src/chat/participant.ts`
+38. `src/extension.ts`
+39. `.vscodeignore`
+40. Run `npm install && npm run package` to produce `codegraph-0.1.0.vsix`
+
+---
+
+## HARD RULES
+
+- Python: 4-space indentation. JS/TS: 2-space indentation.
+- Zero placeholders. Every method body is fully implemented.
+- Zero `any` types unless interfacing with raw tree-sitter SyntaxNode.
+- No markdown file generation unless the user asks.
+- Flat, linear logic. No deep abstractions. Simple is correct.
+- `sql.js` (WASM SQLite) for all DB access — zero native binaries, works on all platforms out of the box. Persist via `db.export()` after every batch write. Initialize from `wasm/sql-wasm.wasm` via `locateFile`.
+- All tree-sitter grammars loaded from `context.asAbsolutePath('grammars/')`.
+- All WASM grammar `.wasm` files copied to `grammars/` directory at build time via a script.
+- The extension must work offline. No network calls of any kind.
+- `.codegraph/` directory and `codegraph.db` file created automatically on first index.
+- Incremental indexing: files whose content hash is unchanged are skipped — never re-parsed.
