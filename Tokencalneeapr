@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+copilot_token_tracker.py
+Reads GitHub Copilot token usage directly from VS Code local SQLite databases.
+Zero config changes needed. Zero dependencies. Pure stdlib.
+
+Windows path scanned automatically:
+  APPDATA\\Code\\User\\workspaceStorage\\*\\state.vscdb
+
+Usage:
+  python copilot_token_tracker.py            # all-time summary
+  python copilot_token_tracker.py --watch    # live refresh every 10s
+  python copilot_token_tracker.py --today    # today only
+  python copilot_token_tracker.py --days 7   # last N days
+"""
+
+import os
+import sys
+import json
+import time
+import shutil
+import sqlite3
+import platform
+import tempfile
+import argparse
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# ANSI colours
+R    = "\033[0m"
+BOLD = "\033[1m"
+DIM  = "\033[2m"
+CYN  = "\033[96m"
+GRN  = "\033[92m"
+YLW  = "\033[93m"
+RED  = "\033[91m"
+BLU  = "\033[94m"
+
+
+# ---------------------------------------------------------------------------
+# 1. Locate workspaceStorage databases
+# ---------------------------------------------------------------------------
+
+def get_vscode_bases() -> list:
+    system = platform.system()
+    bases = []
+
+    if system == "Windows":
+        appdata = Path(os.environ.get("APPDATA", "~")).expanduser()
+        local   = Path(os.environ.get("LOCALAPPDATA", "~")).expanduser()
+        for variant in ("Code", "Code - Insiders", "Cursor", "windsurf"):
+            bases.append(appdata / variant)
+            bases.append(local   / variant)
+
+    elif system == "Darwin":
+        base = Path("~/Library/Application Support").expanduser()
+        for variant in ("Code", "Code - Insiders", "Cursor", "windsurf"):
+            bases.append(base / variant)
+
+    else:  # Linux
+        xdg = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+        for variant in ("Code", "Code - Insiders", "Cursor", "windsurf"):
+            bases.append(xdg / variant)
+
+    return [b for b in bases if b.exists()]
+
+
+def find_vscdb_files() -> list:
+    found = []
+    for base in get_vscode_bases():
+        ws = base / "User" / "workspaceStorage"
+        if ws.exists():
+            for db in ws.rglob("state.vscdb"):
+                found.append(db)
+    # deduplicate
+    return list({f.resolve() for f in found})
+
+
+# ---------------------------------------------------------------------------
+# 2. Read a single vscdb safely (VS Code locks the live file)
+# ---------------------------------------------------------------------------
+
+CHAT_KEYS = (
+    "chat.sessions",
+    "chatSessions",
+    "github.copilot.chat",
+    "copilot.chat",
+    "workbench.panel.chat",
+)
+
+
+def read_db(db_path: Path) -> list:
+    """Copy db to temp file, return (key, value) rows from ItemTable."""
+    rows = []
+    tmp = None
+    try:
+        tmp = tempfile.mktemp(suffix=".vscdb")
+        shutil.copy2(str(db_path), tmp)
+        conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=3)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM ItemTable WHERE value IS NOT NULL"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            pass
+        conn.close()
+    except Exception:
+        pass
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    return rows
+
+
+def extract_records_from_db(db_path: Path) -> list:
+    records = []
+    for key, value in read_db(db_path):
+        if not any(k in key for k in CHAT_KEYS):
+            continue
+        try:
+            data = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        records.extend(parse_session_data(data))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# 3. Parse session JSON into flat token records
+# ---------------------------------------------------------------------------
+
+def parse_session_data(data) -> list:
+    records = []
+
+    sessions = []
+    if isinstance(data, list):
+        sessions = data
+    elif isinstance(data, dict):
+        for key in ("sessions", "requests", "turns", "history", "entries"):
+            val = data.get(key)
+            if isinstance(val, list):
+                sessions = val if key == "sessions" else [{"requests": val}]
+                break
+        if not sessions:
+            sessions = [data]
+
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        requests = session.get("requests") or session.get("turns") or []
+        for req in requests:
+            rec = extract_from_request(req)
+            if rec:
+                records.append(rec)
+
+    return records
+
+
+def extract_from_request(req) -> dict:
+    if not isinstance(req, dict):
+        return None
+
+    # token usage — try nested then flat
+    tu = req.get("tokenUsage") or req.get("usage") or req.get("token_usage") or {}
+    if isinstance(tu, dict):
+        input_t  = (tu.get("promptTokens")     or tu.get("prompt_tokens") or
+                    tu.get("inputTokens")       or tu.get("input_tokens"))
+        output_t = (tu.get("completionTokens") or tu.get("completion_tokens") or
+                    tu.get("outputTokens")      or tu.get("output_tokens"))
+    else:
+        input_t = output_t = None
+
+    if input_t is None:
+        input_t = req.get("promptTokens") or req.get("prompt_tokens")
+    if output_t is None:
+        output_t = req.get("completionTokens") or req.get("completion_tokens")
+
+    if input_t is None and output_t is None:
+        return None
+
+    # model
+    model_obj = req.get("model") or {}
+    if isinstance(model_obj, dict):
+        model = model_obj.get("id") or model_obj.get("name") or "unknown"
+    else:
+        model = str(model_obj) if model_obj else "unknown"
+    if model == "unknown":
+        model = req.get("modelId") or req.get("model_id") or "unknown"
+
+    # timestamp
+    ts_raw = (req.get("timestamp") or req.get("createdAt") or
+              req.get("created_at") or req.get("time") or req.get("date"))
+    ts = parse_ts(ts_raw)
+
+    return {
+        "input_tokens":  int(input_t  or 0),
+        "output_tokens": int(output_t or 0),
+        "model":         str(model),
+        "timestamp":     ts,
+    }
+
+
+def parse_ts(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            v = raw / 1000 if raw > 1e10 else raw
+            return datetime.fromtimestamp(v)
+        except (OSError, OverflowError):
+            return None
+    if isinstance(raw, str):
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                return datetime.strptime(raw[:len(fmt)], fmt)
+            except ValueError:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 4. Load + deduplicate all records across all dbs
+# ---------------------------------------------------------------------------
+
+def load_all_records() -> list:
+    all_records = []
+    seen = set()
+    for db in find_vscdb_files():
+        for r in extract_records_from_db(db):
+            key = (
+                r["input_tokens"], r["output_tokens"], r["model"],
+                r["timestamp"].isoformat() if r["timestamp"] else ""
+            )
+            if key not in seen:
+                seen.add(key)
+                all_records.append(r)
+    all_records.sort(key=lambda r: r["timestamp"] or datetime.max)
+    return all_records
+
+
+def filter_records(records: list, days: int) -> list:
+    if days is None:
+        return records
+    cutoff = datetime.now() - timedelta(days=days)
+    return [r for r in records if r["timestamp"] and r["timestamp"] >= cutoff]
+
+
+# ---------------------------------------------------------------------------
+# 5. Display
+# ---------------------------------------------------------------------------
+
+def print_header(n_dbs: int):
+    print(f"\n{BOLD}{CYN}{'─'*64}{R}")
+    print(f"{BOLD}{CYN}  GitHub Copilot Token Tracker{R}  "
+          f"{DIM}({n_dbs} workspace db{'s' if n_dbs != 1 else ''} scanned){R}")
+    print(f"{CYN}{'─'*64}{R}")
+
+
+def print_per_request(records: list, limit: int = 50):
+    if not records:
+        return
+    showing = records[-limit:]
+    print(f"\n{BOLD}  Per-Request Breakdown{R}  {DIM}(last {len(showing)} of {len(records)}){R}")
+    print(f"  {DIM}{'#':<5} {'Timestamp':<20} {'Model':<30} {'In':>8} {'Out':>8} {'Total':>8}{R}")
+    print(f"  {'─'*81}")
+    for i, r in enumerate(showing, 1):
+        ts  = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if r["timestamp"] else "—"
+        mod = r["model"][:28]
+        inp, out = r["input_tokens"], r["output_tokens"]
+        print(f"  {BLU}{i:<5}{R} {DIM}{ts:<20}{R} {GRN}{mod:<30}{R}"
+              f" {inp:>8,} {out:>8,} {BOLD}{inp + out:>8,}{R}")
+
+
+def print_model_breakdown(records: list):
+    if not records:
+        return
+    by_model = defaultdict(lambda: {"in": 0, "out": 0, "n": 0})
+    for r in records:
+        m = r["model"]
+        by_model[m]["in"]  += r["input_tokens"]
+        by_model[m]["out"] += r["output_tokens"]
+        by_model[m]["n"]   += 1
+
+    print(f"\n{BOLD}  By Model{R}")
+    print(f"  {DIM}{'Model':<32} {'Requests':>9} {'In':>12} {'Out':>12} {'Total':>12}{R}")
+    print(f"  {'─'*81}")
+    for m, d in sorted(by_model.items(), key=lambda x: -(x[1]["in"] + x[1]["out"])):
+        tot = d["in"] + d["out"]
+        print(f"  {GRN}{m:<32}{R} {d['n']:>9,} {d['in']:>12,} {d['out']:>12,} {BOLD}{tot:>12,}{R}")
+
+
+def print_daily_totals(records: list):
+    if not records:
+        return
+    days = defaultdict(lambda: {"in": 0, "out": 0, "n": 0, "models": set()})
+    for r in records:
+        day = r["timestamp"].strftime("%Y-%m-%d") if r["timestamp"] else "unknown"
+        days[day]["in"]     += r["input_tokens"]
+        days[day]["out"]    += r["output_tokens"]
+        days[day]["n"]      += 1
+        days[day]["models"].add(r["model"])
+
+    print(f"\n{BOLD}  Daily Cumulative Totals{R}")
+    print(f"  {DIM}{'Date':<12} {'Req':>5} {'Models':<30} {'In':>10} {'Out':>10} {'Total':>10}{R}")
+    print(f"  {'─'*83}")
+    gi = go = gn = 0
+    for day in sorted(days):
+        d = days[day]
+        mods = ", ".join(sorted(d["models"]))[:28]
+        gi += d["in"]
+        go += d["out"]
+        gn += d["n"]
+        print(f"  {CYN}{day:<12}{R} {d['n']:>5}  {GRN}{mods:<30}{R}"
+              f" {d['in']:>10,} {d['out']:>10,} {BOLD}{d['in'] + d['out']:>10,}{R}")
+    print(f"  {'─'*83}")
+    print(f"  {BOLD}{'TOTAL':<12}{R} {gn:>5}  {'':30}"
+          f" {gi:>10,} {go:>10,} {BOLD}{YLW}{gi + go:>10,}{R}")
+
+
+def print_no_data(dbs: list):
+    print(f"\n  {YLW}No Copilot token data found.{R}")
+    if not dbs:
+        print(f"\n  {RED}No VS Code workspaceStorage databases found.{R}")
+        print(f"  Make sure VS Code is installed and Copilot Chat has been used at least once.")
+    else:
+        print(f"\n  Scanned {len(dbs)} database(s) — token data not yet written.")
+        print(f"  Open VS Code, send a message in Copilot Chat, then re-run this script.")
+        print(f"\n  {DIM}First few db paths:{R}")
+        for db in dbs[:3]:
+            print(f"  {DIM}{db}{R}")
+
+
+# ---------------------------------------------------------------------------
+# 6. Main
+# ---------------------------------------------------------------------------
+
+def run(args):
+    days = 1 if args.today else args.days
+
+    def display():
+        if args.watch:
+            os.system("cls" if platform.system() == "Windows" else "clear")
+
+        dbs = find_vscdb_files()
+        print_header(len(dbs))
+
+        all_records = load_all_records()
+        records = filter_records(all_records, days)
+
+        if not records:
+            print_no_data(dbs)
+            if all_records and days:
+                print(f"\n  {DIM}Note: {len(all_records)} records exist outside this time window.{R}")
+                print(f"  {DIM}Run without --today / --days to see all of them.{R}")
+        else:
+            label = f"last {days} day(s)" if days else "all time"
+            print(f"\n  {DIM}{len(records)} requests — {label}{R}")
+            print_per_request(records)
+            print_model_breakdown(records)
+            print_daily_totals(records)
+
+        if args.watch:
+            print(f"\n  {DIM}Refreshing every 10s — Ctrl+C to stop  "
+                  f"[{datetime.now().strftime('%H:%M:%S')}]{R}")
+        print()
+
+    if args.watch:
+        try:
+            while True:
+                display()
+                time.sleep(10)
+        except KeyboardInterrupt:
+            print(f"\n{DIM}Stopped.{R}\n")
+    else:
+        display()
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="GitHub Copilot token tracker — reads VS Code SQLite dbs, no config needed"
+    )
+    p.add_argument("--watch", action="store_true",
+                   help="Live mode: refresh every 10s")
+    p.add_argument("--today", action="store_true",
+                   help="Show today only")
+    p.add_argument("--days", type=int, default=None, metavar="N",
+                   help="Show last N days (default: all time)")
+    run(p.parse_args())
+
+
+if __name__ == "__main__":
+    main()
