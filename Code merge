@@ -1,0 +1,35 @@
+I have an enterprise VS Code extension project (APP-EBSSH-IDE-VSCODE-CUSTOM-ORCHESTRA-EX) 
+and I need to integrate my CodeGraph extension into it as a non-invasive module.
+
+## CONSTRAINTS (STRICTLY ENFORCE)
+- DO NOT modify any existing EBSSH files
+- Create only NEW files under a dedicated folder: `codegraph-extension/`
+- No hardcoded values anywhere (paths, URLs, credentials, model names)
+- No references to: graphifyy, Kimi, Claude, Cursor, or any AI vendor names
+- No console.log in production code (use proper VS Code OutputChannel logging)
+- All config must come from VS Code settings (package.json contributes.configuration)
+- Code must pass ESLint, Prettier, and SonarQube standards already in this project
+- Follow existing tsconfig.json, .eslintrc.js, .prettierrc.js rules exactly
+- All strings externalized (no inline user-facing text)
+- Full TypeScript strict mode compliance
+- No try/catch swallowing errors silently
+
+## TASK
+1. Read the existing EBSSH package.json, tsconfig.json, .eslintrc.js to understand 
+   the project standards
+2. Read codegraph-extension/ folder structure to understand what needs to be integrated
+3. Create a self-contained integration that:
+   - Registers a new VS Code command under the EBSSH extension's activation
+   - Adds configuration entries to a new partial package.json contribution file
+   - Invokes the CodeGraph Python backend using the configured Python interpreter path
+   - Surfaces results in a VS Code WebviewPanel or TreeView
+   - Handles all error states gracefully with user-visible messages via window.showErrorMessage
+4. Create an integration entry point: `codegraph-extension/index.ts` that exports 
+   a single `activate(context)` function that EBSSH can call
+5. Provide exact instructions for the ONE LINE to add to EBSSH's existing activate() 
+   to wire in the new module
+
+## OUTPUT FORMAT
+- Full production-ready TypeScript files with no placeholders or TODOs
+- File paths relative to workspace root
+- A checklist of manual steps needed after code generation
