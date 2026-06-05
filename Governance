@@ -1,0 +1,33 @@
+## AgentGuard — Impact Report
+
+**Status: BLOCKED ❌**
+**Changed agent:** `order-processor-agent` (services/order/agent.py)
+
+### Breaking Changes Detected
+
+| Change | Type | Severity |
+|--------|------|----------|
+| Tool `validate_order` param `amount` renamed to `total_amount` | Schema breaking | 🔴 Critical |
+| Output field `order_id` type changed from `str` to `int` | Schema breaking | 🔴 Critical |
+| System prompt modified | Semantic change | 🟡 Warning |
+
+### Downstream Agents Affected
+
+1. **`payment-agent`** (services/payment/agent.yaml)
+   - Depends on: `validate_order` tool output
+   - Breaks because: expects param named `amount`, receives `total_amount`
+   - **Fix:** In `services/payment/agent.yaml` line 34, rename `amount` to `total_amount`
+     in the tool call arguments block.
+
+2. **`audit-agent`** (services/audit/agent_graph.py)
+   - Depends on: output field `order_id` as string for log formatting
+   - Breaks because: `str(order_id)` cast will silently change behavior
+   - **Fix:** In `services/audit/agent_graph.py` line 89, update parser to
+     cast `order_id` to `str` explicitly: `str(state["order_id"])`
+
+### Prompt Change Warning
+System prompt hash changed. Semantic impact cannot be verified automatically.
+Manual review recommended before merge.
+
+---
+*AgentGuard · 3 agents scanned · 2 breaking · 1 warning · 847ms*
