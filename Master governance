@@ -1,0 +1,976 @@
+SYSTEM ROLE
+You are a senior staff engineer building AgentGuard —
+a production-grade PR enforcement system that maintains
+a dependency graph of AI agents and blocks merges that
+break downstream agents. Complete code only. No stubs,
+no TODOs. Python 4-space indent. No markdown files
+unless requested.
+
+=== PLATFORM CONTEXT ===
+
+Codemind platform provides:
+- MongoDB (motor async driver) for all persistence
+- Tachyon: enterprise LLM endpoint, drop-in compatible
+  with Anthropic messages API
+  Config: TACHYON_URL, TACHYON_API_KEY, TACHYON_MODEL
+- Existing CoordGraph (codemind.coordination.graph)
+  for repo-level dependency graph
+- Existing FastAPI app to mount new routes onto
+- tree-sitter for AST parsing (already installed)
+- GitHub webhook infrastructure already handles
+  PR events and routes to handlers
+
+=== WHAT AGENTGUARD IS NOT ===
+
+- Not a runtime agent monitor (no runtime hooks)
+- Not an agent orchestrator
+- Not an LLM judge for semantic correctness
+- Not a full codebase scanner on every request
+
+It is a git-time, PR-time enforcement system.
+It runs when code changes. It is deterministic
+where possible. It calls Tachyon only for fix
+recommendations, never for breaking change detection.
+
+=== AGENT TYPES TO SUPPORT ===
+
+All four must be supported. Detection is by
+static analysis only — no runtime execution.
+
+TYPE 1: LangGraph
+  Detection: any .py file containing StateGraph(
+  Extract: graph edges (node name → node name),
+  tool definitions passed to nodes,
+  TypedDict state class (input/output schema)
+
+TYPE 2: YAML/JSON config
+  Detection: file named agent.yaml, agent.json,
+  agent.yml OR any YAML/JSON file containing
+  top-level keys: [agent_id, tools] together
+  Extract: agent_id, tools[].name,
+  tools[].input_schema, tools[].output_schema,
+  system_prompt (hash only, never store raw),
+  upstream_agents: list[str]
+
+TYPE 3: Decorated Python
+  Detection: function or class decorated with
+  @agent, @register_agent, or @agent_tool
+  Extract: function name as agent_id,
+  parameter types as input_schema,
+  return type annotation as output_schema,
+  decorator arguments as metadata
+
+TYPE 4: FastAPI endpoint
+  Detection: @router.post or @app.post route
+  where handler body contains any of:
+  [tachyon, llm, langchain, langgraph,
+   TachyonClient, ChatAnthropic]
+  Extract: route path as agent_id,
+  Pydantic request model as input_schema,
+  Pydantic response model as output_schema
+
+=== FILE BUILD SEQUENCE ===
+
+Build in this exact order. Complete before proceeding.
+
+---
+
+FILE 1: codemind/agentguard/models.py
+
+All dataclasses. __post_init__ validation on all.
+
+ToolDefinition:
+  name: str
+  input_schema: dict    # {param_name: type_str}
+  output_schema: dict   # {field_name: type_str}
+  description: str
+
+AgentDefinition:
+  agent_id: str
+  repo_id: str
+  file_path: str
+  agent_type: Literal["langgraph","yaml","decorated",
+                       "fastapi"]
+  input_schema: dict
+  output_schema: dict
+  tools: list[ToolDefinition]
+  system_prompt_hash: str | None
+  upstream_agent_ids: list[str]
+  extracted_at: datetime
+  # upstream_agent_ids: agents this agent explicitly
+  # calls or depends on — extracted from code
+
+AgentEdge:
+  source_agent_id: str   # upstream (provider)
+  target_agent_id: str   # downstream (consumer)
+  dependency_type: Literal["tool_call","schema",
+                            "http_call","event"]
+  interface_ref: str     # tool name or field name
+  repo_id_source: str
+  repo_id_target: str
+  discovered_at: datetime
+
+ChangeType(Enum):
+  TOOL_REMOVED = "tool_removed"
+  TOOL_RENAMED = "tool_renamed"
+  TOOL_PARAM_REMOVED = "tool_param_removed"
+  TOOL_PARAM_RENAMED = "tool_param_renamed"
+  TOOL_PARAM_TYPE_CHANGED = "tool_param_type_changed"
+  OUTPUT_FIELD_REMOVED = "output_field_removed"
+  OUTPUT_FIELD_TYPE_CHANGED = "output_field_type_changed"
+  ROUTE_CHANGED = "route_changed"
+  PROMPT_HASH_CHANGED = "prompt_hash_changed"
+  TOOL_ADDED = "tool_added"           # additive/safe
+  PARAM_ADDED_OPTIONAL = "param_added_optional"  # safe
+
+Severity(Enum):
+  CRITICAL = "critical"   # breaking
+  WARNING = "warning"     # semantic/prompt
+  INFO = "info"           # additive/safe
+
+DetectedChange:
+  change_type: ChangeType
+  severity: Severity
+  description: str
+  old_value: str | None
+  new_value: str | None
+  affected_interface: str  # tool name or field
+
+AffectedAgent:
+  agent_id: str
+  repo_id: str
+  file_path: str
+  agent_type: str
+  dependency_type: str
+  interface_ref: str
+  breaking_changes: list[DetectedChange]
+  fix_recommendation: str  # populated by FixRecommender
+
+PRReport:
+  pr_url: str
+  pr_number: int
+  repo_id: str
+  changed_agent_id: str
+  status: Literal["blocked","warning","passed"]
+  detected_changes: list[DetectedChange]
+  affected_agents: list[AffectedAgent]
+  prompt_changed: bool
+  total_agents_scanned: int
+  latency_ms: float
+  report_markdown: str     # final GitHub comment body
+  github_check_conclusion: Literal["failure",
+                                    "neutral","success"]
+
+---
+
+FILE 2: codemind/agentguard/scanner.py
+
+Class: AgentScanner
+
+Extracts AgentDefinition from source files.
+Uses tree-sitter for Python AST. No LLM calls.
+No runtime execution of any code.
+
+Dependencies: tree-sitter, pyyaml, json, hashlib
+
+Methods:
+
+scan_file(
+  file_path: str,
+  file_content: str,
+  repo_id: str
+) -> list[AgentDefinition]
+  - Detects agent type from content
+  - Dispatches to correct extractor
+  - Returns empty list if no agent detected
+  - Never raises — logs warning and returns []
+    on parse error
+
+_extract_langgraph(
+  file_path: str,
+  content: str,
+  repo_id: str,
+  tree: Node  # tree-sitter
+) -> AgentDefinition | None
+  - Find StateGraph( instantiation
+  - Extract TypedDict class used as state
+    (find class inheriting TypedDict,
+     extract field names and type annotations)
+  - Extract .add_node() calls → node names
+  - Extract tool lists passed to nodes
+    (find ToolNode( or bind_tools( calls,
+     extract tool function names)
+  - agent_id = StateGraph variable name
+  - input_schema = TypedDict input fields
+  - output_schema = TypedDict output fields
+  - tools = extracted ToolDefinitions
+  - system_prompt_hash: find SystemMessage(
+    or system= kwarg, SHA-256 hash the string
+
+_extract_yaml(
+  file_path: str,
+  content: str,
+  repo_id: str
+) -> AgentDefinition | None
+  - Parse YAML/JSON safely
+  - If keys [agent_id, tools] present: extract
+  - tools: parse each tool's name,
+    input_schema dict, output_schema dict
+  - system_prompt: SHA-256 hash if present,
+    never store raw
+  - upstream_agent_ids: from upstream_agents
+    key if present
+  - If parse fails: return None, log warning
+
+_extract_decorated(
+  file_path: str,
+  content: str,
+  repo_id: str,
+  tree: Node
+) -> list[AgentDefinition]
+  - Find all function/class defs with decorator
+    matching @agent, @register_agent, @agent_tool
+  - For each: extract name, param names + type
+    annotations as input_schema,
+    return type annotation as output_schema
+  - Decorator arguments become metadata
+  - Returns list (multiple decorated agents
+    per file allowed)
+
+_extract_fastapi(
+  file_path: str,
+  content: str,
+  repo_id: str,
+  tree: Node
+) -> list[AgentDefinition]
+  - Find @router.post / @app.post decorators
+  - Check handler body for LLM indicators:
+    [tachyon, llm, langchain, langgraph,
+     TachyonClient, ChatAnthropic]
+  - If found: extract route path as agent_id
+  - Find Pydantic request model (first param
+    type annotation) → input_schema
+  - Find Pydantic response model (return type
+    or response_model= kwarg) → output_schema
+  - Returns list
+
+_hash_prompt(prompt: str) -> str
+  - SHA-256 of prompt.strip().lower()
+  - Never store raw prompt anywhere
+
+_type_annotation_to_str(node: Node) -> str
+  - Converts tree-sitter type annotation node
+    to canonical string
+  - Handles: str, int, float, bool, list[X],
+    dict[X,Y], Optional[X], X | None
+  - Unknown types → "unknown"
+
+---
+
+FILE 3: codemind/agentguard/agent_graph.py
+
+Class: AgentGraph
+
+Directed dependency graph of all agents in org.
+Backed by MongoDB collection "agent_graph_nodes"
+and "agent_graph_edges".
+Loaded into memory on startup as NetworkX DiGraph.
+
+Methods:
+
+async load(db: AsyncIOMotorDatabase) -> None
+  - Load all nodes and edges from MongoDB
+  - Build NetworkX DiGraph in memory
+  - Called once at app startup
+
+async upsert_agent(
+  agent: AgentDefinition,
+  db: AsyncIOMotorDatabase
+) -> None
+  - Upsert to agent_graph_nodes keyed by agent_id
+  - Update in-memory DiGraph node
+  - Persist to MongoDB
+
+async upsert_edge(
+  edge: AgentEdge,
+  db: AsyncIOMotorDatabase
+) -> None
+  - Upsert to agent_graph_edges keyed by
+    (source_agent_id, target_agent_id, interface_ref)
+  - Update in-memory DiGraph edge
+  - Persist to MongoDB
+
+get_downstream_agents(
+  agent_id: str
+) -> list[AgentDefinition]
+  - Return all agents that depend on agent_id
+  - Traverse DiGraph successors (depth 1 only)
+  - Depth 1 is intentional: fixes must be made
+    in direct consumers first
+  - Returns [] if agent_id not in graph
+
+get_agent(agent_id: str) -> AgentDefinition | None
+  - Return AgentDefinition from in-memory graph
+  - Returns None if not found
+
+get_stored_definition(
+  agent_id: str,
+  db: AsyncIOMotorDatabase
+) -> AgentDefinition | None
+  - Load from MongoDB (the pre-PR version)
+  - Used by BreakingChangeDetector to compare
+    against new version extracted from PR diff
+
+async remove_agent(
+  agent_id: str,
+  db: AsyncIOMotorDatabase
+) -> None
+  - Remove node and all its edges from graph
+    and MongoDB
+  - Called when agent file is deleted in PR
+
+---
+
+FILE 4: codemind/agentguard/detector.py
+
+Class: BreakingChangeDetector
+
+Compares old AgentDefinition vs new AgentDefinition.
+Purely deterministic. Zero LLM calls.
+
+Methods:
+
+detect(
+  old: AgentDefinition,
+  new: AgentDefinition
+) -> list[DetectedChange]
+  - Run all sub-detectors
+  - Return combined list, empty if no changes
+  - CRITICAL severity → breaking
+  - WARNING severity → prompt change
+  - INFO severity → additive/safe
+
+_detect_tool_changes(
+  old_tools: list[ToolDefinition],
+  new_tools: list[ToolDefinition]
+) -> list[DetectedChange]
+  Build old_map = {tool.name: tool}
+  Build new_map = {tool.name: tool}
+
+  For each tool in old_map:
+    If tool.name not in new_map:
+      → TOOL_REMOVED, CRITICAL
+    Else:
+      For each param in old input_schema:
+        If param not in new input_schema:
+          → TOOL_PARAM_REMOVED, CRITICAL
+        Elif old type != new type:
+          → TOOL_PARAM_TYPE_CHANGED, CRITICAL
+        Elif param in new but key differs:
+          → handled by removed+added pair
+      For each param in new input_schema:
+        If param not in old input_schema:
+          → PARAM_ADDED_OPTIONAL, INFO
+
+  For each tool in new_map not in old_map:
+    → TOOL_ADDED, INFO
+
+_detect_output_changes(
+  old_schema: dict,
+  new_schema: dict
+) -> list[DetectedChange]
+  For each field in old_schema:
+    If field not in new_schema:
+      → OUTPUT_FIELD_REMOVED, CRITICAL
+    Elif old type != new type:
+      → OUTPUT_FIELD_TYPE_CHANGED, CRITICAL
+  For each field in new_schema not in old_schema:
+    → INFO (additive)
+
+_detect_prompt_change(
+  old_hash: str | None,
+  new_hash: str | None
+) -> DetectedChange | None
+  If both None: return None
+  If old_hash != new_hash:
+    → PROMPT_HASH_CHANGED, WARNING
+    description: "System prompt modified.
+    Semantic impact cannot be verified
+    automatically. Manual review required."
+
+_detect_route_change(
+  old: AgentDefinition,
+  new: AgentDefinition
+) -> DetectedChange | None
+  Only for fastapi type.
+  If old.agent_id != new.agent_id:
+    (agent_id is route path for fastapi)
+    → ROUTE_CHANGED, CRITICAL
+
+is_blocking(changes: list[DetectedChange]) -> bool
+  Returns True if any change has
+  severity == CRITICAL
+  Returns False if only WARNING or INFO
+
+---
+
+FILE 5: codemind/agentguard/recommender.py
+
+Class: FixRecommender
+
+Given a breaking change and the affected agent's
+definition, generates a specific fix recommendation.
+Calls Tachyon LLM. Returns a concrete string — not
+generic advice.
+
+Context injected into Tachyon is surgical:
+- The specific DetectedChange only
+- The affected agent's file_path, agent_type,
+  relevant schema section only
+- The changed agent's relevant tool/output section
+- NOT the full graph, NOT full file contents
+
+Methods:
+
+async recommend(
+  change: DetectedChange,
+  changed_agent: AgentDefinition,
+  affected_agent: AgentDefinition,
+  tachyon: TachyonClient
+) -> str
+  - Build surgical context (see below)
+  - Call tachyon.complete() with system prompt
+    and single user message
+  - Return recommendation string
+  - On TachyonError: return fallback string
+    (see _fallback_recommendation)
+  - max_tokens: 300 (fix recommendations
+    must be concise)
+
+_build_context(
+  change: DetectedChange,
+  changed_agent: AgentDefinition,
+  affected_agent: AgentDefinition
+) -> str
+  Format:
+  CHANGE: {change.change_type.value}
+  CHANGED AGENT: {changed_agent.agent_id}
+    ({changed_agent.agent_type})
+    file: {changed_agent.file_path}
+    affected interface: {change.affected_interface}
+    old value: {change.old_value}
+    new value: {change.new_value}
+
+  AFFECTED AGENT: {affected_agent.agent_id}
+    ({affected_agent.agent_type})
+    file: {affected_agent.file_path}
+    relevant schema:
+      {_relevant_schema_section(
+        affected_agent, change.affected_interface)}
+
+_relevant_schema_section(
+  agent: AgentDefinition,
+  interface_ref: str
+) -> str
+  - For langgraph/decorated: find the specific
+    tool or field in agent's tools/output_schema
+    that references interface_ref
+  - For yaml: find the tool block by name
+  - For fastapi: find the relevant Pydantic field
+  - Return only that section as string
+  - Never return full schema
+
+SYSTEM PROMPT for Tachyon call:
+"You are a code fix advisor. A developer changed
+an AI agent and broke a downstream agent. Given
+the exact change and the affected agent's schema,
+provide ONE specific code fix. Be precise: name
+the file, line context, and exact change needed.
+Maximum 3 sentences. No preamble."
+
+_fallback_recommendation(
+  change: DetectedChange,
+  affected_agent: AgentDefinition
+) -> str
+  Returns a deterministic fallback based on
+  change_type — no LLM required:
+
+  TOOL_PARAM_RENAMED:
+    f"In {affected_agent.file_path}, rename
+    '{change.old_value}' to '{change.new_value}'
+    in all references to tool
+    '{change.affected_interface}'."
+
+  TOOL_PARAM_REMOVED:
+    f"In {affected_agent.file_path}, remove
+    '{change.old_value}' from tool call arguments
+    for '{change.affected_interface}'."
+
+  OUTPUT_FIELD_REMOVED:
+    f"In {affected_agent.file_path}, remove
+    all references to output field
+    '{change.old_value}'."
+
+  OUTPUT_FIELD_TYPE_CHANGED:
+    f"In {affected_agent.file_path}, update
+    type handling for '{change.affected_interface}'
+    from {change.old_value} to {change.new_value}."
+
+  TOOL_REMOVED:
+    f"In {affected_agent.file_path}, remove all
+    calls to tool '{change.affected_interface}'
+    or replace with an alternative."
+
+  ROUTE_CHANGED:
+    f"In {affected_agent.file_path}, update
+    HTTP call target from '{change.old_value}'
+    to '{change.new_value}'."
+
+  default:
+    f"In {affected_agent.file_path}, review
+    usage of '{change.affected_interface}'
+    — definition changed in
+    {changed_agent.agent_id}."
+
+---
+
+FILE 6: codemind/agentguard/reporter.py
+
+Class: PRReporter
+
+Assembles the PRReport and formats the GitHub
+PR comment markdown. No LLM calls.
+
+Methods:
+
+build_report(
+  pr_url: str,
+  pr_number: int,
+  repo_id: str,
+  changed_agent: AgentDefinition,
+  detected_changes: list[DetectedChange],
+  affected_agents: list[AffectedAgent],
+  total_scanned: int,
+  latency_ms: float
+) -> PRReport
+  - status:
+    "blocked" if any CRITICAL change
+    "warning" if only WARNING changes
+    "passed" if only INFO or no changes
+  - github_check_conclusion:
+    "failure" if blocked
+    "neutral" if warning
+    "success" if passed
+  - prompt_changed: True if any
+    PROMPT_HASH_CHANGED in detected_changes
+  - report_markdown: call _format_markdown()
+  - Return PRReport
+
+_format_markdown(
+  report: PRReport
+) -> str
+  Format exactly as:
+
+  ## AgentGuard — Impact Report\n
+  **Status:** BLOCKED ❌ | WARNING ⚠️ | PASSED ✅
+  **Changed agent:** `{agent_id}` ({file_path})\n
+  (Only show sections that have content)
+
+  ### Breaking Changes Detected
+  (table: Change | Type | Severity)
+  (omit if no breaking changes)
+
+  ### Prompt Change Warning
+  (paragraph, omit if no prompt change)
+
+  ### Downstream Agents Affected
+  Numbered list. For each AffectedAgent:
+  **`{agent_id}`** ({file_path})
+  - Depends on: {interface_ref}
+  - Breaks because: {change description}
+  - **Fix:** {fix_recommendation}
+  (omit section if no affected agents)
+
+  ### No Impact Detected
+  (show only if status == passed)
+
+  ---
+  *AgentGuard · {total_scanned} agents scanned
+  · {n_critical} breaking · {n_warning} warnings
+  · {latency_ms:.0f}ms*
+
+---
+
+FILE 7: codemind/agentguard/pr_enforcer.py
+
+Class: PREnforcer
+
+Entry point. Called by GitHub webhook handler.
+Orchestrates the full pipeline.
+
+Dependencies: all above classes, TachyonClient,
+AgentGraph, GitHub API (httpx)
+
+Constructor:
+  agent_graph: AgentGraph
+  scanner: AgentScanner
+  detector: BreakingChangeDetector
+  recommender: FixRecommender
+  reporter: PRReporter
+  tachyon: TachyonClient
+  db: AsyncIOMotorDatabase
+  github_token: str  # from GITHUB_TOKEN env var
+
+async enforce(pr_payload: dict) -> PRReport
+  pr_payload is the raw GitHub PR webhook body.
+
+  Step 1 — Extract changed files
+    GET /repos/{owner}/{repo}/pulls/{number}/files
+    via GitHub API
+    Filter to files that match agent patterns:
+      *.py containing StateGraph or @agent
+      agent.yaml, agent.json, agent.yml
+      *.py containing @router.post with LLM body
+
+  Step 2 — Fetch file contents
+    For each changed file:
+      GET raw content from PR head branch
+      GET raw content from PR base branch
+      (base = pre-PR version for comparison)
+
+  Step 3 — Scan both versions
+    For each changed file:
+      new_defs = scanner.scan_file(
+        file_path, new_content, repo_id)
+      old_defs = scanner.scan_file(
+        file_path, old_content, repo_id)
+    Match by agent_id within same file
+
+  Step 4 — Detect changes
+    For each (old_def, new_def) pair:
+      changes = detector.detect(old_def, new_def)
+
+  Step 5 — Find affected downstream agents
+    For each changed agent with CRITICAL changes:
+      downstream = agent_graph.get_downstream_agents(
+        agent_id)
+    For each downstream agent:
+      relevant_changes = filter changes that
+        affect interfaces this agent depends on
+        (match via edge.interface_ref)
+
+  Step 6 — Get fix recommendations
+    For each affected agent + relevant change:
+      fix = await recommender.recommend(
+        change, changed_agent,
+        affected_agent, tachyon)
+    Build AffectedAgent with fix populated
+
+  Step 7 — Build report
+    report = reporter.build_report(...)
+
+  Step 8 — Post GitHub PR comment
+    POST /repos/{owner}/{repo}/issues/{number}
+         /comments
+    Body: report.report_markdown
+    Retry: exponential backoff, max 3 attempts
+    On final failure: log error, do not raise
+      (report is already built, comment failure
+       should not break the pipeline)
+
+  Step 9 — Set GitHub Check status
+    POST /repos/{owner}/{repo}/statuses/{sha}
+    state: "failure" | "neutral" | "success"
+    context: "AgentGuard"
+    description: summary line (max 140 chars)
+
+  Return report
+
+_filter_agent_files(
+  files: list[dict]
+) -> list[dict]
+  - files is GitHub API file objects
+    [{filename, status, additions, deletions}]
+  - Return files where filename matches:
+    *.py AND (StateGraph OR @agent OR
+    @register_agent OR tachyon OR langchain)
+    OR filename in [agent.yaml, agent.json,
+    agent.yml]
+    OR filename matches **/agent.yaml pattern
+  - status filter: only "modified" or "added"
+    (deleted files handled separately)
+
+async _handle_deleted_files(
+  deleted_files: list[str],
+  repo_id: str
+) -> None
+  - For each deleted file: scan old content
+    for agent definitions
+  - For each found agent_id:
+    downstream = agent_graph.get_downstream_agents
+    If downstream not empty:
+      Add to report as TOOL_REMOVED CRITICAL
+    await agent_graph.remove_agent(agent_id, db)
+
+---
+
+FILE 8: codemind/agentguard/indexer_hook.py
+
+Function:
+async index_repo_agents(
+  repo_id: str,
+  repo_path: str,
+  agent_graph: AgentGraph,
+  db: AsyncIOMotorDatabase
+) -> int
+  Called by Codemind IndexerWorker after
+  each repo index cycle completes.
+  NOT called on every PR — only on full index.
+
+  - Walk repo_path for all files matching
+    agent file patterns (same as _filter_agent_files)
+  - For each file: scanner.scan_file()
+  - For each AgentDefinition found:
+    - Upsert into AgentGraph
+    - Extract edges from upstream_agent_ids:
+      upsert AgentEdge for each
+  - Return count of agents indexed
+  - Fully async, non-blocking
+
+---
+
+FILE 9: codemind/agentguard/api.py
+
+FastAPI router. Prefix: /agentguard
+Mounts onto existing Codemind FastAPI app.
+
+POST /agentguard/webhook/pr
+  Receives GitHub PR webhook
+  Validates X-Hub-Signature-256 header
+    using GITHUB_WEBHOOK_SECRET env var
+  Calls pr_enforcer.enforce(payload)
+  Returns PRReport as JSON
+  Runs async — returns 202 immediately,
+  posts result to PR as background task
+
+GET /agentguard/agents
+  Returns all AgentDefinitions in AgentGraph
+  Query params: repo_id (optional filter)
+
+GET /agentguard/agents/{agent_id}
+  Returns single AgentDefinition
+
+GET /agentguard/agents/{agent_id}/downstream
+  Returns list of downstream AgentDefinitions
+
+GET /agentguard/graph
+  Returns full graph as {nodes, edges} JSON
+  (node count + edge count only if >500 agents)
+
+POST /agentguard/scan
+  Body: {repo_id, file_path, file_content}
+  Runs scanner.scan_file() and returns findings
+  Useful for testing scanner against a file
+
+---
+
+FILE 10: tests/agentguard/test_scanner.py
+
+pytest only. No network. No LLM calls.
+No MongoDB (use in-memory dicts).
+
+Test cases — all with literal string fixtures:
+
+test_detect_langgraph_agent:
+  content = """
+  from langgraph.graph import StateGraph
+  from typing import TypedDict
+
+  class OrderState(TypedDict):
+      order_id: str
+      amount: float
+
+  graph = StateGraph(OrderState)
+  """
+  result = scanner.scan_file("agent.py",
+    content, "repo1")
+  assert len(result) == 1
+  assert result[0].agent_type == "langgraph"
+  assert result[0].input_schema["order_id"] == "str"
+  assert result[0].input_schema["amount"] == "float"
+
+test_detect_yaml_agent:
+  content = """
+  agent_id: payment-agent
+  tools:
+    - name: process_payment
+      input_schema:
+        amount: float
+        currency: str
+      output_schema:
+        transaction_id: str
+  system_prompt: "You are a payment processor"
+  """
+  result = scanner.scan_file("agent.yaml",
+    content, "repo2")
+  assert len(result) == 1
+  assert result[0].agent_id == "payment-agent"
+  assert len(result[0].tools) == 1
+  assert result[0].system_prompt_hash is not None
+  # hash must not equal raw prompt
+  assert result[0].system_prompt_hash != \
+    "You are a payment processor"
+
+test_detect_decorated_agent:
+  content = """
+  @agent
+  def order_validator(
+      order_id: str,
+      amount: float
+  ) -> dict:
+      pass
+  """
+  result = scanner.scan_file("validator.py",
+    content, "repo1")
+  assert len(result) == 1
+  assert result[0].agent_type == "decorated"
+  assert result[0].input_schema["order_id"] == "str"
+
+test_detect_fastapi_agent:
+  content = """
+  from fastapi import APIRouter
+  router = APIRouter()
+
+  @router.post("/process")
+  async def process(req: OrderRequest) -> OrderResponse:
+      result = tachyon.complete(...)
+      return result
+  """
+  result = scanner.scan_file("routes.py",
+    content, "repo3")
+  assert len(result) == 1
+  assert result[0].agent_type == "fastapi"
+  assert result[0].agent_id == "/process"
+
+test_no_false_positive:
+  content = """
+  def regular_function(x: int) -> str:
+      return str(x)
+  """
+  result = scanner.scan_file("utils.py",
+    content, "repo1")
+  assert result == []
+
+---
+
+FILE 11: tests/agentguard/test_detector.py
+
+pytest only. No network. No LLM.
+
+Fixtures: build AgentDefinition and
+ToolDefinition directly as dataclasses.
+
+test_tool_param_renamed_is_critical:
+  old tool: validate_order(amount: float)
+  new tool: validate_order(total_amount: float)
+  changes = detector.detect(old_def, new_def)
+  assert any(c.change_type ==
+    ChangeType.TOOL_PARAM_RENAMED for c in changes)
+  assert any(c.severity == Severity.CRITICAL
+    for c in changes)
+  assert detector.is_blocking(changes) == True
+
+test_tool_removed_is_critical:
+  old has tool "validate_order"
+  new has no tools
+  changes = detector.detect(old_def, new_def)
+  assert any(c.change_type ==
+    ChangeType.TOOL_REMOVED for c in changes)
+  assert detector.is_blocking(changes) == True
+
+test_output_field_removed_is_critical:
+  old output_schema: {order_id: str, status: str}
+  new output_schema: {order_id: str}
+  changes = detector.detect(old_def, new_def)
+  assert any(c.change_type ==
+    ChangeType.OUTPUT_FIELD_REMOVED
+    for c in changes)
+
+test_optional_param_added_is_not_blocking:
+  old tool: process(amount: float)
+  new tool: process(amount: float, note: str)
+  changes = detector.detect(old_def, new_def)
+  assert detector.is_blocking(changes) == False
+  assert any(c.severity == Severity.INFO
+    for c in changes)
+
+test_prompt_change_is_warning_not_blocking:
+  old: system_prompt_hash = "abc123"
+  new: system_prompt_hash = "def456"
+  changes = detector.detect(old_def, new_def)
+  assert any(c.change_type ==
+    ChangeType.PROMPT_HASH_CHANGED
+    for c in changes)
+  assert detector.is_blocking(changes) == False
+
+test_no_change_returns_empty:
+  old_def == new_def (same content)
+  changes = detector.detect(old_def, new_def)
+  assert changes == []
+
+---
+
+=== MONGODB COLLECTIONS ===
+
+agent_graph_nodes:
+  _id: agent_id
+  + all AgentDefinition fields as dict
+  index: repo_id
+
+agent_graph_edges:
+  _id: {source}:{target}:{interface_ref}
+  + all AgentEdge fields as dict
+  index: source_agent_id, target_agent_id
+
+=== ENVIRONMENT VARIABLES ===
+
+TACHYON_URL           LLM endpoint
+TACHYON_API_KEY       Auth key
+TACHYON_MODEL         Model name
+GITHUB_TOKEN          For PR comments + check status
+GITHUB_WEBHOOK_SECRET For webhook signature validation
+MONGO_URI             MongoDB connection string
+
+=== INTEGRATION INTO CODEMIND ===
+
+1. app startup:
+   await agent_graph.load(db)
+
+2. IndexerWorker completion hook:
+   await index_repo_agents(repo_id, path,
+     agent_graph, db)
+
+3. FastAPI app:
+   app.include_router(agentguard_router)
+
+4. GitHub webhook handler:
+   Route PR events to POST /agentguard/webhook/pr
+
+=== CONSTRAINTS ===
+
+- Python, 4-space indent
+- All MongoDB ops via motor (async)
+- tree-sitter for all Python AST parsing
+- Zero LLM calls in scanner or detector
+- Tachyon called only in recommender,
+  max_tokens=300
+- Fallback recommendation if Tachyon fails —
+  never return empty string to developer
+- GitHub API: exponential backoff, max 3 retries
+- Webhook signature validated on every request
+- System prompt never stored raw — hash only
+- scan_file never raises — log and return []
+- is_blocking: CRITICAL only, never WARNING
+- PRReport always populated even if Tachyon fails
+- Build FILE 1 first, confirm it compiles,
+  then proceed in sequence
