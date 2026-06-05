@@ -1,0 +1,122 @@
+## Goal
+Build a desktop automation agent that uses Windows-MCP (pip package: windows-mcp,
+GitHub: CursorTouch/Windows-MCP) to control the Microsoft Teams desktop app
+(Office 365) from within VS Code Copilot agent mode. The agent must be able to:
+  1. Launch or focus the Teams desktop app
+  2. Navigate to a specific channel or chat
+  3. Read messages visible on screen
+  4. Type and send a message
+  5. Take a screenshot and return it as confirmation
+
+---
+
+## Environment assumptions
+- OS: Windows 10 or 11
+- Python: 3.13+
+- uv is installed (preferred) or pip fallback is acceptable
+- VS Code 1.99+ with GitHub Copilot extension and agent mode enabled
+- Microsoft Teams desktop app is already installed and the user is signed in
+- No changes to firewall/antivirus are expected — all communication is local stdio
+
+---
+
+## What to build
+
+### 1. MCP server config: .vscode/mcp.json
+Create this file in the workspace root. Use the correct VS Code key ("servers",
+NOT "mcpServers" — those are for Cursor/Claude Desktop). Use uvx to run
+windows-mcp so no global pip install is required:
+
+{
+  "servers": {
+    "windows-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["windows-mcp"]
+    }
+  }
+}
+
+If uv is not available on this machine, provide a pip fallback variant using:
+"command": "python", "args": ["-m", "windows_mcp"]
+after: pip install windows-mcp
+
+Do NOT invent any other config keys. Only use what the windows-mcp README documents.
+
+---
+
+### 2. Agent instruction file: .github/copilot-instructions.md
+This file tells Copilot how to behave when the windows-mcp tools are active.
+Write it with these rules:
+
+- Always call Screenshot first to get visual context before taking any action
+- Use Snapshot (use_vision=True) when you need to identify interactive element IDs
+- Use App tool to launch or switch to Teams — do not hardcode coordinates to open it
+- Use WaitFor to confirm Teams has loaded before proceeding (wait for window title
+  containing "Microsoft Teams")
+- Use Click with element IDs from Snapshot output — not hardcoded pixel coordinates
+- Use Type to enter text into the message box
+- Use Shortcut("Enter") to send the message
+- After sending, take a Screenshot to confirm
+- Never guess coordinates. If you cannot identify an element from Snapshot, say so
+  and ask the user for clarification.
+- Teams may open in browser fallback mode (Edge/Chrome). If that happens, use
+  Snapshot with use_dom=True to read the web DOM instead of the accessibility tree.
+
+---
+
+### 3. Example task script: scripts/teams_send_message.md
+Write a plain-English step-by-step script (not code — this is a Copilot prompt
+chain) that demonstrates:
+  - Opening Teams via the App tool
+  - Navigating to a named channel (parameterised as CHANNEL_NAME)
+  - Reading the last 3 visible messages from the chat pane
+  - Composing and sending a message (parameterised as MESSAGE_TEXT)
+  - Taking a final screenshot saved to screenshots/sent_confirmation.png
+
+Use only tools that windows-mcp actually exposes:
+  Screenshot, Snapshot, Click, Type, Shortcut, App, WaitFor, Scroll, Shell
+Do not invent tool names.
+
+---
+
+### 4. README.md
+Write a setup section covering:
+  a. Installing uv if not present (winget install --id=astral-sh.uv)
+  b. Installing windows-mcp (uvx windows-mcp — no separate pip install needed
+     with uvx, it auto-installs on first run)
+  c. Opening .vscode/mcp.json in VS Code and clicking the Start button that
+     appears at the top of the file
+  d. Switching Copilot Chat to Agent mode (the dropdown in the chat panel)
+  e. Verifying the server is running: Ctrl+Shift+P → MCP: List Servers
+  f. Known limitations:
+     - windows-mcp cannot interact with UAC dialogs or any window running as
+       Administrator (Windows UIPI security boundary — not a bug)
+     - Teams must already be signed in; this agent does not handle auth flows
+     - Headless/SSH sessions will fail — a real GUI session is required
+     - If Teams opens in browser mode instead of the desktop app, DOM mode
+       (use_dom=True in Snapshot) is needed
+
+---
+
+## Constraints — read carefully before generating any file
+- Do not use mcpServers as the root key in any VS Code config file
+- Do not reference @anthropic-ai/mcp-server-computer-use — that package is not
+  verified to exist on PyPI and was not requested
+- Do not reference windows-desktop-control-mcp — that is a different, unverified
+  package name; use windows-mcp (CursorTouch/Windows-MCP) only
+- Do not hardcode pixel coordinates anywhere — use element IDs from Snapshot
+- Do not add any OAuth, Graph API, or REST API calls — this is pure UI automation
+- Do not create placeholder or stub functions — all content must be complete
+- Python indentation: 4 spaces. No complex abstractions.
+- If a step is genuinely uncertain (e.g., exact Teams UI element names may vary
+  by version), say so explicitly rather than guessing
+
+---
+
+## Output order
+Generate files in this order:
+1. .vscode/mcp.json
+2. .github/copilot-instructions.md
+3. scripts/teams_send_message.md
+4. README.md
