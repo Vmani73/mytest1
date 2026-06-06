@@ -1,0 +1,397 @@
+-----
+
+name: spring-boot-zero-day-remediation
+version: “1.0.0”
+description: >
+Single source of truth playbook for remediating Spring Boot Zero Day events
+across PAA applications. Covers Black Duck scan interpretation, dependency
+version resolution, pom.xml and build.gradle upgrades, OSS validation
+preparation, and remediation reporting. Targets Spring Boot 2.x, 3.x, and 4.x
+upgrade paths with version-specific rules. Never modifies business logic,
+application behavior, test expectations, or unrelated dependencies.
+triggers:
+
+- “spring boot zero day”
+- “spring zero day”
+- “spring boot upgrade”
+- “spring boot remediation”
+- “spring framework upgrade”
+- “black duck spring”
+- “oss validation spring”
+- “spring boot due 6/9”
+- “spring cve remediation”
+- “spring boot 4.x upgrade”
+- “spring boot 3.x upgrade”
+- “spring framework 7.x”
+- “spring framework 6.x”
+- “orchestra spring boot”
+- “spring boot zero day event”
+
+-----
+
+# Spring Boot Zero Day Remediation Playbook
+
+## 1. Purpose
+
+Remediate all Spring Boot and Spring Framework components flagged in a Zero Day
+event by upgrading to the approved version, validating via Black Duck scan, and
+completing the OSS validation process. Scope is strictly limited to Spring
+dependency version changes. No other code, logic, configuration, or dependency
+is touched unless it directly blocks the Spring upgrade and the human explicitly
+approves it.
+
+> **Principle**: Make only the version changes that Black Duck and the approved
+> Spring Framework sheet require. Never change application behavior, public
+> contracts, security configuration, logging, telemetry, business logic, or test
+> expectations unless the change is **required** for Spring remediation **and**
+> the human explicitly approves it.
+
+-----
+
+## 2. Scope
+
+This playbook applies to Java/Kotlin applications that contain one or more of:
+
+- `spring-boot-starter-*` dependencies in any version
+- `spring-framework` BOM or direct `org.springframework.*` dependencies
+- `spring-security-*` dependencies
+- `spring-cloud-*` dependencies
+- `spring-data-*` dependencies
+- Orchestra Spring Boot wrapper libraries (`orchestra-spring-boot-*`)
+
+**In scope:**
+
+- `pom.xml`, `build.gradle`, `build.gradle.kts`, `gradle.properties`,
+  `gradle/libs.versions.toml` — version changes only
+- Spring BOM import version in dependency management blocks
+- Orchestra wrapper version (`orchestra-spring-boot-starter`)
+- Parent POM version when `spring-boot-starter-parent` is the parent
+
+**Out of scope — never touch without explicit human approval:**
+
+- Application source code (`.java`, `.kt`)
+- Test source code
+- `application.yml` / `application.properties` (unless a property key was
+  removed in the target Spring version and migration is required — stop and ask)
+- Non-Spring dependencies
+- Dockerfile, CI/CD pipeline, Kubernetes manifests
+- Database migration scripts
+- Architecture changes of any kind
+
+> If a required file, import path, current version, or approved target version
+> is unclear — stop and ask a precise question before making any change.
+
+-----
+
+## 3. Required Repository Discovery
+
+Before editing any file, inspect and identify:
+
+- All build files: `pom.xml` (root and modules), `build.gradle`,
+  `build.gradle.kts`, `gradle.properties`, `gradle/libs.versions.toml`,
+  `settings.gradle`, `settings.gradle.kts`
+- The build system in use: Maven, Gradle, or both
+- Whether the project is single-module or multi-module
+- Current Spring Boot version (from `<parent>`, `spring-boot-starter-parent`,
+  BOM import, or `springBootVersion` property)
+- Current Spring Framework version if overridden separately
+- Current Orchestra Spring Boot wrapper version if present
+- All `spring-*` and `org.springframework.*` dependencies and their versions,
+  including transitives that are explicitly overridden
+- Whether versions are declared inline, in a `<properties>` block, in a version
+  catalog, or inherited from a BOM
+- Black Duck scan report if provided — extract the component name, current
+  version, and flagged CVEs for each Spring component
+
+-----
+
+## 4. Version Resolution Rules
+
+Apply exactly one upgrade path based on the current Spring Boot major version.
+Do not mix paths. Do not skip a major version without human approval.
+
+### 4.1 Spring Boot 4.x / Spring Framework 7.x
+
+- Use the **single approved version** listed on the internal Spring Framework
+  sheet for this event
+- Do not pick a different minor or patch version
+- Orchestra wrapper: upgrade to `4.1.5` unless the approved sheet specifies
+  otherwise
+- Java requirement: Java 17 or higher (do not change Java version — if current
+  Java is below 17, stop and report a blocker)
+- Tomcat requirement: Tomcat 11.x (do not change Tomcat version — if current
+  Tomcat is below 11, stop and report a blocker)
+
+### 4.2 Spring Boot 3.x / Spring Framework 6.x
+
+- Multiple approved versions may be listed on the internal Spring Framework
+  sheet
+- Upgrade to the **latest available approved minor version** for the 3.x line
+- Do not upgrade from 3.x to 4.x in this playbook — that requires a separate
+  human-approved migration
+- Orchestra wrapper: upgrade to `3.23.8` unless the approved sheet specifies
+  otherwise
+- Java requirement: Java 17 or higher (do not change Java version — if current
+  Java is below 17, stop and report a blocker)
+- Tomcat requirement: Tomcat 10.x (do not change Tomcat version — if current
+  Tomcat is below 10, stop and report a blocker)
+
+### 4.3 Spring Boot 2.x / Spring Framework 5.x
+
+- **No major version upgrade is required within this 72-hour event window**
+- Apply only the approved patch version for the 2.x line if one is listed
+- If no 2.x patch is listed on the approved sheet, make no version change
+- Post-event action required: a plan to migrate to Spring Boot 3.x or 4.x must
+  be developed — document this in the remediation report but do not execute it
+- Spring Boot 2.x is approaching end-of-life risk thresholds — record this as
+  a risk item in the report
+
+### 4.4 Java and Tomcat Upgrades
+
+- For this event, Java and Tomcat upgrades are **not required** unless the
+  current versions are significantly outdated and directly block the Spring
+  Boot upgrade
+- If Java or Tomcat must be upgraded to unblock Spring, stop and ask the human
+  for approval before proceeding
+
+-----
+
+## 5. Build File Modification Rules
+
+### 5.1 Maven (`pom.xml`)
+
+**Case A — `spring-boot-starter-parent` as parent:**
+
+```xml
+<!-- Change only the version value. Touch nothing else. -->
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>APPROVED_VERSION</version>
+  <relativePath/>
+</parent>
+```
+
+**Case B — Spring Boot BOM imported in `<dependencyManagement>`:**
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>APPROVED_VERSION</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+**Case C — Version declared in `<properties>`:**
+
+```xml
+<properties>
+  <spring-boot.version>APPROVED_VERSION</spring-boot.version>
+  <!-- or -->
+  <spring.boot.version>APPROVED_VERSION</spring.boot.version>
+</properties>
+```
+
+**Case D — Orchestra wrapper present:**
+
+```xml
+<dependency>
+  <groupId>com.wellsfargo.orchestra</groupId>
+  <artifactId>orchestra-spring-boot-starter</artifactId>
+  <version>APPROVED_ORCHESTRA_VERSION</version>
+</dependency>
+```
+
+**Rules:**
+
+- Change only the version string. Do not reformat, reorder, or add/remove any
+  other XML elements.
+- If Spring Framework version is overridden separately via
+  `<spring-framework.version>` property, update it to match the Spring
+  Framework version paired with the approved Spring Boot version.
+- If multiple `pom.xml` files exist (multi-module), update the root POM version
+  declaration. Do not update child POMs unless they override the Spring version
+  independently — if they do, update each override individually.
+- Do not add a BOM if one does not exist. Do not restructure dependency
+  management.
+
+### 5.2 Gradle (`build.gradle` / `build.gradle.kts`)
+
+**Case A — Plugin version:**
+
+```groovy
+// build.gradle
+plugins {
+  id 'org.springframework.boot' version 'APPROVED_VERSION'
+}
+
+// build.gradle.kts
+plugins {
+  id("org.springframework.boot") version "APPROVED_VERSION"
+}
+```
+
+**Case B — Version in `gradle.properties`:**
+
+```properties
+springBootVersion=APPROVED_VERSION
+```
+
+**Case C — Version catalog (`gradle/libs.versions.toml`):**
+
+```toml
+[versions]
+spring-boot = "APPROVED_VERSION"
+```
+
+**Rules:**
+
+- Change only the version string. Do not reformat or restructure the build file.
+- If `ext` block or `buildscript` block declares the Spring Boot version,
+  update that property.
+- For multi-project Gradle builds, update only the root version declaration
+  unless subprojects override it independently.
+
+-----
+
+## 6. Black Duck Scan Interpretation
+
+If a Black Duck scan report is provided:
+
+1. Extract each flagged component — name, current version, CVE IDs
+1. For each flagged Spring component, confirm it is covered by the Spring Boot
+   BOM at the approved version
+1. If a flagged component is NOT managed by the Spring Boot BOM (e.g., a
+   standalone `spring-security-*` or `spring-cloud-*` dependency with an
+   explicit version override), identify the correct approved version from the
+   Spring Framework sheet and update the explicit override
+1. Do not remove explicit version overrides unless the BOM at the approved
+   version already manages that component to an equal or higher version
+1. Record each CVE, the component, the old version, and the new version in the
+   remediation report
+
+-----
+
+## 7. Multi-Module Project Rules
+
+- Identify the version inheritance chain before making any change
+- Update only the authoritative version declaration (root BOM import, root
+  parent, or root properties block)
+- If a child module declares a Spring version override that conflicts with the
+  root upgrade, flag it explicitly — do not silently remove it without human
+  confirmation
+- After updating, verify that no child module pins a Spring component to an
+  older version via its own `<dependencyManagement>` or `ext` block
+
+-----
+
+## 8. Validation Steps
+
+After making version changes, perform these checks without running the build
+unless the human asks:
+
+1. Confirm the version string in every changed file matches the approved version
+   exactly — no snapshot, no RC, no beta suffix
+1. Confirm no other Spring component versions remain pinned to a version older
+   than the BOM-managed version at the approved Spring Boot release
+1. Confirm the Orchestra wrapper version is updated if present
+1. Confirm no non-Spring dependencies were modified
+1. If the human runs `mvn dependency:tree` or `./gradlew dependencies` and
+   shares the output, scan it for any remaining `org.springframework.*` or
+   `org.springframework.boot.*` component at a version older than what the
+   approved BOM manages
+
+-----
+
+## 9. Remediation Report Output
+
+Produce a `remediation-report.md` file at the repository root with this exact
+structure:
+
+```markdown
+# Spring Boot Zero Day Remediation Report
+
+**Application:** <app name>
+**Event:** Spring Boot Zero Day — Due 6/9/2026
+**Completed:** <date>
+**Status:** COMPLETE | BLOCKED | PARTIAL
+
+---
+
+## Version Changes Made
+
+| File | Field Changed | Old Value | New Value |
+|---|---|---|---|
+| pom.xml | spring-boot-starter-parent version | X.X.X | Y.Y.Y |
+| ... | ... | ... | ... |
+
+---
+
+## CVEs Addressed
+
+| CVE | Component | Old Version | New Version | Status |
+|---|---|---|---|---|
+| CVE-XXXX-XXXXX | spring-webmvc | X.X.X | Y.Y.Y | RESOLVED |
+
+---
+
+## Blockers
+
+<!-- List any items that prevented full remediation. -->
+<!-- If none: "None" -->
+
+---
+
+## Post-Event Actions Required
+
+<!-- List items that must be addressed after the 72-hour window. -->
+<!-- Example: Spring Boot 2.x migration plan to 3.x or 4.x -->
+
+---
+
+## Risk Items
+
+<!-- List known risks, e.g. EOL versions, Java/Tomcat upgrade debt. -->
+```
+
+-----
+
+## 10. Stop Conditions
+
+Stop immediately and ask the human a precise question if any of the following
+are true:
+
+- The approved target version is not provided or cannot be determined
+- The current Spring Boot major version cannot be identified from build files
+- A Java version below 17 is present and the target is Spring Boot 3.x or 4.x
+- A Tomcat version below 10 is present and the target is Spring Boot 3.x,
+  or below 11 for Spring Boot 4.x
+- A child module declares a Spring version override that conflicts with the root
+- A flagged Black Duck component is not a Spring component and requires a
+  separate upgrade decision
+- Any `application.yml` property key must be changed due to a removed or
+  renamed Spring property in the target version
+- The build file structure is non-standard and the authoritative version
+  declaration is ambiguous
+- More than one Spring Boot major version is present across modules
+
+Do not guess. Do not assume an approved version. Do not proceed past a blocker.
+
+-----
+
+## 11. Principles Summary
+
+- Only change what the Zero Day event requires
+- Only change Spring dependency versions and Orchestra wrapper versions
+- Never change application code, tests, or unrelated dependencies
+- Never assume an approved version — it must be provided or confirmed
+- Never upgrade across a major version boundary without explicit human approval
+- Always produce a remediation report
+- This will not be a one-time event — build changes must be clean, reviewable,
+  and repeatable
