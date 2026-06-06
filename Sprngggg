@@ -1,0 +1,837 @@
+-----
+
+name: spring-boot-zero-day-remediation
+version: “3.0.0”
+description: >
+Single source of truth playbook for remediating Spring Boot Zero Day events
+across PAA applications. Covers repository discovery, Black Duck scan
+interpretation, per-artifact approved version lookup from the PAA Spring
+Framework Versions sheet, BOM-managed and explicitly overridden component
+resolution, Maven and Gradle build file upgrades across all known declaration
+patterns, Spring Cloud BOM handling, Orchestra wrapper versioning, OSS
+validation preparation, and remediation reporting. Targets Spring Boot 2.x,
+3.x, and 4.x upgrade paths with strict version-specific rules. Never modifies
+business logic, application behavior, test expectations, or unrelated
+dependencies. Designed to be repeatable across future Zero Day events.
+triggers:
+
+- “spring boot zero day”
+- “spring zero day”
+- “spring boot upgrade”
+- “spring boot remediation”
+- “spring framework upgrade”
+- “black duck spring”
+- “oss validation spring”
+- “spring boot due 6/9”
+- “spring cve remediation”
+- “spring boot 4.x upgrade”
+- “spring boot 3.x upgrade”
+- “spring framework 7.x”
+- “spring framework 6.x”
+- “orchestra spring boot”
+- “spring boot zero day event”
+- “PAA spring framework versions”
+- “spring data redis upgrade”
+- “spring data keyvalue upgrade”
+- “spring security oauth2 upgrade”
+- “spring aop upgrade”
+- “spring cloud upgrade”
+- “spring cloud gateway upgrade”
+- “spring cloud config upgrade”
+- “spring cloud function upgrade”
+- “spring batch upgrade”
+- “spring integration upgrade”
+
+-----
+
+# Spring Boot Zero Day Remediation Playbook
+
+## 1. Purpose
+
+Remediate all Spring Boot and Spring Framework components flagged in a Zero Day
+event by upgrading each artifact to its approved version as listed in the PAA
+Spring Framework Versions sheet, validating via Black Duck scan, and completing
+the OSS validation process.
+
+Scope is strictly limited to Spring dependency version changes. No other code,
+logic, configuration, or dependency is touched unless it directly blocks the
+Spring upgrade and the human explicitly approves it.
+
+> **Non-negotiable principle**: Make only the version changes that Black Duck
+> and the PAA Spring Framework Versions sheet require. Match each artifact ID
+> to its approved version exactly. Never change application behavior, public
+> contracts, security configuration, logging, telemetry, business logic, or
+> test expectations unless the change is required for Spring remediation AND
+> the human explicitly approves it. This will not be a one-time event — every
+> change must be clean, minimal, and repeatable.
+
+-----
+
+## 2. Scope
+
+**Applies to** Java/Kotlin applications containing one or more of:
+
+- `spring-boot-starter-*` in any version
+- `org.springframework.*` direct dependencies or BOM imports
+- `spring-security-*` dependencies
+- `spring-cloud-*` dependencies
+- `spring-data-*` dependencies
+- `spring-batch-*` dependencies
+- `spring-integration-*` dependencies
+- Orchestra Spring Boot wrapper (`orchestra-spring-boot-*`)
+
+**In scope — version strings only:**
+
+- `pom.xml` (root and all module files)
+- `build.gradle`, `build.gradle.kts`
+- `gradle.properties`
+- `gradle/libs.versions.toml`
+- `settings.gradle`, `settings.gradle.kts` (if they declare plugin versions)
+- Explicit `<properties>` overrides for Spring artifacts
+- Explicit `ext {}` / `dependencyResolutionManagement` overrides for Spring
+  artifacts
+
+**Out of scope — never touch without explicit human approval:**
+
+- Any `.java` or `.kt` source file
+- Any test source file
+- `application.yml` / `application.properties` / `bootstrap.yml`
+- Non-Spring dependencies of any kind
+- Dockerfile, CI/CD pipeline, Kubernetes or Helm manifests
+- Database migration scripts
+- `pom.xml` structure, formatting, element ordering, or non-version fields
+- Architecture, module structure, or dependency graph shape
+
+> If the approved version, artifact ID, current version string, or build file
+> structure is ambiguous — stop and ask one precise question before proceeding.
+
+-----
+
+## 3. Repository Discovery
+
+Execute fully before editing any file. Do not skip steps.
+
+### 3.1 Build System Identification
+
+- Determine if the project uses Maven, Gradle, or both
+- For Maven: locate all `pom.xml` files including submodules referenced in
+  `<modules>`
+- For Gradle: locate `build.gradle` or `build.gradle.kts`, `settings.gradle`
+  or `settings.gradle.kts`, `gradle.properties`, and
+  `gradle/libs.versions.toml` if present
+- Determine if the project is single-module or multi-module
+
+### 3.2 Spring Version Inventory
+
+Identify and record:
+
+- Current Spring Boot version — source: `<parent>` block,
+  `spring-boot-starter-parent`, BOM import, or `springBootVersion` property
+- Current Spring Framework version if overridden separately
+- Current Spring Cloud BOM version if present
+- Current Spring Security version if overridden separately
+- Current Spring Data BOM version if overridden separately
+- Current Orchestra wrapper version if present
+- Every Spring artifact declared with an explicit version — record artifact ID,
+  current version string, file, and line number
+- Every Spring artifact declared without a version (BOM-managed) — record
+  artifact ID and note as BOM-managed
+- The exact version string format in use for each artifact:
+  - Numeric: `3.2.4`
+  - Release train: `2.1.8.RELEASE`
+  - Milestone: `4.0.0-M1`
+  - Snapshot: `3.5.0-SNAPSHOT`
+
+### 3.3 Black Duck Scan Inventory
+
+If a Black Duck scan report is provided:
+
+- Extract every flagged Spring component: artifact ID, current version, CVE IDs
+- Record each as a remediation target
+- Cross-reference against the Spring version inventory from 3.2
+
+### 3.4 Discovery Output
+
+Before making any change, present the inventory to the human as:
+
+```
+DISCOVERY SUMMARY
+=================
+Build system: Maven | Gradle | Both
+Project structure: Single-module | Multi-module (N modules)
+Spring Boot version: X.X.X (source: <file>)
+Spring Cloud BOM: X.X.X | NOT PRESENT (source: <file>)
+Orchestra wrapper: X.X.X | NOT PRESENT
+
+EXPLICIT SPRING VERSION OVERRIDES FOUND:
+- <artifact-id>: <version> (<file>:<line>)
+
+BOM-MANAGED SPRING ARTIFACTS (no explicit version):
+- <artifact-id>
+
+BLACK DUCK FLAGGED COMPONENTS:
+- <artifact-id>: <version> (CVE-XXXX-XXXXX, ...)
+
+SNAPSHOT VERSIONS FOUND (will not be changed):
+- <artifact-id>: <version> (<file>)
+```
+
+-----
+
+## 4. PAA Spring Framework Versions Sheet — Lookup Rules
+
+The PAA Spring Framework Versions sheet (`All PAA Apps_Spring Rajeev List` tab)
+is the authoritative source of approved versions. The `Pivot` tab is for
+summary only — do not use it for version resolution.
+
+**Columns used:** `Artifact ID`, `Component Version Name` (approved version),
+`Project`, `Publicly Accessible`.
+
+**Lookup procedure:**
+
+1. For each Spring artifact in the repository, look up its `Artifact ID` in
+   the sheet
+1. `Component Version Name` is the approved target version
+1. If the same artifact ID appears in the sheet with different versions across
+   rows, select the version that matches the project’s current Spring Boot major
+   line — 2.x uses Framework 5.x versions, 3.x uses Framework 6.x versions,
+   4.x uses Framework 7.x versions — do not mix lines
+1. If the artifact ID is not in the sheet, do not change its version — flag as
+   NOT FOUND IN SHEET in the remediation report
+1. If the `Project` column on the sheet row matches the current repository name,
+   that row takes precedence over a generic row for the same artifact ID
+
+**Known approved versions from the PAA sheet (this event):**
+
+|Artifact ID                  |Approved Version|Line   |Notes                                 |
+|-----------------------------|----------------|-------|--------------------------------------|
+|spring-boot                  |3.4.3           |3.x    |                                      |
+|spring-boot-actuator         |3.5.12          |3.x    |                                      |
+|spring-boot-autoconfigure    |3.5.12          |3.x    |                                      |
+|spring-boot-jarmode-tools    |3.5.12          |3.x    |                                      |
+|spring-boot-data-cassandra   |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-data-jdbc        |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-data-neo4j       |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-data-r2dbc       |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-graphql          |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-http-client      |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-jdbc             |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-jooq             |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-boot-rsocket          |4.0.0-M1        |4.x    |Milestone — see Section 5.3           |
+|spring-data-commons          |3.5.10          |3.x    |                                      |
+|spring-data-mongodb          |4.5.10          |3.x/4.x|                                      |
+|spring-data-keyvalue         |3.2.4           |3.x    |Use 3.4.4 if project is on 3.4.x minor|
+|spring-data-keyvalue         |3.4.4           |3.x    |Only if project already on 3.4.x minor|
+|spring-data-redis            |3.2.4           |3.x    |                                      |
+|spring-data-redis            |2.1.8.RELEASE   |2.x    |Legacy format — see Section 5.2       |
+|spring-jcl                   |6.2.17          |3.x    |Framework 6.x                         |
+|spring-security-crypto       |6.5.9           |3.x    |Often explicit override               |
+|spring-security-oauth2-client|6.5.9           |3.x    |Often explicit override               |
+|spring-security-oauth2-core  |6.5.9           |3.x    |Often explicit override               |
+|spring-tx                    |6.2.17          |3.x    |Framework 6.x                         |
+|spring-webflux               |6.2.17          |3.x    |Framework 6.x                         |
+|spring-aop                   |5.3.29          |2.x    |Framework 5.x                         |
+|spring-aop                   |6.2.15          |3.x    |Framework 6.x                         |
+|spring-beans                 |2.7.14          |2.x    |                                      |
+
+
+> This table reflects what is visible in the sheet screenshots provided. If the
+> human provides the full sheet or additional rows, use that as the authoritative
+> source and supersede this table entirely. Never infer a version not present in
+> the sheet or this table.
+
+-----
+
+## 5. Version String Format Rules
+
+### 5.1 Standard Numeric (e.g., 3.2.4, 6.2.17)
+
+Use the version string exactly as shown in the sheet. No suffix, no qualifier.
+
+### 5.2 Release Train Format (e.g., 2.1.8.RELEASE)
+
+Legacy Spring Data format used before calendar versioning.
+
+- If the repo has `2.1.8.RELEASE` and the only sheet-approved version for that
+  artifact is in the 3.x line (e.g., `3.2.4`), this is a major version jump —
+  stop, report as BLOCKER, ask human for explicit approval before proceeding
+- If the sheet lists `2.1.8.RELEASE` as the approved version, use that exact
+  string including `.RELEASE` — do not normalize it
+
+### 5.3 Milestone Format (e.g., 4.0.0-M1)
+
+Pre-release version.
+
+- Apply only if it is the only approved version in the sheet for that artifact
+  in the 4.x line
+- If the project is on Boot 3.x and the only sheet entry for an artifact is a
+  milestone, do not apply it — flag as LINE MISMATCH — NOT APPLIED
+- Never substitute a milestone with a GA version or vice versa
+
+### 5.4 Snapshot Format (e.g., 3.5.0-SNAPSHOT)
+
+- Never change a SNAPSHOT version — flag it in the report as SNAPSHOT —
+  NOT CHANGED and ask the human whether to address it
+
+-----
+
+## 6. Version Resolution by Spring Boot Major Version
+
+Apply exactly one upgrade path based on the current Spring Boot major version.
+Do not mix paths. Do not cross a major version boundary without explicit human
+approval.
+
+### 6.1 Spring Boot 4.x / Spring Framework 7.x
+
+- Use the PAA sheet approved version for each artifact in the 4.x line
+- `4.0.0-M1` milestone versions apply per Section 5.3
+- Orchestra wrapper: `4.1.5`
+- Spring Cloud: use the approved Spring Cloud 2024.x BOM version if listed in
+  the sheet; if not listed, stop and ask — do not guess
+- Java: 17 or higher required — if below 17, stop and report BLOCKER
+- Tomcat: 11.x required — if below 11, stop and report BLOCKER
+
+### 6.2 Spring Boot 3.x / Spring Framework 6.x
+
+- Use the PAA sheet approved version for each artifact in the 3.x line
+- `spring-aop`: `6.2.15`
+- `spring-data-keyvalue`: `3.2.4`, or `3.4.4` if project is already on 3.4.x
+- `spring-data-redis`: `3.2.4`
+- `spring-security-oauth2-client`, `spring-security-oauth2-core`,
+  `spring-security-crypto`: `6.5.9` — update as explicit overrides
+- `spring-jcl`, `spring-tx`, `spring-webflux`: `6.2.17`
+- Orchestra wrapper: `3.23.8`
+- Spring Cloud: use the approved Spring Cloud 2023.x BOM version if listed in
+  the sheet; if not listed, stop and ask — do not guess
+- Do not upgrade from 3.x to 4.x — requires separate human-approved migration
+- Java: 17 or higher required — if below 17, stop and report BLOCKER
+- Tomcat: 10.x required — if below 10, stop and report BLOCKER
+
+### 6.3 Spring Boot 2.x / Spring Framework 5.x
+
+- No major version upgrade in this 72-hour window
+- `spring-aop`: `5.3.29` — update only if explicitly overridden in build files
+- `spring-beans`: `2.7.14` — update only if explicitly overridden
+- `spring-data-redis` at `2.1.8.RELEASE` with sheet 3.x version `3.2.4`:
+  major jump — stop, flag as BLOCKER, ask human
+- Apply only approved patch versions for 2.x artifacts listed in the sheet;
+  if no 2.x patch version is listed, make no change to that artifact
+- Spring Cloud: use the approved Spring Cloud 2021.x BOM version if listed in
+  the sheet; if not listed, stop and ask — do not guess
+- Post-event: document a migration plan to Boot 3.x or 4.x in the report —
+  do not execute it
+- Boot 2.x is approaching end-of-life — record as risk item
+
+### 6.4 Java and Tomcat
+
+- Not required for this event unless they directly block the Spring upgrade
+- If upgrade is needed to unblock Spring, stop and ask for explicit approval
+
+-----
+
+## 7. Spring Cloud BOM Handling
+
+Spring Cloud has its own BOM independent of the Spring Boot BOM. It must be
+handled separately.
+
+**Discovery — search for these patterns:**
+
+Maven:
+
+```xml
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-dependencies</artifactId>
+  <version>X.X.X</version>
+  <type>pom</type>
+  <scope>import</scope>
+</dependency>
+```
+
+Gradle:
+
+```groovy
+implementation platform("org.springframework.cloud:spring-cloud-dependencies:X.X.X")
+// or
+dependencyResolutionManagement {
+  imports {
+    mavenBom "org.springframework.cloud:spring-cloud-dependencies:X.X.X"
+  }
+}
+```
+
+**Resolution rules:**
+
+- If the PAA sheet lists an approved `spring-cloud-dependencies` version, use it
+- If the PAA sheet does not list an approved Spring Cloud version, stop and ask
+  the human — do not guess a Cloud BOM version
+- The Spring Cloud BOM version must be compatible with the Spring Boot version
+  being targeted:
+  - Boot 2.x → Cloud 2021.x (Jubilee line)
+  - Boot 3.x → Cloud 2023.x (Leyton line)
+  - Boot 4.x → Cloud 2024.x — stop and ask if sheet does not specify
+- Do not update individual `spring-cloud-*` artifact versions directly unless
+  they are explicitly overridden outside the Cloud BOM and listed in the PAA
+  sheet — let the BOM manage them
+
+-----
+
+## 8. Per-Artifact Explicit Override Handling
+
+Many PAA projects pin Spring Security, Spring Data, Spring AOP, and Spring
+Cloud artifact versions explicitly outside the Boot BOM. Each must be resolved
+individually.
+
+**Discovery — Maven `<properties>` patterns to search for:**
+
+```xml
+<properties>
+  <spring-security.version>X.X.X</spring-security.version>
+  <spring-framework.version>X.X.X</spring-framework.version>
+  <spring-data-bom.version>X.X.X</spring-data-bom.version>
+  <spring-cloud.version>X.X.X</spring-cloud.version>
+  <spring-aop.version>X.X.X</spring-aop.version>
+  <spring.version>X.X.X</spring.version>
+</properties>
+```
+
+**Discovery — Gradle `ext {}` and `dependencyResolutionManagement` patterns:**
+
+```groovy
+ext {
+  springSecurityVersion = 'X.X.X'
+  springFrameworkVersion = 'X.X.X'
+  springDataVersion = 'X.X.X'
+  springCloudVersion = 'X.X.X'
+}
+```
+
+**Resolution rule for each explicit override found:**
+
+1. Look up the artifact ID in the PAA sheet
+1. If the sheet has an approved version for this artifact in the project’s major
+   line, update the override to the approved version
+1. If the BOM at the approved Spring Boot version already manages this artifact
+   to a version equal to or higher than the sheet-approved version, remove the
+   explicit override — do not keep a redundant pin
+1. If removing the override would cause the BOM to resolve to a version lower
+   than the sheet-approved version, keep the override and set it to the
+   sheet-approved version
+1. If the artifact is not in the PAA sheet, leave the override unchanged and
+   flag it in the report as NOT IN SHEET — NOT CHANGED
+
+-----
+
+## 9. Build File Modification Rules
+
+### 9.1 Maven (`pom.xml`)
+
+**Case A — `spring-boot-starter-parent` as parent:**
+
+```xml
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>APPROVED_BOOT_VERSION</version>
+  <relativePath/>
+</parent>
+```
+
+**Case B — Spring Boot BOM in `<dependencyManagement>`:**
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>APPROVED_BOOT_VERSION</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+**Case C — Spring Boot version in `<properties>`:**
+
+```xml
+<properties>
+  <spring-boot.version>APPROVED_BOOT_VERSION</spring-boot.version>
+</properties>
+```
+
+**Case D — Spring Cloud BOM in `<dependencyManagement>`:**
+
+```xml
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-dependencies</artifactId>
+  <version>APPROVED_CLOUD_VERSION</version>
+  <type>pom</type>
+  <scope>import</scope>
+</dependency>
+```
+
+**Case E — Orchestra wrapper:**
+
+```xml
+<dependency>
+  <groupId>com.wellsfargo.orchestra</groupId>
+  <artifactId>orchestra-spring-boot-starter</artifactId>
+  <version>APPROVED_ORCHESTRA_VERSION</version>
+</dependency>
+```
+
+**Case F — Explicit Spring Security override in `<properties>`:**
+
+```xml
+<properties>
+  <spring-security.version>6.5.9</spring-security.version>
+</properties>
+```
+
+**Case G — Explicit Spring Data override in `<properties>`:**
+
+```xml
+<properties>
+  <spring-data-bom.version>APPROVED_DATA_VERSION</spring-data-bom.version>
+</properties>
+```
+
+**Maven rules — apply to all cases:**
+
+- Change only the version string value. Do not reformat, reorder, add, or
+  remove any XML element, attribute, or whitespace outside the version string.
+- Multi-module: update the root POM authoritative declaration first. Update
+  child POMs only if they independently declare a Spring version override —
+  update each override individually, never restructure.
+- Do not add a BOM import that does not already exist in the file.
+- Do not restructure `<dependencyManagement>` sections.
+
+### 9.2 Gradle (`build.gradle` / `build.gradle.kts`)
+
+**Case A — Spring Boot plugin:**
+
+```groovy
+// build.gradle
+plugins {
+  id 'org.springframework.boot' version 'APPROVED_BOOT_VERSION'
+}
+
+// build.gradle.kts
+plugins {
+  id("org.springframework.boot") version "APPROVED_BOOT_VERSION"
+}
+```
+
+**Case B — `gradle.properties`:**
+
+```properties
+springBootVersion=APPROVED_BOOT_VERSION
+springCloudVersion=APPROVED_CLOUD_VERSION
+```
+
+**Case C — Version catalog (`gradle/libs.versions.toml`):**
+
+```toml
+[versions]
+spring-boot = "APPROVED_BOOT_VERSION"
+spring-cloud = "APPROVED_CLOUD_VERSION"
+spring-security = "6.5.9"
+```
+
+**Case D — `platform()` BOM import in `dependencies {}`:**
+
+```groovy
+// build.gradle
+dependencies {
+  implementation platform("org.springframework.boot:spring-boot-dependencies:APPROVED_BOOT_VERSION")
+  implementation platform("org.springframework.cloud:spring-cloud-dependencies:APPROVED_CLOUD_VERSION")
+}
+
+// build.gradle.kts
+dependencies {
+  implementation(platform("org.springframework.boot:spring-boot-dependencies:APPROVED_BOOT_VERSION"))
+}
+```
+
+**Case E — `dependencyResolutionManagement` BOM import:**
+
+```groovy
+dependencyResolutionManagement {
+  versionCatalogs {
+    libs {
+      version('spring-boot', 'APPROVED_BOOT_VERSION')
+    }
+  }
+}
+```
+
+**Case F — `ext {}` or `buildscript {}` version property:**
+
+```groovy
+ext {
+  springBootVersion = 'APPROVED_BOOT_VERSION'
+  springCloudVersion = 'APPROVED_CLOUD_VERSION'
+  springSecurityVersion = '6.5.9'
+}
+```
+
+**Gradle rules — apply to all cases:**
+
+- Change only version strings. Do not reformat or restructure any build file.
+- Multi-project: update root declaration only, unless a subproject independently
+  overrides a Spring version — update each such override individually.
+- Do not add a platform import that does not already exist.
+
+-----
+
+## 10. Orchestra Wrapper Conflict Detection
+
+Orchestra wrapper pulls Spring Boot transitively. After updating both the
+explicit Spring Boot version and the Orchestra wrapper version:
+
+1. Confirm the Orchestra wrapper’s internal Spring Boot version is equal to or
+   lower than the approved Boot version being set in the project
+1. If Orchestra `4.1.5` pulls Boot `3.5.12` internally and the project sets
+   Boot `3.4.3`, the higher Orchestra-internal version wins at runtime — flag
+   this as a VERSION CONFLICT in the report and ask the human which version
+   takes precedence
+1. Do not remove or override Orchestra’s transitive Spring Boot pull without
+   explicit human approval
+
+-----
+
+## 11. Black Duck Scan Interpretation
+
+1. Extract each flagged component: artifact ID, current version, CVE IDs
+1. Look up each artifact ID in the PAA sheet
+1. If the sheet-approved version is higher than the current version, apply the
+   version change per Section 9
+1. If the component is BOM-managed and the Boot BOM upgrade resolves it to the
+   sheet-approved version, the BOM upgrade alone is sufficient — do not add a
+   redundant explicit override
+1. If the component is NOT in the PAA sheet, do not change its version — flag
+   as NOT IN SHEET / REQUIRES SEPARATE REVIEW
+1. Record each CVE, artifact ID, old version, new version, and resolution method
+   (BOM upgrade or explicit override) in the remediation report
+
+-----
+
+## 12. Multi-Module Project Rules
+
+- Map the full version inheritance chain before making any change
+- Update only the authoritative version declaration per module hierarchy
+- If a child module pins a Spring component independently:
+  - Flag it explicitly before touching it
+  - Do not silently remove the pin without human confirmation
+- After all changes, verify no child module retains a Spring component pinned
+  to a version older than the sheet-approved version for that artifact
+- In a Gradle multi-project build, check `buildSrc` and any included builds for
+  additional Spring version declarations
+
+-----
+
+## 13. Validation Steps
+
+Perform after all changes — without running the build unless the human asks:
+
+1. Every changed version string matches the approved PAA sheet version exactly,
+   including format (numeric, `.RELEASE` suffix, `-M1` suffix)
+1. No Spring artifact remains explicitly pinned to a version older than the
+   sheet-approved version for its major line
+1. Orchestra wrapper version updated if present
+1. Spring Cloud BOM version updated if present and sheet-approved version exists
+1. No non-Spring dependencies were modified
+1. No application source or test files were modified
+1. No `application.yml` / `application.properties` files were modified
+1. No SNAPSHOT versions were changed
+1. If the human runs `mvn dependency:tree` or `./gradlew dependencies` and
+   shares the output, scan every `org.springframework.*`,
+   `org.springframework.boot.*`, `org.springframework.cloud.*`,
+   `org.springframework.security.*`, and `org.springframework.data.*` line —
+   flag any artifact resolving to a version older than the sheet-approved
+   version for that artifact
+1. Confirm no duplicate BOM imports were introduced
+
+-----
+
+## 14. Post-Remediation OSS Validation Guidance
+
+After build changes are complete and the build passes:
+
+1. Trigger a new Black Duck scan on the repository
+1. Confirm all previously flagged Spring CVEs no longer appear in the scan
+   results
+1. If any CVE still appears after the upgrade, stop and report it as UNRESOLVED
+   — do not mark the remediation complete
+1. Complete the OSS validation process per the internal OSS validation workflow
+1. Record the Black Duck scan run ID and result in the remediation report
+1. Deadline: all testing, patching, validation, and OSS validation must be
+   complete by June 9, 2026 at 11:59 PM ET
+
+-----
+
+## 15. Remediation Report Output
+
+Produce `remediation-report.md` at the repository root:
+
+```markdown
+# Spring Boot Zero Day Remediation Report
+
+**Application:** <project name>
+**Repository:** <repo URL>
+**Event:** Spring Boot Zero Day — Due 6/9/2026 11:59 PM ET
+**Remediated by:** Copilot Agent (playbook v3.0.0)
+**Completed:** <date and time ET>
+**Status:** COMPLETE | BLOCKED | PARTIAL
+
+---
+
+## Discovery Summary
+
+| Item | Value |
+|---|---|
+| Build system | Maven / Gradle / Both |
+| Project structure | Single-module / Multi-module (N modules) |
+| Spring Boot version (before) | X.X.X |
+| Spring Boot version (after) | Y.Y.Y |
+| Spring Cloud BOM (before) | X.X.X / NOT PRESENT |
+| Spring Cloud BOM (after) | Y.Y.Y / NOT PRESENT |
+| Orchestra wrapper (before) | X.X.X / NOT PRESENT |
+| Orchestra wrapper (after) | Y.Y.Y / NOT PRESENT |
+
+---
+
+## Version Changes Made
+
+| File | Artifact / Property | Old Version | New Version | Method |
+|---|---|---|---|---|
+| pom.xml | spring-boot-starter-parent | X.X.X | Y.Y.Y | BOM parent |
+| pom.xml | spring-security.version | X.X.X | 6.5.9 | Explicit override |
+| pom.xml | spring-cloud-dependencies | X.X.X | Y.Y.Y | BOM import |
+
+---
+
+## CVEs Addressed
+
+| CVE | Artifact ID | Old Version | New Version | Resolution | Status |
+|---|---|---|---|---|---|
+| CVE-XXXX-XXXXX | spring-webmvc | X.X.X | Y.Y.Y | BOM upgrade | RESOLVED |
+
+---
+
+## Artifacts Not In PAA Sheet
+
+| Artifact ID | Current Version | Action |
+|---|---|---|
+| example-artifact | X.X.X | NOT CHANGED — not in PAA sheet |
+
+---
+
+## Line Mismatches (not applied)
+
+| Artifact ID | Sheet Version | Project Line | Reason |
+|---|---|---|---|
+| spring-boot-data-jdbc | 4.0.0-M1 | 3.x | 4.x milestone only — not applied |
+
+---
+
+## Snapshot Versions (not changed)
+
+| Artifact ID | Version | File | Action |
+|---|---|---|---|
+| spring-xyz | 3.5.0-SNAPSHOT | pom.xml | NOT CHANGED — snapshot |
+
+---
+
+## Version Conflicts
+
+| Artifact ID | Declared Version | Transitive Source | Resolved Version | Action |
+|---|---|---|---|---|
+| spring-boot | 3.4.3 | orchestra-spring-boot-starter:4.1.5 | 3.5.12 | FLAGGED — human review required |
+
+---
+
+## Blockers
+
+<!-- Precise description of each blocker. If none: None -->
+
+---
+
+## Post-Event Actions Required
+
+<!-- Items to address after the 72-hour window -->
+<!-- Always include Spring Boot 2.x migration plan if applicable -->
+<!-- Example: spring-data-redis 2.1.8.RELEASE requires major upgrade — plan needed -->
+
+---
+
+## Risk Items
+
+<!-- EOL versions, Java/Tomcat upgrade debt, milestone versions in prod -->
+
+---
+
+## OSS Validation
+
+| Item | Value |
+|---|---|
+| Black Duck re-scan run ID | <scan ID or PENDING> |
+| Re-scan result | CLEAN / UNRESOLVED CVEs REMAIN / PENDING |
+| OSS validation status | COMPLETE / PENDING |
+```
+
+-----
+
+## 16. Stop Conditions
+
+Stop immediately and ask the human one precise question if any of the following
+are true. Do not proceed. Do not guess.
+
+- The PAA Spring Framework Versions sheet is not provided and the approved
+  version for a specific artifact cannot be determined from the table in
+  Section 4
+- The current Spring Boot major version cannot be identified from build files
+- Java is below 17 and the target is Spring Boot 3.x or 4.x
+- Tomcat is below 10 and the target is Spring Boot 3.x, or below 11 for 4.x
+- An artifact is at `2.1.8.RELEASE` and the only PAA sheet version is in the
+  3.x line — major jump requires explicit human approval
+- The same artifact ID appears in the sheet with versions from two different
+  major lines and the project’s target line is ambiguous
+- Spring Cloud is present but no approved Spring Cloud BOM version is in the
+  PAA sheet
+- A child module independently declares a Spring version override that conflicts
+  with the root upgrade
+- A flagged Black Duck artifact is not in the PAA sheet and has no obvious
+  Spring owner
+- Any `application.yml` or `application.properties` key must change due to a
+  removed or renamed property in the target Spring version
+- The build file structure is non-standard and the authoritative Spring version
+  declaration cannot be identified without ambiguity
+- More than one Spring Boot major version is present across modules
+- A SNAPSHOT version of a Spring artifact is present and it is unclear whether
+  it should be replaced
+- An Orchestra wrapper version conflict is detected per Section 10
+
+-----
+
+## 17. Principles Summary
+
+- Match every artifact ID to its PAA sheet approved version — no guessing,
+  no inferring
+- Preserve the exact version string format shown in the PAA sheet
+- Never apply a milestone version unless it is the only sheet-approved version
+  for that artifact in the project’s major line
+- Never cross a major version boundary without explicit human approval
+- Never change application code, tests, config files, or unrelated dependencies
+- Handle Spring Cloud BOM separately — never assume a compatible version
+- Detect and report Orchestra wrapper transitive conflicts before marking
+  complete
+- Never change SNAPSHOT versions without human instruction
+- Always produce a full remediation report with per-artifact detail
+- OSS validation is part of remediation — it is not complete until the
+  re-scan is clean
+- This will not be a one-time event — every change must be clean, minimal,
+  reviewable, and repeatable
