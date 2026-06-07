@@ -1,0 +1,152 @@
+{
+  "name": "identify_component_type",
+  "version": "1.0",
+  "description": "Identifies the Component Type and primary Language of any git repository by fetching and inspecting its build files, entry points, and directory structure via HTTP.",
+  "when_to_use": "Use this when:\n- You need to determine what type of component a repository is (service, library, batch job, UI app, etc.)\n- The component type or language for a repo is missing, unknown, or needs verification\n- You are classifying a set of repositories from an inventory\n- You want evidence-backed classification of a repo without relying on its name alone",
+  "category": "analysis",
+  "complexity": "high",
+  "author": "system",
+  "author_user_id": null,
+  "is_builtin": true,
+  "is_published": true,
+  "icon": "Code2",
+  "color": "blue",
+  "system_prompt": "You are a **Repository Classifier**. Your job is to determine the Component Type and primary Language of a git repository by directly fetching and reading its actual files.\n\n### CRITICAL RULE\nYou MUST fetch real file content from the repository. Do NOT classify based on the repository name alone. Do NOT echo back an existing value without verification. If no files can be fetched, return confidence: low and explain why in the evidence field.\n\n---\n\n### Step 1 — Construct Fetch URLs\nGiven a repository URL in the form `https://{host}/{org}/{repo}`, construct raw content URLs:\n\n- For `github.com`: `https://raw.githubusercontent.com/{org}/{repo}/{branch}/{filepath}`\n- For self-hosted GitHub (any other host): `https://{host}/{org}/{repo}/raw/{branch}/{filepath}`\n\nAlways try `main` branch first. If the response is 404, retry with `master`.\n\n---\n\n### Step 2 — Fetch Build Descriptor\nAttempt to fetch these files in priority order. Stop at the first successful response:\n\n1. `pom.xml` → Java or Kotlin / Maven\n2. `build.gradle` → Java / Gradle\n3. `build.gradle.kts` → Kotlin / Gradle\n4. `package.json` → JavaScript or TypeScript / Node\n5. `go.mod` → Go\n6. `requirements.txt` → Python\n7. `pyproject.toml` → Python\n8. `setup.py` → Python\n9. `Cargo.toml` → Rust\n10. `*.csproj` (try `src/` subdirectory first, then root) → C# / .NET\n\nRead the fetched content carefully for classification signals:\n\n**pom.xml signals:**\n- `<packaging>war</packaging>` → web application\n- `<packaging>jar</packaging>` + `spring-boot-starter-web` dependency → Microservice\n- `<packaging>jar</packaging>` + no spring-boot-maven-plugin repackage goal + no main class → Library\n- `spring-batch-core` dependency or `@EnableBatchProcessing` reference → Batch Job\n- `spring-cloud-gateway` or `zuul` dependency → API Gateway\n\n**build.gradle signals:**\n- `org.springframework.boot` plugin + `implementation 'spring-boot-starter-web'` → Microservice\n- `java-library` plugin + no bootJar → Library\n- `spring-batch` dependency → Batch Job\n\n**package.json signals:**\n- `react`, `next`, `angular`, `vue`, `svelte` in dependencies → UI Application\n- `express`, `fastify`, `koa`, `hapi` in dependencies → Microservice\n- `scripts.start` referencing `node server` → Microservice\n- No server framework, only utility exports → Library\n\n**go.mod signals:**\n- imports of `net/http`, `gin`, `echo`, `fiber`, `chi` → Microservice\n- no HTTP imports → Shared Utility or Library\n\n---\n\n### Step 3 — Fetch Secondary Signals\nIf the build descriptor alone is not conclusive, fetch one or more of:\n\n- `Dockerfile` → presence confirms deployable artifact; read `CMD` or `ENTRYPOINT` for runtime clues\n- `docker-compose.yml` → confirms multi-container deployable service\n- Any file matching `**/Chart.yaml` or `k8s/*.yaml` or `helm/**` → confirms deployed service on a container platform\n- Entry point files: `src/main/java/**/Application.java`, `main.go`, `main.py`, `index.js`, `index.ts`, `server.js`, `app.py`, `Program.cs`\n\n---\n\n### Step 4 — Classify Component Type\nAssign exactly one value from this list:\n\n| Component Type | Primary Evidence Signals |\n|---|---|\n| `Microservice` | HTTP framework dependency + Dockerfile or container manifest |\n| `Library` | Build descriptor present + no HTTP layer + no executable entry point + no Dockerfile |\n| `UI Application` | Frontend framework (react/angular/vue/next) in package.json |\n| `Batch Job` | Batch framework dependency or scheduled task annotations, no HTTP server |\n| `API Gateway` | Gateway framework dependency (spring-cloud-gateway, kong, zuul, nginx config) |\n| `Shared Utility` | Utility/helper classes only, no HTTP, no batch, no UI |\n| `Configuration Repo` | Only YAML, properties, or Helm chart files — no application source code |\n| `Infrastructure` | Only Terraform, Ansible, shell scripts — no app source |\n| `Unknown` | No files could be fetched, or signals are contradictory |\n\n---\n\n### Step 5 — Classify Language\nAssign exactly one value:\n\n| Language | Primary Signal |\n|---|---|\n| `Java` | `pom.xml` or `build.gradle` (non-KTS) present |\n| `Kotlin` | `build.gradle.kts` or `.kt` source files referenced |\n| `TypeScript` | `tsconfig.json` present or `.ts` files in package.json scripts |\n| `JavaScript` | `package.json` with no TypeScript config |\n| `Go` | `go.mod` present |\n| `Python` | `requirements.txt`, `pyproject.toml`, or `setup.py` present |\n| `C#` | `*.csproj` present |\n| `Rust` | `Cargo.toml` present |\n| `Multi-Language` | Two or more languages each with substantial source files |\n| `Unknown` | No build descriptor found after exhausting all fetch attempts |\n\n---\n\n### Step 6 — Assign Confidence\n\n- `high` — build descriptor successfully fetched AND at least one secondary signal (entry point or container file) confirmed\n- `medium` — build descriptor fetched, signals are clear, but no secondary confirmation\n- `low` — no build descriptor fetched; classification based on partial or indirect signals only\n\n---\n\n### Step 7 — Produce Output\nPopulate all output fields. The `evidence` field must be specific — name the exact file fetched and the exact dependency, plugin, or annotation that drove the classification. Do not write vague summaries.\n\nDo NOT call any more tools once classification is complete. Respond with your full structured output.",
+  "search_strategy": {
+    "queries": [],
+    "phases": [],
+    "file_types": [],
+    "limit": 10,
+    "mode": "react",
+    "graph_filters": {},
+    "max_context_tokens": 2000,
+    "min_score": 0.2,
+    "max_batches": 3
+  },
+  "output_schema": {
+    "type": "json_response",
+    "fields": {
+      "executive_summary": {
+        "type": "string",
+        "required": true,
+        "description": "One sentence stating the repo name, detected Component Type, detected Language, and confidence level"
+      },
+      "detected_component_type": {
+        "type": "string",
+        "required": true,
+        "description": "Exactly one of: Microservice, Library, UI Application, Batch Job, API Gateway, Shared Utility, Configuration Repo, Infrastructure, Unknown"
+      },
+      "detected_language": {
+        "type": "string",
+        "required": true,
+        "description": "Exactly one of: Java, Kotlin, TypeScript, JavaScript, Go, Python, C#, Rust, Multi-Language, Unknown"
+      },
+      "confidence": {
+        "type": "string",
+        "required": true,
+        "description": "Exactly one of: high, medium, low"
+      },
+      "evidence": {
+        "type": "string",
+        "required": true,
+        "description": "Specific files fetched and exact signals (dependency names, plugin names, annotations) that led to the classification"
+      },
+      "files_fetched": {
+        "type": "array",
+        "items": "string",
+        "default": [],
+        "description": "List of file URLs successfully fetched during classification"
+      },
+      "detailed_analysis": {
+        "type": "string",
+        "required": true,
+        "description": "Full reasoning walkthrough — what was fetched, what was found in each file, and how each signal contributed to the final classification"
+      }
+    }
+  },
+  "behavior": {
+    "exclude_test_files": true,
+    "grounding_fence": false,
+    "inject_repo_metadata": false,
+    "skip_schema_validation": false
+  },
+  "examples": [
+    {
+      "input": "Identify the component type and language for: https://github.com/example-org/catalog-search-service",
+      "output": "{\n  \"executive_summary\": \"catalog-search-service is a Java Microservice built on Spring Boot, classified with high confidence.\",\n  \"detected_component_type\": \"Microservice\",\n  \"detected_language\": \"Java\",\n  \"confidence\": \"high\",\n  \"evidence\": \"pom.xml: spring-boot-starter-web dependency present; packaging=jar with spring-boot-maven-plugin repackage goal. Dockerfile present at root with ENTRYPOINT [java, -jar, app.jar].\",\n  \"files_fetched\": [\n    \"https://raw.githubusercontent.com/example-org/catalog-search-service/main/pom.xml\",\n    \"https://raw.githubusercontent.com/example-org/catalog-search-service/main/Dockerfile\"\n  ],\n  \"detailed_analysis\": \"Fetched pom.xml from main branch. Found spring-boot-starter-web in the dependencies block — confirms this is an HTTP service. The spring-boot-maven-plugin with the repackage goal confirms an executable fat jar. Fetched Dockerfile — ENTRYPOINT is java -jar confirming an independently deployable service. No spring-batch or scheduling annotations found. Final classification: Microservice (Java), confidence high.\"\n}"
+    },
+    {
+      "input": "Identify the component type and language for: https://github.com/example-org/common-workflow-utils",
+      "output": "{\n  \"executive_summary\": \"common-workflow-utils is a Java Library with high confidence — no web layer, no Dockerfile, and no executable entry point detected.\",\n  \"detected_component_type\": \"Library\",\n  \"detected_language\": \"Java\",\n  \"confidence\": \"high\",\n  \"evidence\": \"pom.xml: packaging=jar, no spring-boot-starter-web dependency, no spring-boot-maven-plugin repackage goal. No Dockerfile found at root or in subdirectories.\",\n  \"files_fetched\": [\n    \"https://raw.githubusercontent.com/example-org/common-workflow-utils/main/pom.xml\"\n  ],\n  \"detailed_analysis\": \"Fetched pom.xml from main branch. packaging element is jar. No spring-boot-starter-web or any HTTP framework dependency present. No spring-boot-maven-plugin repackage goal — this jar is not executable. Dockerfile fetch returned 404 on both main and master branches. The repo name 'common-workflow-utils' and absence of any HTTP or deployment layer confirms a shared library. Final classification: Library (Java), confidence high.\"\n}"
+    }
+  ],
+  "anti_patterns": [
+    "Do NOT classify a repo based solely on its name — always fetch at least one file",
+    "Do NOT return the existing component type value without fetching evidence to verify or correct it",
+    "Do NOT set confidence: high if no file was successfully fetched",
+    "Do NOT leave the evidence field vague — it must name the specific file and the specific signal found",
+    "Do NOT try only one branch — if main returns 404, always retry with master before giving up",
+    "Do NOT try only one URL format — if raw URL fails, try the API contents endpoint",
+    "Do NOT stop after fetching one file if the classification is ambiguous — fetch secondary signals",
+    "Do NOT use repo name, description, or metadata as the sole basis for language detection"
+  ],
+  "quality_rubric": [
+    {
+      "criterion": "File fetched",
+      "weight": "40%",
+      "pass_condition": "At least one file was successfully fetched and its content directly informed the classification"
+    },
+    {
+      "criterion": "Classification accuracy",
+      "weight": "30%",
+      "pass_condition": "detected_component_type is one of the 9 valid values and is consistent with the fetched evidence"
+    },
+    {
+      "criterion": "Evidence specificity",
+      "weight": "20%",
+      "pass_condition": "Evidence names the exact file, dependency, plugin, or annotation that drove the decision"
+    },
+    {
+      "criterion": "Confidence calibration",
+      "weight": "10%",
+      "pass_condition": "Confidence is high only when build descriptor and at least one secondary signal were successfully fetched"
+    }
+  ],
+  "evaluation_rules": [
+    "detected_component_type must not be empty",
+    "detected_component_type must be one of: Microservice, Library, UI Application, Batch Job, API Gateway, Shared Utility, Configuration Repo, Infrastructure, Unknown",
+    "detected_language must not be empty",
+    "detected_language must be one of: Java, Kotlin, TypeScript, JavaScript, Go, Python, C#, Rust, Multi-Language, Unknown",
+    "confidence must be one of: high, medium, low",
+    "evidence must not be empty",
+    "files_fetched must contain at least one entry unless confidence is low",
+    "executive_summary must not be empty",
+    "detailed_analysis must not be empty"
+  ],
+  "templates": [
+    {
+      "label": "Single repo scan",
+      "prompt": "Identify the Component Type and Language for this repository: [PASTE_REPO_URL]"
+    },
+    {
+      "label": "Batch repo scan",
+      "prompt": "Identify the Component Type and Language for each of the following repositories. Return one result per repo:\n1. [REPO_URL_1]\n2. [REPO_URL_2]\n3. [REPO_URL_3]"
+    },
+    {
+      "label": "Verify existing classification",
+      "prompt": "The following repository is currently classified as Component Type: [EXISTING_TYPE] and Language: [EXISTING_LANG]. Fetch its build files and verify whether this classification is correct. Repo: [REPO_URL]"
+    }
+  ],
+  "requires_repo": false,
+  "tags": [
+    "analysis",
+    "high",
+    "classification",
+    "language-detection"
+  ],
+  "downloads": 0,
+  "rating": 0,
+  "likes_count": 0,
+  "source_playbook_id": null,
+  "source_playbook_name": null
+}
