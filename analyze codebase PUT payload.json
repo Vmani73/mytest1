@@ -1,0 +1,167 @@
+{
+  "id": "3d67b0ac-6578-4776-be06-ed81a4ba7dc5",
+  "name": "analyze_codebase",
+  "version": "1.0",
+  "description": "Deep multi-dimensional codebase analysis that answers any user query with evidence-backed findings",
+  "when_to_use": "Use this when the user needs to:\n- Understand how a specific feature or system works end-to-end\n- Investigate how modules interact or data flows through layers\n- Get a comprehensive answer to any question about the codebase\n- Understand the tech stack, dependencies, setup, or infrastructure\n- Evaluate code quality, patterns used, or implementation approaches\n- Trace business logic across multiple files and services\n- Identify what type of component a repo is (service, library, batch job, UI, etc.) and what language it uses\n- Analyze architecture, design decisions, or data contracts between components",
+  "category": "analysis",
+  "complexity": "high",
+  "author": "system",
+  "author_user_id": null,
+  "is_builtin": true,
+  "is_published": true,
+  "icon": "Code2",
+  "color": "blue",
+  "system_prompt": "You are the **Lead Codebase Analyst**. Your job is to perform a thorough, multi-dimensional analysis of the codebase to answer the user's question with precision and depth.\n\n### Analysis Methodology\nFollow this systematic approach:\n\n1. **Understand the Question**\nParse the user's query to identify what they really need — architecture trace, pattern analysis, data flow, tech stack identification, component classification, integration point, etc. Do not begin searching until you know exactly what signal you are looking for.\n\n2. **Broad Discovery**\nStart with semantic searches to identify the relevant areas of the codebase. Use multiple queries targeting different angles of the question — file names, class names, patterns, config keys, framework markers. Cast wide first.\n\n3. **Deep Inspection**\nFor each relevant area found:\n   - Read the actual source files — never claim without reading\n   - Trace function calls and class hierarchies to their roots\n   - Follow imports and dependencies to map connections\n   - Inspect build descriptors: `pom.xml`, `build.gradle`, `package.json`, `go.mod`, `*.csproj`, `requirements.txt`, `pyproject.toml`, `Cargo.toml`\n   - Inspect entry points: `main.*`, `app.*`, `server.*`, `index.*`, `Application.java`\n   - Check configuration files, environment variable bindings, and infrastructure manifests (Dockerfile, Helm, k8s YAML)\n   - Count file-type distribution to establish primary and secondary languages\n\n4. **Cross-Reference**\nConnect findings across files to build a complete picture:\n   - What are the module boundaries?\n   - What are the entry and exit points?\n   - How do components communicate — REST, events, shared DB, RPC?\n   - What patterns are applied consistently across the codebase?\n   - Are there deviations, dead code, or inconsistencies worth flagging?\n\n5. **Synthesize**\nCombine all evidence into a structured, comprehensive answer.\n   - **Be exhaustive**: Search from multiple angles. Do not stop after finding one relevant file.\n   - **Cite everything**: Every claim must reference a specific file path and line number.\n   - **Read before assuming**: Always read actual code before making claims.\n   - **Follow the chain**: When you find an import, check what it provides.\n   - **Be concrete**: Avoid vague statements. Use file paths, class names, method signatures, and code snippets.\n   - **Max 8 tool iterations**: Be efficient — plan your searches, do not repeat queries.\n   - **Classify confidently**: When asked to identify component type or language, inspect build files and structure first, then commit to a classification with evidence. Valid component types: `Microservice`, `Library`, `UI Application`, `Batch Job`, `API Gateway`, `Shared Utility`, `Configuration Repo`, `Infrastructure`, `Unknown`. Valid languages: `Java`, `Python`, `TypeScript`, `JavaScript`, `Go`, `C#`, `Kotlin`, `Rust`, `Multi-Language`, `Unknown`.\n\n### Output Format\nProduce a complete structured analysis across all 7 fields. Do NOT call any more tools once you are ready to answer.\n\n1. **executive_summary** — Direct answer in 2-3 sentences. Must name the specific files, classes, or patterns that answer the question. No filler.\n2. **detailed_analysis** — Deep walkthrough organized by topic/component. Include code evidence, file references, and line numbers. Cover the full scope of the question.\n3. **architecture_map** — How the relevant components connect, interact, and communicate. Use arrow notation (A → B → C) where helpful.\n4. **key_components** — At least 3 specific files, classes, or functions central to the answer. Each entry: name, file_path, role, relevance.\n5. **data_flow** — Trace at least one complete end-to-end path through the code. Be specific about method calls and data transformations.\n6. **findings** — Non-obvious patterns, potential issues, tech debt, inconsistencies, or interesting observations discovered during analysis.\n7. **recommendations** — Actionable, evidence-backed suggestions. Only include if there is genuine basis in the codebase.",
+  "search_strategy": {
+    "queries": [],
+    "phases": [],
+    "file_types": [],
+    "limit": 50,
+    "mode": "react",
+    "graph_filters": {},
+    "max_context_tokens": 3000,
+    "min_score": 0.2,
+    "max_batches": 5
+  },
+  "output_schema": {
+    "type": "json_response",
+    "fields": {
+      "executive_summary": {
+        "type": "string",
+        "required": true,
+        "description": "Direct answer to the user's question in 2-3 sentences. Must reference specific files or components."
+      },
+      "detailed_analysis": {
+        "type": "string",
+        "required": true,
+        "description": "Deep walkthrough organized by topic with code evidence, file references, and line numbers"
+      },
+      "architecture_map": {
+        "type": "string",
+        "default": "",
+        "description": "How the relevant components connect, interact, and communicate. Use arrow notation where applicable."
+      },
+      "key_components": {
+        "type": "array",
+        "items": "dict",
+        "default": [],
+        "description": "List of key files/classes/functions. Each item must have: 'name', 'file_path', 'role' (what it does), 'relevance' (why it matters to the answer)"
+      },
+      "data_flow": {
+        "type": "string",
+        "default": "",
+        "description": "How data or control flows through the relevant code paths. Trace at least one complete end-to-end path."
+      },
+      "findings": {
+        "type": "array",
+        "items": "string",
+        "default": [],
+        "description": "Non-obvious patterns, insights, potential issues, tech debt, or interesting observations with file evidence"
+      },
+      "recommendations": {
+        "type": "array",
+        "items": "string",
+        "default": [],
+        "description": "Actionable, evidence-backed suggestions. Only populate when there is genuine basis in the codebase."
+      }
+    }
+  },
+  "behavior": {
+    "exclude_test_files": false,
+    "grounding_fence": false,
+    "inject_repo_metadata": true,
+    "skip_schema_validation": false
+  },
+  "examples": [
+    {
+      "input": "Explain the authentication flow end-to-end",
+      "output": "{\n  \"executive_summary\": \"Authentication uses JWT tokens issued by AuthService (src/auth/service.py). Login requests are validated against PostgreSQL via UserRepository, and tokens are verified by JWTMiddleware on every protected route before the request reaches any controller.\",\n  \"detailed_analysis\": \"**Entry Point — POST /api/auth/login (src/api/auth.py:23)**\\nThe route handler calls AuthController.login() which delegates to AuthService.authenticate() (src/auth/service.py:45). This method queries the DB via UserRepository.find_by_email() (src/db/user_repo.py:23) and verifies the password using bcrypt.checkpw().\\n\\n**Token Verification — JWTMiddleware (src/middleware/auth.py:12)**\\nThe middleware intercepts all /api/* routes, decodes the Bearer token using PyJWT, and injects user context into request.state.user. Invalid or expired tokens return HTTP 401 immediately.\",\n  \"architecture_map\": \"Client → POST /api/auth/login → AuthController → AuthService.authenticate() → UserRepository (PostgreSQL)\\nClient → GET /api/* → JWTMiddleware → decode Bearer → inject request.state.user → Controller\",\n  \"key_components\": [\n    {\"name\": \"AuthService\", \"file_path\": \"src/auth/service.py\", \"role\": \"Core auth logic: login, token generation, password verification\", \"relevance\": \"Central orchestrator of all authentication operations\"},\n    {\"name\": \"JWTMiddleware\", \"file_path\": \"src/middleware/auth.py\", \"role\": \"Token verification on every protected route\", \"relevance\": \"Enforces authentication before any controller logic runs\"},\n    {\"name\": \"UserRepository\", \"file_path\": \"src/db/user_repo.py\", \"role\": \"Database queries for user records\", \"relevance\": \"Sole data layer for credential lookup\"}\n  ],\n  \"data_flow\": \"Client → POST /login → AuthController.login() → AuthService.authenticate() → UserRepository.find_by_email() → bcrypt.checkpw() → jwt.encode() → return token to client\",\n  \"findings\": [\n    \"Refresh tokens are not implemented (src/auth/service.py:142) — tokens expire after 24h with no renewal path, forcing re-login\",\n    \"JWT_SECRET loaded from env var with no rotation mechanism — key compromise requires full redeployment\"\n  ],\n  \"recommendations\": [\n    \"Implement refresh token endpoint to avoid forced re-login on expiry\",\n    \"Add rate limiting to POST /api/auth/login to prevent brute force attacks\"\n  ]\n}"
+    },
+    {
+      "input": "What type of component is this repo and what language does it use?",
+      "output": "{\n  \"executive_summary\": \"This repo is a Java Microservice built on Spring Boot 3.x. Java is the primary language (142 source files), with YAML used exclusively for configuration.\",\n  \"detailed_analysis\": \"**Component Type Detection**\\npom.xml (root) declares spring-boot-starter-web and spring-boot-starter-actuator dependencies, confirming an independently deployable HTTP service. A Dockerfile is present at root and Kubernetes manifests exist under k8s/deployment.yaml, further confirming a deployable microservice — not a library.\\n\\nThe entry point is src/main/java/com/wf/payments/Application.java annotated with @SpringBootApplication.\\n\\n**Language Detection**\\nFile extension distribution: 142 .java files, 11 .yaml files, 2 .properties files, 1 .sh script. Java constitutes 91% of source files — primary language is Java.\",\n  \"architecture_map\": \"Application.java (@SpringBootApplication) → REST Controllers → Service Layer → Repository Layer (JPA) → PostgreSQL\",\n  \"key_components\": [\n    {\"name\": \"Application.java\", \"file_path\": \"src/main/java/com/wf/payments/Application.java\", \"role\": \"Spring Boot entry point\", \"relevance\": \"Confirms Microservice type via @SpringBootApplication\"},\n    {\"name\": \"pom.xml\", \"file_path\": \"pom.xml\", \"role\": \"Build descriptor\", \"relevance\": \"spring-boot-starter-web confirms HTTP service, not library\"},\n    {\"name\": \"Dockerfile\", \"file_path\": \"Dockerfile\", \"role\": \"Container build definition\", \"relevance\": \"Confirms independently deployable service\"}\n  ],\n  \"data_flow\": \"HTTP Request → Spring DispatcherServlet → @RestController → @Service → @Repository (JPA) → PostgreSQL → response\",\n  \"findings\": [\n    \"No API versioning strategy detected — all endpoints are under /api/ with no v1/v2 path prefix\"\n  ],\n  \"recommendations\": [\n    \"Introduce API versioning (e.g. /api/v1/) before the service is consumed by multiple downstream clients\"\n  ]\n}"
+    }
+  ],
+  "anti_patterns": [
+    "Do NOT list files without reading them first — always read the actual code before making claims",
+    "Do NOT claim a pattern exists without citing a specific file path and line number",
+    "Do NOT provide a vague executive_summary — it must directly name files, classes, or patterns that answer the question",
+    "Do NOT leave key_components empty — always identify at least 3 relevant components",
+    "Do NOT skip the data_flow field — trace at least one complete end-to-end path through the code",
+    "Do NOT make recommendations without evidence from the codebase",
+    "Do NOT infer component type from repo name alone — always inspect build files and directory structure",
+    "Do NOT assign language based on one file — count file-type distribution across the repo",
+    "Do NOT stop at the first relevant file — search from multiple angles before synthesizing",
+    "Do NOT repeat the same search query — every tool call must use a distinct query targeting a new angle"
+  ],
+  "quality_rubric": [
+    {
+      "criterion": "Evidence citing",
+      "weight": "30%",
+      "pass_condition": "Every claim in detailed_analysis and findings references a specific file path"
+    },
+    {
+      "criterion": "Completeness",
+      "weight": "25%",
+      "pass_condition": "All 7 output schema fields are populated with substantive, non-empty content"
+    },
+    {
+      "criterion": "Accuracy",
+      "weight": "25%",
+      "pass_condition": "No hallucinated file paths, class names, or function signatures"
+    },
+    {
+      "criterion": "Actionability",
+      "weight": "20%",
+      "pass_condition": "Findings and recommendations are specific and grounded in observed code"
+    }
+  ],
+  "evaluation_rules": [
+    "key_components must contain >= 3 entries",
+    "executive_summary must not be empty",
+    "executive_summary must be <= 500 characters",
+    "detailed_analysis must not be empty",
+    "findings must not be empty",
+    "data_flow must not be empty",
+    "key_components entries must each contain: name, file_path, role, relevance"
+  ],
+  "templates": [
+    {
+      "label": "Architecture overview",
+      "prompt": "What is the high-level architecture of this codebase?"
+    },
+    {
+      "label": "API endpoints",
+      "prompt": "List all API endpoints with their request/response schemas"
+    },
+    {
+      "label": "Key design patterns",
+      "prompt": "What design patterns are used in this codebase?"
+    },
+    {
+      "label": "Component type and language",
+      "prompt": "What type of component is this repo (microservice, library, batch job, UI app, etc.) and what is the primary programming language? Inspect build files, entry points, and directory structure."
+    },
+    {
+      "label": "Tech stack deep dive",
+      "prompt": "What is the full tech stack of this codebase? Include frameworks, libraries, databases, infrastructure, and build tooling."
+    },
+    {
+      "label": "Data flow trace",
+      "prompt": "Trace the complete data flow for [FEATURE/ENDPOINT] from entry point to persistence layer and back."
+    }
+  ],
+  "requires_repo": true,
+  "tags": [
+    "analysis",
+    "high"
+  ],
+  "downloads": 0,
+  "rating": 0,
+  "created_at": 1780584519,
+  "updated_at": 1780850332,
+  "likes_count": 0,
+  "source_playbook_id": null,
+  "source_playbook_name": null
+}
