@@ -1,0 +1,35 @@
+Build a Python CLI utility for batch-orchestrating component metadata enrichment via an internal API endpoint.
+
+REQUIREMENTS:
+
+INPUT:
+- Accept an Excel file path with columns: app_id, identifier1, identifier2, component_name, category, component_type, language, framework, version, platform, etc.
+- Filter rows where component_type is in ['Not Available', 'Others', 'Other', 'AutoRegistration', ''] OR language is in ['Others', '']
+- Extract filtered rows as list of dicts
+
+PROCESSING:
+1. POST to batch orchestrator endpoint:
+   - URL from env var BATCH_API_URL
+   - Payload: batch_id (UUID + timestamp), repos list (from env var REPO_SOURCES), components list, analysis_mode: "ast-based", output_format: "json"
+   - Auth: Bearer token from env var API_TOKEN
+2. Poll GET /{run_id} every 5 seconds until "completed" or "failed" (max 30 min timeout)
+3. Parse JSON results: extract updated component_type and language
+4. Merge back into DataFrame by unique compound key (don't overwrite: app_id, identifier1, identifier2, component_name, category)
+5. Write to output Excel with timestamp suffix
+
+ERROR HANDLING:
+- Validate input schema
+- Catch 401/403 auth errors with env var hints
+- Retry logic with exponential backoff
+- Log all requests/responses to rotated log file (no sensitive data in logs)
+- Timeout handling with run_id output for manual resume
+
+CLI:
+python batch_enrich.py --input <file> [--timeout 1800] [--log-level DEBUG] [--dry-run]
+
+OUTPUT:
+- Updated Excel file
+- Console summary (rows scanned, updated, failed)
+- Structured log file
+
+No stubs — complete, working implementation with type hints and docstrings.
