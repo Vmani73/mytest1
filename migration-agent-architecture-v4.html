@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Monolith Migration Agent</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Figtree:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --c1: #4338ca; --c1l: #eef2ff; --c1m: #c7d2fe;
+  --c2: #0369a1; --c2l: #f0f9ff; --c2m: #bae6fd;
+  --c3: #047857; --c3l: #ecfdf5; --c3m: #a7f3d0;
+  --c4: #b45309; --c4l: #fffbeb; --c4m: #fde68a;
+  --cv: #6d28d9;
+  --ink:    #0f172a;
+  --ink2:   #334155;
+  --ink3:   #64748b;
+  --line:   #e2e8f0;
+  --bg:     #ffffff;
+  --surface:#f8fafc;
+}
+
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+
+body {
+  font-family: 'Figtree', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  padding: 36px 36px 44px;
+  min-width: 1200px;
+}
+
+/* ── HEADER ── */
+.header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding-bottom: 28px; margin-bottom: 28px;
+  border-bottom: 2px solid var(--ink);
+}
+.h-left {}
+.h-eyebrow {
+  font-family: 'Figtree', sans-serif; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 2.5px; color: var(--ink3);
+  margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+.h-eyebrow span { display:inline-block; width:24px; height:2px; background:var(--ink3); }
+h1 {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 52px; font-weight: 800; line-height: 1;
+  letter-spacing: -2px; color: var(--ink);
+}
+h1 em { font-style:normal; color: var(--c1); }
+.h-sub { font-size: 14px; color: var(--ink3); margin-top: 10px; font-weight: 400; max-width: 520px; line-height: 1.55; }
+.h-sub b { color: var(--ink); font-weight: 600; }
+
+.h-stats { display: flex; gap: 0; border: 1.5px solid var(--line); border-radius: 14px; overflow: hidden; }
+.hstat {
+  padding: 16px 24px; text-align: center; border-right: 1.5px solid var(--line);
+}
+.hstat:last-child { border-right: none; }
+.hstat-val {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 32px; font-weight: 800; line-height: 1; margin-bottom: 4px;
+}
+.hstat-lbl { font-size: 10px; font-weight: 600; color: var(--ink3); text-transform: uppercase; letter-spacing: 0.8px; }
+.sv1 { color: var(--c1); } .sv2 { color: var(--c2); } .sv3 { color: var(--c3); } .sv4 { color: var(--c4); }
+
+/* ── MAIN LAYOUT ── */
+.main {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  grid-template-rows: repeat(4, auto);
+  margin-bottom: 16px;
+}
+.right-panel {
+  grid-column: 2; grid-row: 1 / 5;
+  border-left: 1.5px solid var(--line);
+  padding-left: 20px; padding-bottom: 20px;
+  display: flex; flex-direction: column; gap: 0;
+}
+
+/* ── PHASE BANDS ── */
+.phase-band {
+  display: flex; align-items: stretch;
+  border-bottom: 1.5px solid var(--line);
+  padding: 22px 20px 22px 0;
+  gap: 18px; position: relative;
+}
+.phase-band:last-child { border-bottom: none; }
+
+/* colored left stripe */
+.phase-stripe {
+  width: 5px; border-radius: 3px; flex-shrink: 0; align-self: stretch;
+}
+.p1 .phase-stripe { background: var(--c1); }
+.p2 .phase-stripe { background: var(--c2); }
+.p3 .phase-stripe { background: var(--c3); }
+.p4 .phase-stripe { background: var(--c4); }
+
+/* phase meta */
+.phase-meta { width: 200px; flex-shrink: 0; }
+.phase-num {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 56px; font-weight: 800; line-height: 1;
+  letter-spacing: -3px; margin-bottom: 4px;
+}
+.p1 .phase-num { color: var(--c1); }
+.p2 .phase-num { color: var(--c2); }
+.p3 .phase-num { color: var(--c3); }
+.p4 .phase-num { color: var(--c4); }
+
+.phase-name {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 14px; font-weight: 700; color: var(--ink);
+  text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 5px;
+}
+.phase-desc { font-size: 11px; color: var(--ink3); line-height: 1.45; font-weight: 400; }
+
+/* phase badge */
+.phase-badge {
+  margin-top: 10px; display: inline-block;
+  font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 3px 9px; border-radius: 20px; font-family: 'Figtree', sans-serif;
+}
+.p1 .phase-badge { background: var(--c1l); color: var(--c1); border: 1px solid var(--c1m); }
+.p2 .phase-badge { background: var(--c2l); color: var(--c2); border: 1px solid var(--c2m); }
+.p3 .phase-badge { background: var(--c3l); color: var(--c3); border: 1px solid var(--c3m); }
+.p4 .phase-badge { background: var(--c4l); color: var(--c4); border: 1px solid var(--c4m); }
+
+/* divider between meta and chips */
+.phase-divider-v {
+  width: 1px; background: var(--line); flex-shrink: 0; margin: 4px 0;
+}
+
+/* chips area */
+.phase-chips {
+  flex: 1; display: flex; flex-wrap: wrap; align-content: flex-start;
+  gap: 8px; padding-top: 6px;
+}
+
+.chip {
+  display: flex; align-items: center; gap: 7px;
+  padding: 9px 13px; border-radius: 10px;
+  border: 1.5px solid; background: white;
+  transition: transform 0.15s, box-shadow 0.15s;
+  cursor: default;
+}
+.chip:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+
+.p1 .chip { border-color: var(--c1m); }
+.p2 .chip { border-color: var(--c2m); }
+.p3 .chip { border-color: var(--c3m); }
+.p4 .chip { border-color: var(--c4m); }
+
+.p1 .chip:hover { background: var(--c1l); }
+.p2 .chip:hover { background: var(--c2l); }
+.p3 .chip:hover { background: var(--c3l); }
+.p4 .chip:hover { background: var(--c4l); }
+
+.chip-icon { font-size: 16px; flex-shrink: 0; }
+.chip-body {}
+.chip-name { font-size: 12px; font-weight: 700; color: var(--ink); display: block; white-space: nowrap; }
+.chip-sub  { font-size: 10px; color: var(--ink3); display: block; white-space: nowrap; }
+
+/* gate marker on right edge of each phase */
+.phase-gate {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 4px; flex-shrink: 0; width: 52px;
+}
+.gate-circle {
+  width: 32px; height: 32px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; border: 2px solid;
+}
+.p1 .gate-circle { border-color: var(--c1); background: var(--c1l); }
+.p2 .gate-circle { border-color: var(--c2); background: var(--c2l); }
+.p3 .gate-circle { border-color: var(--c3); background: var(--c3l); }
+.p4 .gate-circle { border-color: var(--c4); background: var(--c4l); }
+.gate-lbl { font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; text-align: center; }
+.p1 .gate-lbl { color: var(--c1); }
+.p2 .gate-lbl { color: var(--c2); }
+.p3 .gate-lbl { color: var(--c3); }
+.p4 .gate-lbl { color: var(--c4); }
+
+/* ── RIGHT PANEL — ORCHESTRATOR ── */
+.rp-label {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 2px; color: var(--ink3); margin-bottom: 14px;
+  padding-top: 4px;
+}
+
+.master-card {
+  background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  border: 1.5px solid #ddd6fe; border-radius: 12px;
+  padding: 14px 14px 12px; margin-bottom: 16px;
+}
+.mc-head { display: flex; align-items: center; gap: 9px; margin-bottom: 7px; }
+.mc-icon { font-size: 22px; }
+.mc-name { font-family: 'Bricolage Grotesque', sans-serif; font-size: 14px; font-weight: 800; color: var(--cv); }
+.mc-sub  { font-size: 10px; color: #7c3aed; font-weight: 500; line-height: 1.4; }
+
+.mc-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.mc-tag {
+  font-size: 9px; font-weight: 600; padding: 2px 7px; border-radius: 20px;
+  background: rgba(109,40,217,0.08); color: var(--cv); border: 1px solid #ddd6fe;
+}
+
+/* flow arrows */
+.flow-arrows {
+  display: flex; justify-content: space-around; margin-bottom: 8px;
+}
+.fa { display: flex; flex-direction: column; align-items: center; gap: 0; }
+.fa-line { width: 1px; height: 12px; background: linear-gradient(to bottom, #c4b5fd, #e9d5ff); }
+.fa-tip  { width: 0; height: 0; border-left: 3px solid transparent; border-right: 3px solid transparent; border-top: 4px solid #c4b5fd; }
+
+/* agent grid */
+.agent-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; flex: 1; }
+.ag {
+  border-radius: 9px; padding: 10px 9px; border: 1.5px solid var(--line);
+  background: var(--surface); transition: border-color 0.15s, background 0.15s;
+}
+.ag:hover { border-color: #c4b5fd; background: #faf5ff; }
+.ag-top { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.ag-icon { font-size: 14px; }
+.ag-name { font-family: 'Bricolage Grotesque', sans-serif; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.2px; color: var(--ink); }
+.ag-desc { font-size: 9px; color: var(--ink3); line-height: 1.3; }
+
+/* ── BOTTOM: AGENTS STRIP ── */
+.agents-strip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 0 0; border-top: 1.5px solid var(--line);
+  margin-top: 4px;
+}
+.as-label {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
+  color: var(--ink3); writing-mode: vertical-lr; transform: rotate(180deg);
+  flex-shrink: 0;
+}
+.as-cards { display: flex; gap: 8px; flex: 1; }
+.asc {
+  flex: 1; border-radius: 10px; padding: 10px 11px;
+  border: 1.5px solid var(--line); background: var(--surface);
+  display: flex; align-items: center; gap: 9px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.asc:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.07); }
+.asc:nth-child(1):hover { border-color: var(--c1m); background: var(--c1l); }
+.asc:nth-child(2):hover { border-color: var(--c2m); background: var(--c2l); }
+.asc:nth-child(3):hover { border-color: var(--c2m); background: var(--c2l); }
+.asc:nth-child(4):hover { border-color: var(--c3m); background: var(--c3l); }
+.asc:nth-child(5):hover { border-color: var(--c3m); background: var(--c3l); }
+.asc:nth-child(6):hover { border-color: var(--c4m); background: var(--c4l); }
+.asc-icon { font-size: 18px; flex-shrink: 0; }
+.asc-name { font-family: 'Bricolage Grotesque', sans-serif; font-size: 11px; font-weight: 800; text-transform: uppercase; color: var(--ink); display: block; margin-bottom: 1px; }
+.asc-role { font-size: 9.5px; color: var(--ink3); line-height: 1.3; }
+
+/* ── OUTCOME ── */
+.outcome {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 0 0; border-top: 1.5px solid var(--line); margin-top: 12px;
+  flex-wrap: wrap;
+}
+.out-label {
+  font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: var(--ink);
+  flex-shrink: 0;
+}
+.out-separator { width: 1px; height: 20px; background: var(--line); flex-shrink: 0; }
+.out-tags { display: flex; flex-wrap: wrap; gap: 7px; }
+.otag {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border-radius: 30px;
+  border: 1.5px solid var(--line); background: var(--surface);
+  font-size: 11px; font-weight: 600; color: var(--ink);
+  transition: border-color 0.15s;
+}
+.otag:hover { border-color: var(--ink); }
+.otag-icon { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="h-left">
+    <div class="h-eyebrow"><span></span>GitHub Copilot Agent Mode · .github/agents</div>
+    <h1>Monolith<br/><em>Migration</em> Agent</h1>
+    <p class="h-sub">Governed, evidence-driven decomposition — <b>zero behavioral regression</b>, fully auditable, enterprise-native. Runs entirely inside your repo's <b>.github folder</b>.</p>
+  </div>
+  <div class="h-stats">
+    <div class="hstat"><div class="hstat-val sv1">7</div><div class="hstat-lbl">Agents</div></div>
+    <div class="hstat"><div class="hstat-val sv2">6</div><div class="hstat-lbl">Hard Gates</div></div>
+    <div class="hstat"><div class="hstat-val sv3">0</div><div class="hstat-lbl">Regressions</div></div>
+    <div class="hstat"><div class="hstat-val sv4">100%</div><div class="hstat-lbl">Auditable</div></div>
+  </div>
+</div>
+
+<!-- MAIN GRID -->
+<div class="main">
+
+  <!-- PHASE 1 -->
+  <div class="phase-band p1">
+    <div class="phase-stripe"></div>
+    <div class="phase-meta">
+      <div class="phase-num">01</div>
+      <div class="phase-name">Discovery &amp; Intelligence</div>
+      <div class="phase-desc">Complete inventory from source — no Gradle, no JDK, no hanging scripts.</div>
+      <div class="phase-badge">inventory agent · phase 0</div>
+    </div>
+    <div class="phase-divider-v"></div>
+    <div class="phase-chips">
+      <div class="chip"><span class="chip-icon">📦</span><div class="chip-body"><span class="chip-name">Module Topology</span><span class="chip-sub">34+ modules via find</span></div></div>
+      <div class="chip"><span class="chip-icon">🚪</span><div class="chip-body"><span class="chip-name">Entry Point Scan</span><span class="chip-sub">HTTP · Kafka · JMS · batch · CLI</span></div></div>
+      <div class="chip"><span class="chip-icon">💾</span><div class="chip-body"><span class="chip-name">Persistence Map</span><span class="chip-sub">Entities · SQL · Flyway · native queries</span></div></div>
+      <div class="chip"><span class="chip-icon">⚡</span><div class="chip-body"><span class="chip-name">Transaction Sites</span><span class="chip-sub">@Transactional — saga candidates</span></div></div>
+      <div class="chip"><span class="chip-icon">⚠️</span><div class="chip-body"><span class="chip-name">Risk Surface</span><span class="chip-sub">Untested controllers · missing APM</span></div></div>
+    </div>
+    <div class="phase-gate">
+      <div class="gate-circle">📋</div>
+      <div class="gate-lbl">Inventory<br/>Gate</div>
+    </div>
+  </div>
+
+  <!-- PHASE 2 -->
+  <div class="phase-band p2">
+    <div class="phase-stripe"></div>
+    <div class="phase-meta">
+      <div class="phase-num">02</div>
+      <div class="phase-name">Domain Analysis</div>
+      <div class="phase-desc">Three-signal fusion — static analysis alone lies about coupling.</div>
+      <div class="phase-badge">domain + boundaries · phases 1–2</div>
+    </div>
+    <div class="phase-divider-v"></div>
+    <div class="phase-chips">
+      <div class="chip"><span class="chip-icon">🔀</span><div class="chip-body"><span class="chip-name">Git Co-change</span><span class="chip-sub">Logical coupling from history</span></div></div>
+      <div class="chip"><span class="chip-icon">🕸️</span><div class="chip-body"><span class="chip-name">Coupling Graph</span><span class="chip-sub">Community detection on import edges</span></div></div>
+      <div class="chip"><span class="chip-icon">🏛️</span><div class="chip-body"><span class="chip-name">Bounded Contexts</span><span class="chip-sub">DDD recovery · aggregates · events</span></div></div>
+      <div class="chip"><span class="chip-icon">📊</span><div class="chip-body"><span class="chip-name">Boundary Scoring</span><span class="chip-sub">Cohesion ratio · cut-edges · data verdict</span></div></div>
+      <div class="chip"><span class="chip-icon">🔐</span><div class="chip-body"><span class="chip-name">Human Ratification</span><span class="chip-sub">Boundary = business decision, not graph output</span></div></div>
+    </div>
+    <div class="phase-gate">
+      <div class="gate-circle">✍️</div>
+      <div class="gate-lbl">Human<br/>Gate</div>
+    </div>
+  </div>
+
+  <!-- PHASE 3 -->
+  <div class="phase-band p3">
+    <div class="phase-stripe"></div>
+    <div class="phase-meta">
+      <div class="phase-num">03</div>
+      <div class="phase-name">Safe Extraction</div>
+      <div class="phase-desc">Strangler-fig with behavioral equivalence oracle. Cutover blocked until proof.</div>
+      <div class="phase-badge">extractor + verifier · phases 3–4</div>
+    </div>
+    <div class="phase-divider-v"></div>
+    <div class="phase-chips">
+      <div class="chip"><span class="chip-icon">🌱</span><div class="chip-body"><span class="chip-name">Strangler Seam</span><span class="chip-sub">Pure refactor · existing suite stays green</span></div></div>
+      <div class="chip"><span class="chip-icon">🎬</span><div class="chip-body"><span class="chip-name">Record-Replay Diff</span><span class="chip-sub">Shadow traffic · zero unexplained diffs</span></div></div>
+      <div class="chip"><span class="chip-icon">📋</span><div class="chip-body"><span class="chip-name">Contract Tests</span><span class="chip-sub">Pact / Spring Cloud Contract both sides</span></div></div>
+      <div class="chip"><span class="chip-icon">🗄️</span><div class="chip-body"><span class="chip-name">Data Reconciliation</span><span class="chip-sub">CDC + outbox · row counts · checksums</span></div></div>
+      <div class="chip"><span class="chip-icon">⏱️</span><div class="chip-body"><span class="chip-name">Latency Budget</span><span class="chip-sub">p95/p99 gate before any cutover</span></div></div>
+    </div>
+    <div class="phase-gate">
+      <div class="gate-circle">🔬</div>
+      <div class="gate-lbl">Proof<br/>Gate</div>
+    </div>
+  </div>
+
+  <!-- PHASE 4 -->
+  <div class="phase-band p4">
+    <div class="phase-stripe"></div>
+    <div class="phase-meta">
+      <div class="phase-num">04</div>
+      <div class="phase-name">Harden &amp; Cutover</div>
+      <div class="phase-desc">Every new network edge fortified. Progressive cutover, full evidence trail.</div>
+      <div class="phase-badge">hardener · phase 5</div>
+    </div>
+    <div class="phase-divider-v"></div>
+    <div class="phase-chips">
+      <div class="chip"><span class="chip-icon">⚙️</span><div class="chip-body"><span class="chip-name">Resilience Gates</span><span class="chip-sub">Timeout · retry · breaker · bulkhead</span></div></div>
+      <div class="chip"><span class="chip-icon">🔒</span><div class="chip-body"><span class="chip-name">Security Boundary</span><span class="chip-sub">mTLS · authN/Z · least-privilege · vault</span></div></div>
+      <div class="chip"><span class="chip-icon">📡</span><div class="chip-body"><span class="chip-name">Observability First</span><span class="chip-sub">Traces · RED metrics · alerts before cutover</span></div></div>
+      <div class="chip"><span class="chip-icon">🚦</span><div class="chip-body"><span class="chip-name">Progressive Cutover</span><span class="chip-sub">Shadow → 5% canary → ramp → 100%</span></div></div>
+      <div class="chip"><span class="chip-icon">📁</span><div class="chip-body"><span class="chip-name">STATE.md Trail</span><span class="chip-sub">Every gate decision — fully auditable</span></div></div>
+    </div>
+    <div class="phase-gate">
+      <div class="gate-circle">✅</div>
+      <div class="gate-lbl">Done<br/>Gate</div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div class="right-panel">
+    <div class="rp-label">Orchestration Layer</div>
+
+    <div class="master-card">
+      <div class="mc-head">
+        <span class="mc-icon">🤖</span>
+        <div>
+          <div class="mc-name">migration-master</div>
+          <div class="mc-sub">Reads STATE.md · auto-routes to correct specialist · enforces all gates</div>
+        </div>
+      </div>
+      <div class="mc-tags">
+        <span class="mc-tag">Auto-Switch</span>
+        <span class="mc-tag">State Machine</span>
+        <span class="mc-tag">Gate Enforcer</span>
+      </div>
+    </div>
+
+    <div class="flow-arrows">
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+      <div class="fa"><div class="fa-line"></div><div class="fa-tip"></div></div>
+    </div>
+
+    <div class="agent-grid">
+      <div class="ag"><div class="ag-top"><span class="ag-icon">🔍</span><span class="ag-name">Inventory</span></div><div class="ag-desc">Runs scripts · surfaces risks to RISK.md</div></div>
+      <div class="ag"><div class="ag-top"><span class="ag-icon">🗺️</span><span class="ag-name">Domain</span></div><div class="ag-desc">3-signal fusion → domain-map.md</div></div>
+      <div class="ag"><div class="ag-top"><span class="ag-icon">📊</span><span class="ag-name">Boundaries</span></div><div class="ag-desc">Graph scoring · human gate</div></div>
+      <div class="ag"><div class="ag-top"><span class="ag-icon">🔧</span><span class="ag-name">Extractor</span></div><div class="ag-desc">Seam · ACL · data · saga design</div></div>
+      <div class="ag"><div class="ag-top"><span class="ag-icon">✅</span><span class="ag-name">Verifier</span></div><div class="ag-desc">Hard PASS/FAIL · equivalence oracle</div></div>
+      <div class="ag"><div class="ag-top"><span class="ag-icon">🛡️</span><span class="ag-name">Hardener</span></div><div class="ag-desc">Resilience · security · cutover</div></div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<!-- AGENTS FULL STRIP -->
+<div class="agents-strip">
+  <div class="as-label">Agent Flow</div>
+  <div class="as-cards">
+    <div class="asc"><span class="asc-icon">🔍</span><div><span class="asc-name">Inventory</span><span class="asc-role">Runs inventory.sh · risks into RISK.md</span></div></div>
+    <div class="asc"><span class="asc-icon">🗺️</span><div><span class="asc-name">Domain</span><span class="asc-role">Co-change + static + traces → domain map</span></div></div>
+    <div class="asc"><span class="asc-icon">📊</span><div><span class="asc-name">Boundaries</span><span class="asc-role">Graph scoring · stops for ratification</span></div></div>
+    <div class="asc"><span class="asc-icon">🔧</span><div><span class="asc-name">Extractor</span><span class="asc-role">Seam · ACL · data ownership · saga</span></div></div>
+    <div class="asc"><span class="asc-icon">✅</span><div><span class="asc-name">Verifier</span><span class="asc-role">PASS/FAIL · replay diff · reconciliation</span></div></div>
+    <div class="asc"><span class="asc-icon">🛡️</span><div><span class="asc-name">Hardener</span><span class="asc-role">Resilience · security · progressive cutover</span></div></div>
+  </div>
+</div>
+
+<!-- OUTCOME -->
+<div class="outcome">
+  <div class="out-label">Outcome</div>
+  <div class="out-separator"></div>
+  <div class="out-tags">
+    <div class="otag"><span class="otag-icon">🎯</span>Zero Behavioral Regression</div>
+    <div class="otag"><span class="otag-icon">🔁</span>Always Reversible</div>
+    <div class="otag"><span class="otag-icon">📋</span>Full Evidence Trail</div>
+    <div class="otag"><span class="otag-icon">🔒</span>Secure by Design</div>
+    <div class="otag"><span class="otag-icon">⚡</span>Faster Delivery</div>
+    <div class="otag"><span class="otag-icon">🏢</span>Enterprise Native</div>
+  </div>
+</div>
+
+</body>
+</html>
