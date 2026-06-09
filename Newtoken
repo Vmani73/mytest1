@@ -1,0 +1,402 @@
+# Copilot Agent Mode — Tool Output Deduplication for Token Reduction
+
+-----
+
+## WHAT YOU ARE BUILDING
+
+My Python agentic codebase injects tool outputs into the LLM context on every turn:
+
+- File reads (source code, config files)
+- Shell / tool command outputs
+- API call responses
+- RAG / document retrieval results
+
+The problem: the SAME content gets re-injected multiple times across turns.
+Every re-injection costs the same tokens as the first injection.
+
+You are building a deduplication layer that:
+
+1. Intercepts every piece of content BEFORE it is injected into context
+1. On first occurrence: stores the content, injects it normally
+1. On repeat occurrence: injects a short reference token instead (e.g. `[ref:a3f9b]`)
+1. Tracks tokens saved per turn and per session
+1. NEVER removes content the model has not seen yet
+1. NEVER modifies or summarizes content — only deduplicates exact repeats
+
+Quality is not impacted because the model already saw the full content
+on first injection. Re-sending it adds zero new information.
+
+-----
+
+## STEP 1 — SCAN FIRST, TOUCH NOTHING
+
+Scan the entire codebase and find every place where tool output is
+assembled into the messages list before a vmani LLM call.
+
+Specifically look for:
+
+- File read results being appended to messages or context strings
+- Tool call / function call results being added to message history
+- API response bodies being injected into context
+- Retrieved document chunks being added to the prompt
+
+For each location report:
+
+- File path and function name
+- The variable name holding the content
+- Whether the same content could appear in multiple turns
+  (e.g. reading the same file twice, same API called twice)
+- Approximate size (line count or character count)
+
+Show me this list. Wait for my confirmation before writing any code.
+
+-----
+
+## STEP 2 — BUILD `tool_dedup.py`
+
+After I confirm the scan, create ONE new file `tool_dedup.py`
+at the project root. Nothing else changes yet.
+
+### The store
+
+```python
+import hashlib
+import json
+import threading
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class DedupEntry:
+    content_hash: str
+    original_tokens: int
+    first_seen_turn: int
+    ref_token: str          # e.g. "[ref:a3f9b]"
+
+@dataclass 
+class DedupStore:
+    """
+    In-memory store for this session.
+    Thread-safe. Resets between agent sessions.
+    Never persists to disk — content may be sensitive.
+    """
+    _entries: dict = field(default_factory=dict)  # hash -> DedupEntry
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _current_turn: int = 0
+    _tokens_saved: int = 0
+    _total_dedup_hits: int = 0
+```
+
+### Token counting
+
+```python
+def _count_tokens(text: str) -> int:
+    """
+    Count tokens using tiktoken.
+    Falls back to len(text.split()) if tiktoken unavailable.
+    Never raises.
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text.split())
+```
+
+### Content hashing
+
+```python
+def _hash_content(content: str) -> str:
+    """
+    SHA-256 of the exact content string.
+    Same content = same hash, always.
+    Strips leading/trailing whitespace before hashing
+    so trivial formatting differences do not cause cache misses.
+    """
+    return hashlib.sha256(content.strip().encode()).hexdigest()[:10]
+```
+
+### The main function — the ONLY thing called from agent code
+
+```python
+def maybe_deduplicate(
+    store: DedupStore,
+    content: str,
+    content_type: str,   # "file_read" | "tool_output" | "api_response" | "rag_chunk"
+    label: str = "",     # human-readable label e.g. filename, tool name
+) -> str:
+    """
+    Returns either:
+    - The original content (first time this content is seen this session)
+    - A short reference string (if content was already injected earlier)
+
+    NEVER modifies content. NEVER summarizes. NEVER loses information.
+    The model has already seen the full content on first occurrence.
+
+    Args:
+        store:        The session-scoped DedupStore
+        content:      The raw tool output string to potentially deduplicate
+        content_type: Category of content for logging/reporting
+        label:        Human label for logging (e.g. filename)
+
+    Returns:
+        str: original content OR reference token
+    """
+    if not content or not content.strip():
+        return content  # never deduplicate empty content
+
+    content_hash = _hash_content(content)
+    token_count = _count_tokens(content)
+
+    with store._lock:
+        if content_hash in store._entries:
+            entry = store._entries[content_hash]
+            store._tokens_saved += token_count
+            store._total_dedup_hits += 1
+            ref = entry.ref_token
+            logging.info(
+                f"[dedup] HIT {content_type} '{label}' "
+                f"hash={content_hash} "
+                f"saved={token_count} tokens "
+                f"(first seen turn {entry.first_seen_turn}, "
+                f"now turn {store._current_turn})"
+            )
+            return (
+                f"{ref}\n"
+                f"# [dedup: this {content_type} was already injected in full "
+                f"at turn {entry.first_seen_turn}. "
+                f"Saved {token_count} tokens.]"
+            )
+        else:
+            ref_token = f"[ref:{content_hash}]"
+            store._entries[content_hash] = DedupEntry(
+                content_hash=content_hash,
+                original_tokens=token_count,
+                first_seen_turn=store._current_turn,
+                ref_token=ref_token,
+            )
+            logging.info(
+                f"[dedup] NEW {content_type} '{label}' "
+                f"hash={content_hash} "
+                f"tokens={token_count} "
+                f"(stored for dedup)"
+            )
+            return content  # return original — first time
+```
+
+### Turn tracking
+
+```python
+def advance_turn(store: DedupStore) -> None:
+    """Call this at the start of each agent turn."""
+    with store._lock:
+        store._current_turn += 1
+
+def reset_session(store: DedupStore) -> None:
+    """Call this at the start of a new agent session."""
+    with store._lock:
+        store._entries.clear()
+        store._current_turn = 0
+        store._tokens_saved = 0
+        store._total_dedup_hits = 0
+```
+
+### Session report
+
+```python
+def session_report(store: DedupStore) -> dict:
+    """
+    Returns measured savings for this session.
+    All numbers are exact — counted with tiktoken, not estimated.
+    """
+    with store._lock:
+        total_original = sum(
+            e.original_tokens for e in store._entries.values()
+        )
+        return {
+            "turns": store._current_turn,
+            "unique_content_pieces": len(store._entries),
+            "dedup_hits": store._total_dedup_hits,
+            "tokens_saved_by_dedup": store._tokens_saved,
+            "total_unique_content_tokens": total_original,
+            "note": (
+                "tokens_saved_by_dedup is the exact number of tokens "
+                "NOT sent to vmani because of deduplication. "
+                "Counted with tiktoken on actual content."
+            )
+        }
+
+def print_session_report(store: DedupStore) -> None:
+    report = session_report(store)
+    print("\n=== DEDUP SESSION REPORT ===")
+    print(f"Turns           : {report['turns']}")
+    print(f"Unique pieces   : {report['unique_content_pieces']}")
+    print(f"Dedup hits      : {report['dedup_hits']}")
+    print(f"Tokens saved    : {report['tokens_saved_by_dedup']}")
+    print(f"Note            : {report['note']}")
+    print("============================\n")
+```
+
+-----
+
+## STEP 3 — MINIMAL CHANGES TO EXISTING CALL SITES
+
+After building `tool_dedup.py`, show me a diff of the minimal change
+needed at each call site identified in Step 1.
+
+The change at each site is exactly this pattern:
+
+```python
+# BEFORE — content injected directly
+messages.append({
+    "role": "tool",
+    "content": file_content      # could be 800 tokens, sent every turn
+})
+
+# AFTER — content passed through dedup first
+from tool_dedup import maybe_deduplicate
+messages.append({
+    "role": "tool",
+    "content": maybe_deduplicate(
+        store=dedup_store,
+        content=file_content,
+        content_type="file_read",
+        label="AuthService.java"
+    )
+})
+```
+
+That is the ONLY change to existing files. One function call wrapping
+the content. Nothing else moves.
+
+Show me the diff. Wait for my confirmation before applying it.
+
+-----
+
+## STEP 4 — SESSION LIFECYCLE INTEGRATION
+
+Show me where in the existing code to add:
+
+```python
+# At agent session START
+from tool_dedup import DedupStore, reset_session
+dedup_store = DedupStore()
+
+# At each turn START  
+from tool_dedup import advance_turn
+advance_turn(dedup_store)
+
+# At agent session END
+from tool_dedup import print_session_report
+print_session_report(dedup_store)
+```
+
+Identify the exact existing functions where these belong.
+Do not add them until I confirm.
+
+-----
+
+## STEP 5 — TESTS
+
+Create `tests/test_tool_dedup.py` with these tests.
+All tests run fully offline. No vmani calls.
+
+**Test 1 — First occurrence returns original content unchanged**
+
+```
+content = "class AuthService { ... }" (any non-empty string)
+result = maybe_deduplicate(store, content, "file_read", "auth.java")
+assert result == content
+```
+
+**Test 2 — Second occurrence returns reference, not original**
+
+```
+call maybe_deduplicate twice with identical content
+second result must NOT equal content
+second result must contain "[ref:"
+second result must contain "already injected"
+```
+
+**Test 3 — Whitespace difference does NOT cause cache miss**
+
+```
+content_a = "hello world"
+content_b = "  hello world  "   # same, just padded
+inject content_a first
+inject content_b second
+second result must be a reference (same hash)
+```
+
+**Test 4 — Different content is NOT deduplicated**
+
+```
+inject "content A"
+inject "content B"  (different)
+both results must equal their original content
+```
+
+**Test 5 — tokens_saved is exact**
+
+```
+inject content of known token count (count with tiktoken first)
+inject same content again
+assert store._tokens_saved == exact token count of content
+```
+
+**Test 6 — reset_session clears everything**
+
+```
+inject content, create dedup hit
+call reset_session
+inject same content again — must return original (not reference)
+assert store._tokens_saved == 0
+```
+
+**Test 7 — Thread safety**
+
+```
+from concurrent.futures import ThreadPoolExecutor
+inject same content from 10 threads simultaneously
+assert store._total_dedup_hits == 9 (first one stores, 9 are hits)
+```
+
+**Test 8 — Empty content passes through unchanged**
+
+```
+result = maybe_deduplicate(store, "", "file_read", "empty")
+assert result == ""
+result = maybe_deduplicate(store, "   ", "file_read", "whitespace")
+assert result == "   "
+```
+
+-----
+
+## DELIVERABLES
+
+1. `tool_dedup.py` — complete, as specified above
+1. `tests/test_tool_dedup.py` — all 8 tests passing offline
+1. A diff of minimal changes to each call site (do not apply until I confirm)
+1. Exact locations to add session lifecycle calls (do not add until I confirm)
+
+-----
+
+## ABSOLUTE RULES
+
+- Do NOT apply changes to existing files until I approve the diff
+- Do NOT summarize, truncate, or modify content — only replace
+  exact repeats with reference tokens
+- Do NOT persist content to disk — store is in-memory only,
+  content may be sensitive
+- Do NOT add any dependency not already in requirements.txt
+  except tiktoken (already in use in this project)
+- Do NOT deduplicate content shorter than 20 tokens —
+  the overhead is not worth it for tiny strings
+- Do NOT claim savings numbers — only report what tiktoken
+  actually counted
+- Do NOT use bare except — catch specific exceptions,
+  log with stdlib logging, never crash the agent
+- The agent must produce IDENTICAL output whether dedup
+  is enabled or disabled — it only changes token count,
+  never content seen by the model for the first time
