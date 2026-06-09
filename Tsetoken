@@ -1,0 +1,251 @@
+# Copilot Agent Mode — Token Reduction in My Agentic Codebase
+
+-----
+
+## WHAT YOU ARE DOING
+
+You are modifying my existing Python agentic codebase to reduce the number of tokens
+sent to the LLM API (referred to as `vmani` in this prompt) on each call.
+
+You are NOT building a standalone library.
+You are NOT building a new service.
+You are modifying code that already exists in this repo.
+
+-----
+
+## CRITICAL RULES BEFORE YOU WRITE A SINGLE LINE
+
+1. **Scan first, touch nothing.** Before modifying any file, scan the entire codebase and
+   identify every location where an HTTP call or SDK call is made to `vmani`. List every
+   file path and line number. Show me the list and wait for my confirmation before
+   proceeding.
+1. **Do not assume the call shape.** Read the actual call in the code. Do not assume it
+   uses any specific SDK, HTTP client, or message format. Derive the structure from what
+   is already there.
+1. **Do not claim savings.** You are adding measurement and reduction logic. Whether it
+   actually saves tokens on my specific traffic is unknown until it runs. Do not write
+   comments, docstrings, or README text that claims a specific % saving. Write “may
+   reduce” not “reduces by X%”.
+1. **Quality must not be impacted.** Every reduction technique must be optional and
+   independently toggleable via a config flag. All techniques must be FAIL-SAFE: if
+   anything inside the reduction logic raises an exception, the original unmodified
+   call must go through unchanged. The agent’s output must be byte-identical to what
+   it was before when a technique is disabled or errors.
+1. **Do not add any dependency that is not already in requirements.txt.** Read
+   requirements.txt first. Use only what is already there plus the Python standard
+   library. If a technique you want to add needs a package that is not present, flag it
+   to me and ask — do not add it silently.
+1. **Do not move or rename anything.** Do not restructure the project, rename files,
+   or change import paths in existing code. Add new files only if necessary.
+
+-----
+
+## STEP 1 — SCAN
+
+Scan the entire Python codebase for `vmani` LLM call sites.
+
+Look for patterns such as:
+
+- Any HTTP POST call where the URL or a variable contains references to a chat or
+  completion endpoint
+- Any function call where `messages` (a list of dicts with `role` and `content`) is
+  passed as an argument
+- Any reference to model names, chat completions, or similar patterns that suggest an
+  LLM call
+
+For each match, report:
+
+- File path
+- Function or method name it lives in
+- The exact lines of the call
+- What the `messages` variable looks like at that point (its type, where it comes from)
+
+Do not modify anything yet. Show me this list.
+
+-----
+
+## STEP 2 — WRAP (only after I confirm the scan)
+
+For each confirmed call site, wrap it with a `vmani_call` function defined in a new
+file `vmani_wrapper.py` at the project root.
+
+The wrapper must:
+
+```
+def vmani_call(call_fn, messages, model, params, config):
+    """
+    Wraps a single vmani LLM call.
+    call_fn   — the original callable that makes the real LLM call
+    messages  — the original messages list
+    model     — the model string
+    params    — all other kwargs the original call used
+    config    — VmaniConfig instance
+    Returns the same response object/dict that call_fn returns.
+    """
+```
+
+Inside `vmani_call`, run these techniques IN ORDER, each guarded by its config flag
+and its own `try/except`:
+
+### Technique 1 — Exact cache
+
+- Compute a cache key: `sha256` of the canonical JSON of
+  `{model, messages, temperature, max_tokens}` (use `json.dumps` with `sort_keys=True`,
+  round floats to 3dp before hashing).
+- Check an in-memory dict (with TTL) for this key.
+- If hit: return the cached response directly. Do NOT call `call_fn`.
+- If miss: proceed.
+- After a real call: store the response in the cache.
+- Guard: the entire cache lookup and store in `try/except Exception`; on error, log
+  with `logging.warning` and continue as if cache does not exist.
+
+### Technique 2 — Prompt slimming
+
+- Operate ONLY on the `content` field of the LAST message in `messages` where
+  `role == "user"`.
+- Apply these transformations using `re` (stdlib only):
+  - Collapse 3 or more consecutive blank lines into one
+  - Remove lines that are ONLY a comment (`#...` or `//...`) with nothing else
+  - Remove `/* ... */` block comments
+  - Strip trailing whitespace from each line
+- Do NOT touch any other message. Do NOT touch code inside fenced code blocks
+  (` ` ``` or ~~~). Preserve everything inside fenced blocks exactly.
+- Count tokens before and after using `tiktoken` if available, else `len(text.split())`.
+- Record the before/after counts in the measurement record.
+- Guard: entire slimming in `try/except Exception`; on error use original messages.
+
+### Technique 3 — Model routing
+
+- Only active if BOTH `config.simple_model` and `config.complex_model` are set.
+- Count total tokens in all messages using `tiktoken` if available, else word count.
+- If total <= `config.routing_threshold`: use `config.simple_model`.
+- If total > `config.routing_threshold`: use `config.complex_model`.
+- Log the decision at DEBUG level.
+- Guard: `try/except Exception`; on error use original model.
+
+### After the real call — Measurement record
+
+Regardless of which techniques ran, record for this call:
+
+```python
+{
+  "timestamp": ...,
+  "model_requested": ...,
+  "model_used": ...,
+  "raw_input_tokens": ...,    # tokens in original messages before any technique
+  "sent_input_tokens": ...,   # tokens actually sent (0 if cache hit)
+  "output_tokens": ...,       # from response.usage if present, else counted
+  "cache_hit": bool,
+  "slimmer_ran": bool,
+  "slimmer_tokens_saved": int,
+  "routing_changed_model": bool
+}
+```
+
+Append this to an in-memory list. Expose `vmani_wrapper.get_session_report()` which
+returns a summary dict of the session so far.
+
+-----
+
+## STEP 3 — CONFIG FILE
+
+Create `vmani_config.py` at the project root:
+
+```python
+@dataclass
+class VmaniConfig:
+    # Master switch — if False, vmani_call is a pure passthrough, zero side effects
+    enabled: bool = True   # env: VMANI_SHIELD_ENABLED
+
+    # Per-technique toggles
+    exact_cache_enabled: bool = True     # env: VMANI_EXACT_CACHE
+    slimmer_enabled: bool = True         # env: VMANI_SLIMMER
+    routing_enabled: bool = True         # env: VMANI_ROUTING
+
+    # Cache
+    cache_ttl_seconds: int = 3600        # env: VMANI_CACHE_TTL
+    cache_namespace: str = "default"     # env: VMANI_NAMESPACE
+
+    # Routing
+    simple_model: str = ""               # env: VMANI_SIMPLE_MODEL
+    complex_model: str = ""              # env: VMANI_COMPLEX_MODEL
+    routing_threshold: int = 300         # env: VMANI_ROUTING_THRESHOLD
+
+    # Budget
+    max_output_tokens: int = 0           # env: VMANI_MAX_OUTPUT_TOKENS
+                                         # 0 = do not override
+
+    # Measurement
+    log_level: str = "INFO"              # env: VMANI_LOG_LEVEL
+```
+
+All fields default from `os.getenv`. Caller can also instantiate directly.
+If `enabled=False` the wrapper is a transparent passthrough — nothing changes.
+
+-----
+
+## STEP 4 — MEASUREMENT REPORT
+
+`vmani_wrapper.get_session_report()` must return:
+
+```python
+{
+  "total_calls": int,
+  "cache_hits": int,
+  "total_raw_input_tokens": int,
+  "total_sent_input_tokens": int,
+  "total_output_tokens": int,
+  "total_input_tokens_not_sent": int,   # raw - sent across all calls
+  "slimmer_total_tokens_saved": int,
+  "model_routing_changes": int,
+  "note": "token counts are estimates; actual savings depend on your traffic patterns"
+}
+```
+
+Also provide `vmani_wrapper.print_session_report()` which prints a clean
+human-readable table to stdout using only stdlib string formatting.
+
+-----
+
+## STEP 5 — TESTS
+
+In `tests/test_vmani_wrapper.py`, write tests that:
+
+- Use a mock `call_fn` that records calls and returns a fake response dict.
+- Prove exact cache: second identical call does NOT invoke `call_fn`.
+- Prove different model or temperature MISSES cache (key scoping).
+- Prove slimmer: a content string with comment-only lines comes out shorter; a
+  content string with a fenced code block is unchanged inside the fence.
+- Prove routing: with both model names configured, token count below threshold uses
+  simple model; above uses complex model.
+- Prove fail-safe: force each technique to raise; assert `call_fn` is still called
+  and the response is the real response, not an error.
+- Prove `enabled=False` is a pure passthrough: `call_fn` called exactly once with
+  the original arguments unchanged.
+- All tests run offline with no real network calls.
+
+-----
+
+## WHAT TO PRODUCE
+
+1. `vmani_wrapper.py` — the wrapper + in-memory cache + measurement
+1. `vmani_config.py` — the config dataclass
+1. `tests/test_vmani_wrapper.py` — the tests above
+1. A diff or clear description of the minimal change to each existing call site to
+   use the wrapper (do not make the change until I approve the diff)
+
+-----
+
+## EXPLICIT DO NOT
+
+- Do NOT modify any existing file until I approve the scan (Step 1) and the diff
+  (end of Step 4).
+- Do NOT add any package to requirements.txt without asking me first.
+- Do NOT claim specific token saving percentages anywhere in code, comments, or docs.
+- Do NOT restructure, rename, or move any existing file.
+- Do NOT use bare `except:` — catch `Exception` as the widest catch, log with
+  `logging.warning`, and continue.
+- Do NOT use `print()` in library code — stdlib `logging` only.
+- Do NOT touch messages other than the last user message in the slimmer.
+- Do NOT break the agent if vmani is unreachable — that is the existing call_fn’s
+  responsibility, not this wrapper’s.
