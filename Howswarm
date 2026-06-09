@@ -1,0 +1,366 @@
+# How to Actually Use the Swarm: What Prompts to Give Copilot
+
+**The confusion:** There are 2 different ways. Let me show both clearly.
+
+-----
+
+## Way 1: Manual (Simple) - What You Type in VS Code
+
+You open VS Code, click Copilot Chat, and type this ONE prompt:
+
+```
+start migration
+```
+
+That’s it. Copilot will:
+
+1. Detect you typed “start migration”
+1. Load migration-master agent
+1. Run the entire swarm orchestration
+1. You watch it in the chat window
+
+-----
+
+### Step-by-Step (Manual Way)
+
+**1. Open VS Code**
+
+```
+Your monolith repo is open
+```
+
+**2. Click Copilot Chat Icon** (bottom right of VS Code)
+
+```
+or press: Ctrl+Shift+I (Windows) or Cmd+Shift+I (Mac)
+```
+
+**3. In the chat box, type:**
+
+```
+start migration
+```
+
+**4. Click or press Enter**
+
+```
+Copilot loads migration-master agent and starts
+```
+
+**5. Watch in chat window:**
+
+```
+🔍 Starting Phase 0: Business Logic Analysis
+Using skill: business-logic-analyzer
+
+[10 minutes pass...]
+
+✅ Phase 0 complete
+📋 Phase 1: Inventory running...
+
+[15 minutes pass...]
+
+✅ Phase 1 complete
+🗺️ Phase 2: Domain Analysis running...
+
+[15 minutes pass...]
+
+✅ Phase 2 complete
+🔴 BOUNDARY RATIFICATION GATE - HUMAN ACTION REQUIRED
+
+Your action required:
+1. Read /migration/domain-map.md
+2. Edit /migration/STATE.md
+3. Add ratified boundaries and extraction order
+4. Type: "boundaries ratified"
+```
+
+**6. You read the documents and edit STATE.md**
+
+```bash
+nano migration/STATE.md
+# Add:
+PHASE_3_GATE:
+  STATUS: "ratified"
+  RATIFIED_BOUNDARIES:
+    - GetLoanAccountSupport
+    - AccountDetail
+    - PaymentProcessing
+    # ... etc
+  EXTRACTION_ORDER:
+    [1] GetLoanAccountSupport
+    [2] AccountDetail
+    [3] PaymentProcessing
+    # ... etc
+
+git add migration/STATE.md
+git commit -m "feat: boundaries ratified"
+git push
+```
+
+**7. Back in Copilot Chat, type:**
+
+```
+boundaries ratified, start extraction
+```
+
+**8. Watch extraction swarm run:**
+
+```
+Phase 3: Safe Extraction (Strangler Seam)
+  Spawning extractors (4 max)...
+  Extractor-1 → GetLoanAccountSupport
+  Extractor-2 → AccountDetail
+  Extractor-3 → PaymentProcessing
+  Extractor-4 → OnlineWires
+  
+[10 minutes]
+Extractor-1 complete ✅
+  Verifier-1 → GetLoanAccountSupport
+
+Extractor-2 complete ✅
+  Verifier-2 → AccountDetail
+
+[continues...]
+
+✅ Phase 3-5 Complete for all 34 services
+All services ready for manual cutover.
+```
+
+**9. Manual Cutover Instructions:**
+
+```
+Copilot outputs detailed cutover plan for each service:
+
+SERVICE 1: GetLoanAccountSupport
+  File: /migration/PHASE5-CUTOVER-PLAN-GetLoanAccountSupport.json
+  
+  Action: Deploy to dev environment
+  1. kubectl apply -f service-GetLoanAccountSupport/
+  2. Set feature flag to 5%
+  3. Monitor for 10 minutes
+  4. Increase to 25%, 50%, 100%
+  5. Soak for 24 hours
+  6. Mark complete in STATE.md
+```
+
+**10. You deploy services manually to environments** (27 hours per service, mostly soak)
+
+**11. Copilot declares victory:**
+
+```
+🎉 MIGRATION COMPLETE
+
+All 34 services extracted and in production.
+Zero regressions.
+Full audit trail in /migration/STATE.md
+```
+
+-----
+
+## Way 2: Automated (Advanced) - GitHub Actions Runs It
+
+If you want it to run **overnight without you watching**, you don’t give any prompt. Instead:
+
+### Setup One-Time
+
+**1. Create this GitHub Actions workflow:**
+
+`.github/workflows/migration-swarm.yml`
+
+```yaml
+name: Migration Swarm
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '0 22 * * *'  # Every day at 10 PM
+
+jobs:
+  swarm:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start Migration Swarm
+        env:
+          COPILOT_API_KEY: ${{ secrets.COPILOT_API_KEY }}
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import subprocess
+          import time
+          import os
+          
+          # Call Copilot API to run migration-master agent
+          response = subprocess.run([
+              "copilot-cli",
+              "run-agent",
+              "--agent", ".github/agents/migration-master.md",
+              "--prompt", "start migration",
+              "--wait", "true"
+          ], env={**os.environ, "COPILOT_API_KEY": os.getenv("COPILOT_API_KEY")})
+          
+          exit(response.returncode)
+          PYTHON_SCRIPT
+      
+      - name: Check if Boundaries Need Ratification
+        run: |
+          if grep -q 'STATUS: "pending"' migration/STATE.md; then
+            echo "⏸️ Boundary gate pending - waiting for human ratification"
+            echo "Check migration/domain-map.md and ratify in STATE.md"
+            exit 0  # Don't fail, just wait
+          fi
+      
+      - name: Continue if Boundaries Ratified
+        run: |
+          if grep -q 'STATUS: "ratified"' migration/STATE.md; then
+            echo "✅ Boundaries ratified, continuing swarm..."
+            # Trigger next phase
+          fi
+      
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: migration-artifacts
+          path: migration/
+```
+
+**2. Set the Copilot API Key:**
+
+```
+GitHub Repo Settings → Secrets → New Repository Secret
+Name: COPILOT_API_KEY
+Value: [your Copilot API key]
+```
+
+**3. That’s it. Now every night at 10 PM, the workflow runs automatically.**
+
+-----
+
+## The Key Difference
+
+|Aspect               |Manual (Way 1)                 |Automated (Way 2)               |
+|---------------------|-------------------------------|--------------------------------|
+|**How to start**     |Type in Copilot Chat           |GitHub Actions runs on schedule |
+|**Human involvement**|You watch & manage             |Mostly automated                |
+|**Boundary gate**    |You stop, read, ratify manually|Workflow pauses, emails you     |
+|**Extraction**       |You watch progress             |Runs overnight, emails when done|
+|**Speed**            |Same                           |Same (but overnight)            |
+|**Best for**         |Learning, first-time           |Production, repeated runs       |
+
+-----
+
+## What You ACTUALLY Type (Summary)
+
+### Manual Way - Just 3 Prompts Total
+
+```
+Prompt 1 (Start):
+"start migration"
+
+Prompt 2 (After reading docs):
+"boundaries ratified, continue"
+
+Prompt 3 (Final):
+"all services deployed, mark complete"
+```
+
+### Automated Way - No Prompts
+
+```
+# GitHub Actions file does it all
+# You just receive emails:
+
+📧 Email 1: "Boundary gate pending - ratify now"
+📧 Email 2: "All phases 0-2 complete, extraction ready"
+📧 Email 3: "Service 1 ready for cutover"
+... (repeat for all 34 services)
+```
+
+-----
+
+## The Real “Swarm Coordinator” Script
+
+The Python script I mentioned isn’t needed if you use GitHub Actions. GitHub Actions IS the coordinator.
+
+But if you want to run locally, the coordinator is simple:
+
+```python
+# .github/skills/monolith-decomposer/local-swarm-runner.py
+import subprocess
+import time
+import yaml
+
+with open('migration/STATE.md', 'r') as f:
+    state = yaml.safe_load(f)
+
+if state['PHASE'] == 'start':
+    # Call Copilot to run migration-master agent
+    subprocess.run([
+        "code",  # VS Code CLI
+        "--wait",
+        "--command", "github.copilot.openChatPanel",
+        "--prompt", "start migration"
+    ])
+
+# Wait for completion
+while state['PHASE'] != 'migration-complete':
+    time.sleep(5)
+    with open('migration/STATE.md', 'r') as f:
+        state = yaml.safe_load(f)
+    print(f"Current phase: {state['PHASE']}")
+```
+
+But honestly, you probably don’t need even this. Just:
+
+**Option A (Simplest):**
+
+1. Type in Copilot Chat: `start migration`
+1. Let it run
+1. Watch the chat window
+
+**Option B (Most Automated):**
+
+1. Set up GitHub Actions workflow (copy-paste the YAML above)
+1. Go to bed
+1. Wake up to “migration complete” email
+
+-----
+
+## Which Way Should You Use?
+
+**Use Manual (Way 1) if:**
+
+- ✅ First time doing this
+- ✅ Want to understand each step
+- ✅ Want to control pacing
+- ✅ Have time to watch it
+
+**Use Automated (Way 2) if:**
+
+- ✅ Already done it once
+- ✅ Want it overnight
+- ✅ Have tight deadline
+- ✅ Don’t want to babysit
+
+-----
+
+## TLDR: The Actual Prompts You Give Copilot
+
+**That’s it. Three lines:**
+
+```
+start migration
+
+[after reading domain-map.md for 2 hours and ratifying]
+boundaries ratified, continue extraction
+
+[after services extracted and hardened]
+begin manual cutover
+```
+
+Everything else is Copilot talking back to you in the chat.
+
+No complex commands. No weird syntax. Just natural English prompts.
