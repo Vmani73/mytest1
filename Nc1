@@ -1,0 +1,154 @@
+# TASK: N1 ↔ C1 Codebase Hardgate Integration (Feature-Switched)
+
+## ROLE
+
+You are a senior integration engineer performing a surgical, zero-regression integration
+of C1’s codebase-scan hardgate logic into the N1 codebase, controlled by a
+feature flag. You will touch NOTHING outside the codebase hardgate execution path.
+
+## REPOSITORIES
+
+- N1 repo (primary target): [N1_REPO_PATH]
+- C1 repo (logic source): [C1_REPO_PATH]
+
+-----
+
+## PHASE 0 — UNDERSTAND BEFORE TOUCHING ANYTHING
+
+### 0.1 — Map N1 Hardgates
+
+Search the N1 codebase and produce a complete inventory:
+
+- Find all hardgate definitions and their categories
+- Identify which are codebase-related (naming conventions, code quality,
+  dependency checks, static analysis gates)
+- Identify which are platform-related, DB-related, Kafka-related — mark these OFF-LIMITS
+- Output: | HardgateName | Category | FilePath | MethodName | Line# |
+
+### 0.2 — Map C1 Codebase Scan Logic
+
+Search the C1 codebase and identify:
+
+- Entry point(s) for codebase scanning / hardgate evaluation
+- Interface/contract it exposes (input params, return types)
+- Any dependencies it requires (clients, config, models)
+- Output: EntryClass, Method signatures, Input/Output contracts
+
+### 0.3 — Gap Analysis
+
+Before writing a single line of code:
+
+- Compare N1 codebase hardgate inputs vs C1 expected inputs
+- Flag any mismatches in data shape, types, or missing context
+- Confirm C1’s return type is compatible with what N1 expects downstream
+- List every assumption. Stop and ask if any assumption is non-trivial.
+
+-----
+
+## PHASE 1 — FEATURE FLAG INFRASTRUCTURE
+
+### 1.1 — Create Feature Flag
+
+- Flag name: C1_CODEBASE_HARDGATE_ENABLED (boolean)
+- Source from N1’s existing config mechanism — do NOT introduce a new config system
+- Default: false (legacy behavior is the safe default)
+- Add comment: purpose, owner, rollback instructions
+
+### 1.2 — Validate Flag Plumbing
+
+- Confirm the flag is readable at the codebase hardgate execution point only
+- Do NOT propagate this flag to any class outside that path
+
+-----
+
+## PHASE 2 — C1 ADAPTER (NEW CODE ONLY)
+
+### 2.1 — Create Adapter Interface
+
+In the N1 codebase, create:
+
+```java
+CodebaseHardgateEvaluator {
+    HardgateResult evaluate(CodebaseHardgateContext context);
+}
+```
+
+- CodebaseHardgateContext contains exactly what N1 already has at the call site
+- HardgateResult must match what N1’s downstream consumers already expect
+- Do not invent new data fetching
+
+### 2.2 — Implement Two Concrete Classes
+
+1. N1LegacyCodebaseHardgateEvaluator — extract existing N1 logic into this,
+   do not rewrite it
+1. C1CodebaseHardgateEvaluator — calls C1 logic, adapts
+   input/output inside this class only
+
+### 2.3 — Wire the Switch
+
+At the N1 hardgate execution point, replace existing call with:
+
+```java
+if (featureFlag.isEnabled("C1_CODEBASE_HARDGATE_ENABLED")) {
+    return c1Evaluator.evaluate(context);
+} else {
+    return n1LegacyEvaluator.evaluate(context);
+}
+```
+
+This is the ONLY change to existing N1 flow logic.
+
+-----
+
+## PHASE 3 — SAFETY CONSTRAINTS (NON-NEGOTIABLE)
+
+If any of these would be violated, STOP and report before proceeding:
+
+❌ DO NOT modify any N1 class touching DB, Kafka, messaging, or event publishing
+❌ DO NOT modify any N1 class outside the codebase hardgate execution path
+❌ DO NOT copy C1 dependencies that pull in its DB/Kafka/broker clients
+❌ DO NOT change method signatures of any existing N1 public API
+❌ DO NOT delete or rename any existing N1 hardgate class
+✅ All new classes go in: [n1.base.package].integration.c1
+✅ C1 logic called via adapter only — no direct static calls
+✅ If C1 throws ANY exception: catch in adapter, log with full context,
+auto-fallback to N1 legacy logic — exception must never propagate upward
+
+-----
+
+## PHASE 4 — VALIDATION
+
+### 4.1 — Diff Report
+
+After all changes produce:
+
+- Complete list of files MODIFIED (should be ≤ 3 existing files)
+- Complete list of files CREATED (all new adapter/impl classes)
+- Confirm zero changes to: DB layer, Kafka layer, platform hardgate classes
+
+### 4.2 — Test Coverage
+
+Write unit tests for all four scenarios:
+
+1. Flag = false → N1Legacy path executes, C1 is never invoked
+1. Flag = true → C1 path executes
+1. Flag = true + C1 throws → auto-fallback to N1Legacy, no exception propagated
+1. Both evaluators return identical results for a known codebase input (parity test)
+
+### 4.3 — Final Checklist
+
+- [ ] N1 starts up without errors with flag=false
+- [ ] N1 starts up without errors with flag=true
+- [ ] All existing N1 tests still pass
+- [ ] All new tests pass
+- [ ] No new transitive dependencies from C1 touching N1’s DB/Kafka
+
+-----
+
+## GROUND RULES
+
+- Complete Phase 0 fully and show findings before writing any code
+- Produce a summary + exact file paths after each phase
+- If any phase reveals a blocker or non-trivial assumption, stop and ask
+- When in doubt, do less and ask. A missed feature is recoverable.
+  A broken production N1 is not.
