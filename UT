@@ -1,0 +1,315 @@
+# SKILL: Autonomous Full-Coverage Unit Test Generation (Python)
+
+## 1. Purpose
+
+Drive GitHub Copilot Agent Mode to generate a **production-grade, full-coverage
+pytest suite** for an arbitrary Python codebase, end-to-end, with **zero human
+intervention** beyond invoking the initial prompt. The playbook is generic —
+no hardcoded paths, package names, frameworks, or module lists. It self-discovers
+the project layout and adapts.
+
+It is designed to survive long-running, multi-session execution inside any
+Copilot/agentic coding assistant (Copilot Agent Mode, Claude Code, Cursor,
+etc.) where context windows, tool-call budgets, and the underlying LLM API
+connection (direct, or routed through an internal proxy/gateway) are
+unreliable.
+
+## 2. Hard Constraints (non-negotiable)
+
+1. **Never modify production source code.** Writes are restricted to:
+   - `tests/**` (or the repo's existing test root, auto-detected)
+   - `.codemind/unit_test_state.json` (state/memory file)
+   - `.codemind/coverage_reports/**`
+   If a source file appears untestable without modification (e.g. a hard
+   `import` of a live network client at module load time), the agent must
+   solve it via test-side mocking/monkeypatching/dependency injection at the
+   test boundary — never by editing the module under test. If genuinely
+   impossible, log it as `BLOCKED` in the state file with a reason and move on.
+2. **No duplicate tests.** Before generating any test, the agent must check
+   (a) the state file inventory and (b) the AST of existing test files for a
+   test that already targets the same `module::qualname` with a passing,
+   non-trivial assertion. Duplicates are skipped, not regenerated.
+3. **No stub/placeholder tests.** Every generated test must contain real
+   assertions (`assert`, `pytest.raises`, `mock.assert_called_with`, etc.).
+   `pass`, `assert True`, and bodies that only call the function without
+   asserting on output/side-effects are treated as **failures** and must be
+   rewritten in the same session.
+4. **Idempotent & resumable.** Every unit of work is checkpointed to
+   `.codemind/unit_test_state.json` immediately after it completes — not at
+   the end of a batch. A killed/timed-out session must be resumable by simply
+   re-running the same prompt.
+5. **Bounded batches.** Work is processed in small, fixed-size chunks
+   (default: 5 targets per agent turn) specifically to avoid request
+   timeouts and transient network/gateway errors against the LLM backend on
+   large payloads. See Section 6.
+
+## 3. Architecture Overview
+
+```
+┌──────────────┐   ┌───────────────────┐   ┌────────────────────┐
+│ Phase 1       │──▶│ Phase 2            │──▶│ Phase 3 (loop)      │
+│ Discovery &   │   │ Dedup & Inventory  │   │ Chunked Generation  │
+│ Inventory     │   │ Reconciliation     │   │ + Verify + Checkpt  │
+└──────────────┘   └───────────────────┘   └────────────────────┘
+                                                       │
+                                                       ▼
+                                             ┌────────────────────┐
+                                             │ Phase 4             │
+                                             │ Coverage Gate +     │
+                                             │ Final Report        │
+                                             └────────────────────┘
+```
+
+All phases read/write a single source of truth: `.codemind/unit_test_state.json`.
+This file IS the long-term memory. It must survive across Copilot sessions,
+machine restarts, and context resets.
+
+## 4. State File Schema — `.codemind/unit_test_state.json`
+
+```json
+{
+  "schema_version": "1.0",
+  "project_root": "<auto-detected absolute or repo-relative root>",
+  "test_root": "<auto-detected, e.g. tests/ or src/tests/>",
+  "test_framework": "pytest",
+  "source_inventory_hash": "<sha256 of sorted list of (file_path, mtime, size)>",
+  "last_run_timestamp": "<ISO8601>",
+  "session_count": 0,
+  "global_coverage": {
+    "baseline_percent": 0.0,
+    "current_percent": 0.0,
+    "target_percent": 95.0
+  },
+  "targets": {
+    "<module_path>::<qualname>": {
+      "kind": "function|method|classmethod|staticmethod|property|class",
+      "module_path": "src/pkg/module.py",
+      "qualname": "ClassName.method_name",
+      "signature_hash": "<sha256 of normalized signature + docstring>",
+      "status": "pending|in_progress|done|blocked|skipped_duplicate",
+      "test_file": "tests/pkg/test_module.py",
+      "test_function": "test_classname_method_name_<scenario>",
+      "branch_count": 4,
+      "branches_covered": [],
+      "complexity": 6,
+      "external_deps": ["requests", "boto3.client", "open"],
+      "blocked_reason": null,
+      "last_attempt_timestamp": null,
+      "attempt_count": 0
+    }
+  },
+  "blocked_summary": [],
+  "duplicate_summary": []
+}
+```
+
+**Why this matters for "long memory":** the inventory hash detects whether
+source files changed since the last run (re-scan only changed files). Per-target
+`signature_hash` detects whether a previously-tested function's signature
+changed (re-test only that target, not the whole suite). `attempt_count` and
+`last_attempt_timestamp` let the agent back off from targets that repeatedly
+fail (see Section 7).
+
+## 5. Phase 1 — Discovery & Inventory (run once, then incrementally)
+
+Copilot Agent Mode prompt (paste verbatim, no edits needed for any repo —
+also works as a system/task prompt for other coding agents):
+
+```
+Act as an autonomous test-generation agent. Do NOT write any code yet.
+
+1. Detect the project root, the package layout (src-layout vs flat), the test
+   framework (pytest preferred; if unittest only, still emit pytest-compatible
+   tests), and the existing test root directory. If none exists, create
+   `tests/` mirroring the source package structure.
+2. Walk all `*.py` files under the source root, EXCLUDING: test files,
+   `__init__.py` with no logic, migrations, generated/protobuf code (`*_pb2.py`),
+   vendored/third-party directories, and anything matching `.gitignore`.
+3. Parse each file's AST. For every module-level function, class method
+   (instance/class/static), and property that:
+     - is not private-by-convention with zero callers AND zero docstring
+       (still include private methods that have real logic — only skip
+       trivial one-line delegators / `__repr__`/`__str__` boilerplate unless
+       they contain conditional logic)
+   ...emit a target record.
+4. For each target compute: cyclomatic complexity (rough branch count from
+   AST: if/elif/else, for, while, try/except, boolean ops, comprehensions,
+   ternaries), and a list of external dependencies referenced inside the
+   function body (network calls, filesystem, subprocess, datetime.now(),
+   random, env vars, DB clients).
+5. Compute `signature_hash` per target = sha256(normalized source of the
+   function/method body + signature).
+6. Write/merge this into `.codemind/unit_test_state.json` per the schema in
+   SKILL.md Section 4. PRESERVE existing entries whose `signature_hash` is
+   unchanged and whose `status == "done"`. Mark entries whose
+   `signature_hash` changed as `status: "pending"` and bump `attempt_count`
+   reset to 0. Mark entries for deleted source symbols as removed.
+7. Compute `source_inventory_hash` and `global_coverage.baseline_percent` by
+   running the existing test suite with `pytest --cov=<pkg> --cov-report=json`
+   (if it errors, treat baseline as 0 and log the error — do not stop).
+8. STOP after writing the state file. Print a one-paragraph summary: total
+   targets, how many done/pending/blocked, baseline coverage %.
+```
+
+## 6. Phase 2 — Dedup & Inventory Reconciliation
+
+Before generating ANY new test, for each `pending` target the agent must:
+
+1. Search existing test files (AST, not regex) for any `def test_*` whose
+   body references the target's `qualname` (direct call, `mock.patch` target,
+   or `getattr` access) **and** contains at least one real assertion.
+2. If found AND that test currently passes AND covers ≥1 branch of the
+   target → mark target `status: "skipped_duplicate"`, record the existing
+   test's name in `duplicate_summary`, do not touch it.
+3. If found but the test is weak (no assertion on return value/exception/
+   mock call, or it's currently failing/skipped) → leave `status: "pending"`
+   but record the existing test name so the new test can be ADDED alongside
+   it (different scenario/parametrization), never overwriting the existing
+   function. New test names must be unique: append a numeric suffix
+   (`_v2`, `_v3`, ...) if a name collision would occur.
+
+This phase is re-run automatically at the start of every chunk in Phase 3 —
+it's cheap (AST parse only, no LLM calls) and prevents drift if a previous
+session was interrupted mid-write.
+
+## 7. Phase 3 — Chunked Generation Loop (timeout / network resilient)
+
+### 7.1 Batch sizing rules
+- Default batch size = **5 targets per agent turn**.
+- If the previous turn's response was truncated, errored, or the LLM
+  backend/gateway returned a timeout/5xx, **halve the batch size** (min 1)
+  for the next attempt and retry the SAME unfinished targets (they're still
+  `pending`/`in_progress` in the state file — nothing was lost).
+- If 3 consecutive batches at size 1 still fail for the same target,
+  set `status: "blocked"`, `blocked_reason: "repeated_generation_failure"`,
+  increment `attempt_count`, and move to the next target. Do not loop forever
+  on one item.
+- After every successful batch, batch size may grow by 1 (up to the default
+  cap of 5) — simple additive-increase/multiplicative-decrease.
+
+### 7.2 Per-target generation contract
+For each target, Copilot must produce a self-contained pytest test (or a
+small parametrized group) covering:
+- **Happy path** with realistic, representative inputs (not `1, 2, 3` filler
+  unless the domain genuinely is integers — infer realistic types/values from
+  type hints, docstrings, and call sites).
+- **Boundary/edge cases** derived from the branch analysis in Phase 1
+  (empty collections, None, zero/negative numbers, max-length strings, off-by-
+  one loop bounds).
+- **Error paths**: every `raise` and every `except` clause gets a
+  corresponding `pytest.raises(...)` or assertion on logged/handled error.
+- **External dependency isolation**: anything in `external_deps` (network,
+  filesystem, time, random, subprocess, DB, message queues) MUST be mocked
+  via `unittest.mock.patch`/`monkeypatch`/`pytest` fixtures — tests must run
+  fully offline and deterministically (freeze time, seed random, fake
+  filesystem via `tmp_path`).
+- **Fixtures over duplication**: shared setup goes into `conftest.py`
+  fixtures, not copy-pasted across test functions. Before writing a new
+  fixture, check `conftest.py` for an existing one with the same purpose.
+
+Agent prompt for each batch (works for Copilot Agent Mode, Claude Code, or
+any tool-using coding agent):
+
+```
+You are continuing an in-progress, resumable test-generation run.
+
+1. Load `.codemind/unit_test_state.json`. Select up to <BATCH_SIZE> targets
+   with status == "pending", ordered by (complexity DESC, module_path).
+2. For each selected target, run the dedup check from SKILL.md Section 6.
+   Skip duplicates immediately (just update state, no generation needed).
+3. For remaining targets, write tests into the appropriate
+   `tests/<mirrored_path>/test_<module>.py` file (create if missing, append
+   if it exists — never overwrite existing test functions). Follow the
+   per-target contract in SKILL.md Section 7.2.
+4. Set status: "in_progress" for a target the moment you start writing it,
+   and immediately persist that to the state file BEFORE generating the test
+   body (this is the crash-safety checkpoint).
+5. After writing each test, immediately run:
+   `pytest <test_file>::<test_function> -q --no-header`
+   - If it passes: run
+     `pytest --cov=<module's package> --cov-report=json:.codemind/coverage_reports/<target_id>.json <test_file>`
+     and update `branches_covered`, set status "done", attempt_count += 1,
+     last_attempt_timestamp = now. Persist state immediately.
+   - If it fails: read the failure, fix the TEST (never the source), retry
+     up to 2 times within this same turn. If still failing after 2 retries,
+     set status "blocked", blocked_reason = last error message (truncated to
+     500 chars), attempt_count += 1, persist state immediately, move to the
+     next target.
+6. Do NOT proceed to additional targets beyond <BATCH_SIZE> in this turn,
+   even if time/tokens remain — end the turn cleanly so the session can be
+   safely interrupted between batches.
+7. Print a 2-3 line summary of this batch (done / blocked / skipped_duplicate
+   counts) and the updated global_coverage.current_percent.
+```
+
+### 7.3 Driving the loop
+
+This batch prompt is re-issued automatically until no `pending` targets
+remain. Because every batch is self-contained and checkpointed, the
+*orchestrating* side (a thin wrapper script, CI step, scheduled job, or
+simply a human/script repeatedly invoking the agent) only needs to do:
+
+```python
+while state.has_pending_or_in_progress_targets():
+    invoke_agent_with_batch_prompt()
+    reload(state)  # re-read .codemind/unit_test_state.json
+```
+
+No conversational context needs to persist between iterations — the state
+file IS the memory. This is what makes the run resilient to agent session
+resets, IDE restarts, or LLM backend/gateway connection drops mid-run.
+
+## 8. Phase 4 — Coverage Gate & Final Report
+
+Once `pending`/`in_progress` count == 0:
+
+```
+1. Run `pytest --cov=<pkg> --cov-report=term-missing --cov-report=json:.codemind/coverage_reports/final.json` once for the full suite.
+2. Update global_coverage.current_percent.
+3. If current_percent < global_coverage.target_percent:
+   - Identify remaining uncovered lines/branches from the coverage JSON that
+     do NOT correspond to any target in state (e.g. lines inside targets
+     marked "blocked", or lines outside any function such as module-level
+     conditionals/`if __name__ == "__main__"`).
+   - For module-level/script-guard code, generate tests using
+     `subprocess`/`runpy` invocation with mocked args, OR explicitly add a
+     `# pragma: no cover` ONLY for genuinely untestable lines (e.g.
+     `if __name__ == "__main__":` blocks) — and log every pragma added in
+     the report so a human can audit it.
+   - For "blocked" targets, do NOT silently exclude them from coverage; list
+     them explicitly in the final report under "Needs human follow-up".
+4. Generate `.codemind/coverage_reports/SUMMARY.md` containing:
+   - Baseline vs final coverage %, delta, and per-module breakdown.
+   - Total tests added, total targets done/blocked/skipped_duplicate.
+   - Full list of blocked targets with their blocked_reason.
+   - Full list of skipped duplicates with the existing test that covers them.
+   - Any `# pragma: no cover` additions with file:line and justification.
+5. Run the FULL suite once more (`pytest -q`) to confirm zero regressions
+   and zero flaky failures (run twice if any test touches randomness/time,
+   to confirm determinism).
+```
+
+## 9. Failure-Mode Reference Table
+
+| Failure | Detection | Recovery |
+|---|---|---|
+| Agent request timeout | No response / partial response within turn | Halve batch size, retry same `pending`/`in_progress` targets (state already checkpointed pre-write) |
+| LLM backend/gateway 5xx or network error | Tool error from API call | Exponential backoff (1x, 2x, 4x turns skipped via re-prompt), then halve batch size |
+| Generated test fails | `pytest` non-zero exit | Self-fix up to 2 retries in-turn; else `blocked` |
+| Generated test flaky (time/random/order-dependent) | Re-run twice in Phase 4 produces different result | Re-open target to `pending`, force re-generation with explicit time/random mocking requirement |
+| Source file changed mid-run | `signature_hash` mismatch on next Phase 1 incremental scan | Reset only that target to `pending`, re-run dedup |
+| Duplicate test name collision | AST scan in Phase 2 | Auto-suffix (`_v2`, `_v3`, ...) |
+| Target genuinely untestable without source change | Repeated failure or `external_deps` includes un-mockable hard dependency | `blocked`, surfaced in final report — never edit source to "fix" |
+| Context window exhaustion mid-batch | Agent notices it's losing earlier-batch detail | State file is the only memory needed — safe to start a fresh chat/session and re-issue the Phase 3 prompt |
+
+## 10. Quick-Start (single command for a fresh repo)
+
+```
+Run SKILL: full-coverage-unittest-playbook
+1. Execute Phase 1 (Discovery & Inventory) once.
+2. Loop Phase 3 batches (batch size 5, adaptive) until no pending/in_progress
+   targets remain, following the resilience rules in Section 7.1 and the
+   failure-mode table in Section 9.
+3. Execute Phase 4 (Coverage Gate & Final Report).
+4. Do not modify any file outside tests/, conftest.py, and .codemind/.
+```
