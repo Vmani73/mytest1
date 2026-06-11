@@ -1,0 +1,102 @@
+TASK: Fix a race condition and an orphaned-job bug in IndexWorker._claim_next_job
+(src/codemind/worker/index_worker.py).
+
+CONTEXT:
+- Jobs are persisted in MongoDB via JobModel, accessed through
+  self.job_manager.db.get_session() (SQLAlchemy-style query API over Mongo).
+- _claim_next_job currently does a SELECT (filter_by status=PENDING,
+  execution_scope=..., optional target_job_id) followed by a separate
+  status update + commit. This is NOT atomic: two pods' workers can both
+  read the same PENDING job before either commits, and both think they
+  claimed it.
+- execution_scope is set to the originating pod's identity. It exists
+  because the pod that creates a job may hold pod-local state (e.g. an
+  open connection back to the original requester, in-memory cache) that
+  ONLY that pod's worker can use to correctly process the job. So
+  execution_scope is an AFFINITY constraint, not just a load-balancing
+  hint, and must NOT be removed.
+- KNOWN BUG: if the owning pod's worker crashes or restarts after the job
+  is created but before it claims/finishes the job, the job is orphaned
+  forever — no other pod's execution_scope will ever match, and
+  claim_unscoped_jobs only matches execution_scope=None.
+
+STEP 1 — INVESTIGATE FIRST (do not write code yet):
+- Read JobModel's full schema (fields, types, indexes) in
+  codemind/jobs/job_manager.py.
+- Find every place JobStatus is defined and every status transition
+  (PENDING -> ? -> ? -> done/failed).
+- Find where execution_scope is set when a job is created, and confirm
+  it's the pod's own identity (e.g. hostname/pod name/instance id).
+- Find how/where job results are delivered back to the original requester
+  (Mongo document field read via polling? in-memory event/callback?
+  websocket?). This determines whether a "reassign to another pod" fallback
+  is even safe.
+- Check for existing indexes on JobModel (status, execution_scope,
+  created_at, claimed_at if it exists).
+- Report findings before proceeding to STEP 2.
+
+STEP 2 — ATOMIC CLAIM:
+Replace the read-then-write claim in _claim_next_job with a single atomic
+find_one_and_update (compare-and-swap), filtering on status=PENDING AND
+execution_scope=self.execution_scope (AND id=self.target_job_id if set),
+ordered by created_at ascending, atomically setting:
+  status -> CLAIMED (or your existing "in progress" status)
+  claimed_by -> a worker/pod identifier (add this field if it doesn't exist)
+  claimed_at -> current UTC timestamp
+Return None if no document matched. If the scoped query returns nothing
+and self.claim_unscoped_jobs is True, repeat the same atomic
+find_one_and_update against execution_scope=None.
+
+Remove the now-redundant separate "set status and commit" code path for
+the claim itself (status transitions AFTER claiming, e.g. to PROCESSING
+or FAILED, remain as-is).
+
+STEP 3 — ORPHAN RECOVERY (lease expiry):
+Add a claimed_at (or lease_expires_at) field to JobModel if not present.
+Implement a sweeper (separate method, e.g. _reclaim_stale_jobs, called on
+a schedule or at the top of the worker loop) that:
+  - Finds jobs in CLAIMED/PROCESSING status whose claimed_at is older than
+    a configurable STALE_CLAIM_TIMEOUT (e.g. 5x normal job duration).
+  - For jobs WITH a non-null execution_scope: requeue them back to
+    PENDING with the SAME execution_scope (only the original pod can
+    retry them) — UNLESS findings from Step 1 show the pod-local
+    dependency can be satisfied generically (e.g. result delivery is via
+    Mongo polling, not in-memory). If pod-local dependency truly can't be
+    satisfied elsewhere, ALSO increment a retry_count and move to a
+    DEAD_LETTER status after N retries, with the failure surfaced back to
+    the requester via whatever channel Step 1 identified.
+  - For jobs with execution_scope=None, requeue to PENDING (any pod can
+    pick up).
+Use atomic find_one_and_update for the requeue too, to avoid the sweeper
+itself racing against active workers.
+
+STEP 4 — INDEXES & CLEANUP:
+- Add/confirm a compound index on (status, execution_scope, created_at)
+  and (status, claimed_at) for the sweeper query.
+- Remove the existing "[DEBUG] Claiming next job..." print statement;
+  replace with proper logging (logger.debug) including claimed job id,
+  execution_scope, and worker/pod id.
+
+STEP 5 — TESTS:
+Add/extend tests that:
+- Spin up two simulated workers (same execution_scope) concurrently
+  calling _claim_next_job against the same set of PENDING jobs, and
+  assert no job is claimed by both.
+- Verify execution_scope isolation: a worker with execution_scope=B never
+  claims a job created with execution_scope=A.
+- Verify the sweeper requeues a stale CLAIMED job and that it becomes
+  claimable again (by the correct pod per the affinity rule established
+  in Step 3).
+
+CONSTRAINTS:
+- No stubs, no TODOs, no hardcoded pod identifiers — derive worker/pod id
+  from existing config/env the same way execution_scope is currently
+  derived.
+- Do not change target_job_id semantics beyond what's needed for the
+  atomic find_one_and_update rewrite.
+- Preserve existing JobStatus enum values; only add new ones if Step 1
+  shows none fit (e.g. DEAD_LETTER).
+
+Report back the JobModel schema and result-delivery mechanism findings
+from Step 1 BEFORE implementing Steps 2-5, since Step 3's design depends
+on it.
