@@ -1,0 +1,139 @@
+TASK: Fix job-claiming race conditions and pod-affinity violations in
+IndexWorker for git-repo-indexing pipelines, where each pod has a
+SEPARATE, pod-local PVC (no shared storage between pods).
+
+BACKGROUND / ROOT CAUSE HYPOTHESIS:
+- A job created on Pod1 (e.g. "index repo X") may be claimed and processed
+  by Pod2's worker. Pod2 clones/indexes repo X onto ITS OWN PVC and marks
+  the job done in Mongo. Pod1, which originated the request and/or owns
+  downstream steps, then reads "done" from Mongo and proceeds — but the
+  indexed artifacts don't exist on Pod1's PVC, so the next step fails.
+- This can happen via THREE distinct failure paths, all of which must be
+  fixed:
+    (a) Read-then-write claim race: two workers read the same PENDING
+        doc before either commits its claim.
+    (b) execution_scope not set (or not propagated) correctly at job
+        creation time for this job, so it's effectively unscoped.
+    (c) claim_unscoped_jobs fallback lets ANY pod grab a job that should
+        have been pod-affine.
+
+FILES IN SCOPE: src/codemind/worker/index_worker.py,
+codemind/jobs/job_manager.py, and wherever jobs of this type are created
+(API handlers / orchestrator that enqueue indexing + downstream steps).
+
+STEP 0 — AUDIT execution_scope PROPAGATION (read-only, report findings
+before changing code):
+- For the full pipeline (e.g. clone/index -> parse -> embed -> any
+  follow-up step that reads from local PVC), find every place a JobModel
+  document is created.
+- For each, determine: is execution_scope set? To what value (pod
+  identity — confirm what identifies "this pod": hostname, pod name from
+  K8s downward API, instance id, etc.)? Is it propagated from the
+  predecessor job's execution_scope, or independently (re)computed?
+- Identify any job-creation path where execution_scope could end up
+  None or mismatched for a PVC-bound job type.
+- Identify how "job type" is represented on JobModel (a field like
+  job_type/kind), since the fix needs to be type-aware.
+- Report all findings before proceeding.
+
+STEP 1 — FIX execution_scope AT CREATION/PROPAGATION:
+- For any job type that depends on pod-local PVC state (indexing, and
+  any downstream step consuming that index), execution_scope MUST be
+  set, non-null, and equal to the CURRENT pod's identity at creation —
+  OR, for downstream steps, MUST be copied from the predecessor job's
+  execution_scope (whichever pod did step N must do step N+1, since the
+  PVC data lives there).
+- Add a guard/assertion at job-creation time: if job_type is in the
+  PVC-bound set and execution_scope is None/missing, raise loudly
+  (don't silently enqueue an unscoped job) — this should be a hard
+  programming error, not a runtime fallback.
+
+STEP 2 — ATOMIC CLAIM (fix race a):
+In IndexWorker._claim_next_job, replace the SELECT-then-update with a
+single atomic find_one_and_update (compare-and-swap):
+  filter: status=PENDING AND execution_scope=self.execution_scope
+          (AND id=self.target_job_id if set)
+  sort: created_at ascending
+  update: status -> CLAIMED, claimed_by -> <this pod's identity>,
+          claimed_at -> now (UTC)
+  return_document: AFTER
+Return None if nothing matched. Remove the old print("[DEBUG] ...") and
+replace with logger.debug including job id, execution_scope, claimed_by.
+
+STEP 3 — MAKE claim_unscoped_jobs TYPE-AWARE (fix race c):
+- Add/confirm a job_type (or similar) field on JobModel.
+- Define a constant set, e.g. PVC_BOUND_JOB_TYPES = {"index", "parse",
+  "embed", ...} (derive the actual values from Step 0's findings — do
+  not invent new ones).
+- In _claim_next_job, the unscoped-fallback branch
+  (execution_scope=None query) must EXCLUDE job_type in
+  PVC_BOUND_JOB_TYPES — i.e. add `.filter(JobModel.job_type.notin_(PVC_BOUND_JOB_TYPES))`
+  (or equivalent for whatever query API job_manager exposes) to that
+  branch only. Scoped jobs of any type are claimed normally via Step 2.
+- If, per Step 1, PVC-bound jobs should now NEVER have
+  execution_scope=None (it's a hard invariant), this filter is a
+  defense-in-depth backstop, not the primary fix — both must exist.
+
+STEP 4 — ORPHAN / STALE-CLAIM RECOVERY:
+- Add claimed_at (done in Step 2) and a STALE_CLAIM_TIMEOUT config value.
+- Implement _reclaim_stale_jobs (called periodically from the worker
+  loop or a scheduler), using atomic find_one_and_update:
+    For jobs in CLAIMED/PROCESSING with claimed_at older than
+    STALE_CLAIM_TIMEOUT:
+      - If job_type in PVC_BOUND_JOB_TYPES: requeue to PENDING with the
+        SAME execution_scope (only the original pod's PVC has the
+        partial/expected state) AND increment retry_count. After
+        MAX_RETRIES, move to a DEAD_LETTER status and surface the
+        failure via [whatever channel Step 0 of the prior investigation
+        identified for result delivery — confirm and use that
+        mechanism].
+      - If job_type NOT in PVC_BOUND_JOB_TYPES (execution_scope=None
+        allowed): requeue to PENDING, any pod may retry.
+
+STEP 5 — DEFENSIVE LOCAL-ARTIFACT VERIFICATION:
+- Before any worker consumes a job whose status is "done"/"indexed" for
+  a downstream PVC-bound step, add a check that the expected local
+  artifact actually exists on THIS pod's PVC (e.g. repo directory /
+  index files at the expected path, derived from existing path-resolution
+  logic — find and reuse it, don't hardcode paths).
+- If the artifact is missing despite status=done:
+    - Log an error including job id, execution_scope, claimed_by,
+      this pod's identity, and the expected path.
+    - Do NOT proceed with the downstream step.
+    - Reset the job to PENDING with execution_scope corrected to THIS
+      pod's identity (since the inconsistency means whatever pod
+      actually has the data should reclaim it) — OR, if this pod
+      genuinely should have the data and doesn't, mark the job
+      FAILED/DEAD_LETTER for manual investigation rather than looping
+      forever. Choose based on which pod's PVC the path check confirms
+      has the data (check predecessor job's claimed_by/execution_scope
+      to decide).
+
+STEP 6 — INDEXES:
+- Add/confirm compound indexes: (status, execution_scope, created_at),
+  (status, claimed_at), (job_type, status, execution_scope).
+
+STEP 7 — TESTS:
+- Concurrent claim test: two workers, same execution_scope, same set of
+  PENDING jobs — assert no double-claim (Step 2).
+- Cross-scope isolation test: worker with execution_scope=B never claims
+  execution_scope=A jobs, for ALL job types (Step 2/3).
+- Unscoped fallback test: a non-PVC-bound unscoped job IS claimable by
+  any worker; a PVC-bound job with execution_scope=None is REJECTED at
+  creation time (Step 1) and/or never claimed via the unscoped fallback
+  (Step 3) — test both layers independently.
+- Stale reclaim test: a CLAIMED PVC-bound job past STALE_CLAIM_TIMEOUT is
+  requeued with execution_scope unchanged; after MAX_RETRIES it becomes
+  DEAD_LETTER (Step 4).
+- Artifact-mismatch test: simulate status=done with the local artifact
+  absent; assert the worker does not proceed and instead corrects/fails
+  the job per Step 5's logic.
+
+CONSTRAINTS:
+- No stubs/TODOs. No hardcoded pod identifiers, paths, or job_type
+  strings — derive all of these from existing code (Step 0 findings).
+- Preserve existing JobStatus values; add CLAIMED/DEAD_LETTER only if
+  Step 0 shows nothing equivalent already exists.
+- Report Step 0 findings BEFORE writing any code, since Steps 1, 3, 4,
+  and 5 all depend on the actual job_type values, path-resolution
+  helpers, and pipeline structure discovered there.
