@@ -1,0 +1,133 @@
+# Copilot Agent Mode Prompt: Build `t1-optimize` Package
+
+Paste the following into Copilot Agent Mode (Chat). Adjust paths/repo name as needed.
+
+-----
+
+## PROMPT START
+
+Build a production-grade, installable Python package called `t1-optimize` that reduces LLM token consumption for applications calling **T1** (an OpenAI-compatible chat completions API). The package must be a drop-in wrapper — teams install it via `requirements.txt`, swap one client line, and get token savings with zero other code changes.
+
+### Hard requirements (apply throughout)
+
+- Production-grade code only. No stubs, no `TODO`, no `pass # implement later`, no placeholder functions.
+- Fully generic — no hardcoded model names, endpoints, collection names, or T1-specific assumptions beyond “OpenAI-compatible chat completions API.”
+- Full type hints (mypy-clean), docstrings on every public class/function, structured logging via `logging` module (no print statements).
+- Configuration entirely via environment variables with sensible defaults, using `pydantic-settings` (`BaseSettings`).
+- Must support both sync and async usage (`OpenAI` and `AsyncOpenAI` style clients).
+- Include `pyproject.toml` (PEP 621), proper package metadata, and a `README.md` with install + quickstart.
+- Include a `tests/` directory with `pytest` tests covering every module, including failure-mode tests (e.g., cache backend unreachable).
+- Use `tiktoken` for token counting wherever token counts are reported.
+
+### Package structure
+
+```
+t1_optimize/
+├── __init__.py              # exports OptimizedClient, AsyncOptimizedClient, T1OptimizeSettings
+├── client.py                 # OptimizedClient / AsyncOptimizedClient wrapping openai.OpenAI / AsyncOpenAI
+├── config.py                 # T1OptimizeSettings (pydantic-settings)
+├── dedup/
+│   ├── __init__.py
+│   ├── hasher.py              # SHA-256 content hashing utilities
+│   └── cache.py                # CacheBackend protocol + InMemoryLRUCache + MongoCacheBackend
+├── compression/
+│   ├── __init__.py
+│   ├── caveman.py              # system prompt injector for terse-output mode
+│   └── trimmer.py                # registry of per-tool-type output trimmers
+├── metrics.py                  # token accounting + structured log emission per call
+└── exceptions.py               # custom exception types
+
+tests/
+├── test_dedup_hasher.py
+├── test_dedup_cache.py
+├── test_caveman.py
+├── test_trimmer.py
+├── test_client.py
+└── test_metrics.py
+
+pyproject.toml
+README.md
+```
+
+### Module-by-module specification
+
+**config.py — `T1OptimizeSettings`**
+
+- Fields: `dedup_enabled: bool = True`, `compress_output_enabled: bool = False`, `tool_trim_enabled: bool = False`, `trim_tool_types: list[str] = []`, `cache_backend: Literal["memory", "mongo"] = "memory"`, `mongo_uri: str | None = None`, `mongo_db: str = "t1_optimize"`, `mongo_collection: str = "dedup_cache"`, `cache_ttl_seconds: int = 86400`, `cache_max_items: int = 10000` (for in-memory LRU), `metrics_enabled: bool = True`.
+- Env var prefix: `T1_OPT_` (e.g., `T1_OPT_DEDUP_ENABLED`).
+- Validate that `mongo_uri` is set when `cache_backend == "mongo"`; raise a clear config error otherwise.
+
+**dedup/hasher.py**
+
+- Function `hash_content(content: str) -> str` returning a SHA-256 hex digest.
+- Function `extract_hashable_blocks(messages: list[dict]) -> list[HashableBlock]` that walks a chat-completions `messages` list (including `tool` role messages and tool_call results) and identifies content blocks eligible for dedup — define a `HashableBlock` dataclass with `message_index`, `content`, `hash`.
+- Only consider blocks above a configurable minimum length (default 200 chars) to avoid hashing trivial strings.
+
+**dedup/cache.py**
+
+- Define a `CacheBackend` Protocol with `get(key: str) -> Optional[str]`, `set(key: str, value: str, ttl_seconds: int) -> None`, `health_check() -> bool`.
+- Implement `InMemoryLRUCache` using `functools.lru_cache`-style or `collections.OrderedDict`, respecting `cache_max_items` and `cache_ttl_seconds` (store insertion timestamps, evict expired on access).
+- Implement `MongoCacheBackend` using `pymongo`, with a TTL index on a `expires_at` field created on initialization. Connection must be lazy (don’t connect until first use) and must not raise on import if Mongo is unreachable — `health_check()` should return `False` and the client should gracefully fall back to pass-through (log a warning once, not per-call).
+
+**dedup/**init**.py**
+
+- `DedupEngine` class: takes a `CacheBackend` and `T1OptimizeSettings`. Method `process_messages(messages: list[dict]) -> tuple[list[dict], DedupStats]`:
+  - For each hashable block, check cache by hash.
+  - If hash exists in cache: replace the block’s content with a short reference string `[[T1_REF:{hash[:12]}]]` plus a one-line note of original length, and do NOT re-store.
+  - If hash is new: store hash → original content in cache (store the content itself so it can be referenced if needed later), leave block unchanged in this call.
+  - On the FIRST occurrence of any reference scheme being used in a session, prepend a system message explaining the `[[T1_REF:...]]` convention to the model (only added once per `messages` list, only if at least one substitution occurred).
+  - Return `DedupStats(blocks_seen, blocks_deduped, chars_saved)`.
+
+**compression/caveman.py**
+
+- Function `inject_caveman_system_prompt(messages: list[dict], mode: Literal["off","light","aggressive"]) -> list[dict]`.
+- “light”: appends a system instruction to skip greetings/sign-offs/restating the question, answer directly.
+- “aggressive”: additionally instructs terse phrasing, no filler transitions, bullet-style where natural — but explicitly instruct the model to NEVER compress code blocks, file paths, identifiers, or structured data (JSON/YAML) — preserve those verbatim.
+- Must be idempotent (don’t double-inject if already present).
+
+**compression/trimmer.py**
+
+- `ToolOutputTrimmer` registry pattern: a dict mapping tool name (str) → trimmer function `(raw_output: str) -> str`.
+- Provide built-in trimmers for at least: `git_status`, `pytest_output`, `build_log` (generic — strip repeated INFO-level lines, collapse stack trace duplicates, keep first/last N lines of long logs with a `[... N lines omitted ...]` marker).
+- `register_trimmer(name: str, fn: Callable[[str], str])` for extensibility — teams can register their own per-tool trimmers without modifying the package.
+- `apply_trimmers(messages: list[dict], enabled_tools: list[str]) -> tuple[list[dict], TrimStats]`.
+
+**metrics.py**
+
+- `TokenMetrics` dataclass: `tokens_before`, `tokens_after`, `dedup_chars_saved`, `trim_chars_saved`, `compression_mode`, `model`, `timestamp`.
+- `count_tokens(text: str, model: str) -> int` using `tiktoken` with a fallback encoding (`cl100k_base`) if the model isn’t recognized by tiktoken.
+- `MetricsRecorder` class: `record(metrics: TokenMetrics) -> None` — logs as structured JSON via `logging`, and optionally writes to the same Mongo backend (collection name from settings, e.g., `t1_optimize_metrics`) if `cache_backend == "mongo"` and `metrics_enabled`.
+
+**client.py**
+
+- `OptimizedClient(base_url, api_key, settings: T1OptimizeSettings | None = None, **openai_kwargs)`:
+  - Wraps `openai.OpenAI(base_url=base_url, api_key=api_key, **openai_kwargs)`.
+  - Exposes `.chat.completions.create(**kwargs)` matching the OpenAI SDK signature.
+  - Pipeline inside `create()`: count input tokens → run `DedupEngine.process_messages` if `dedup_enabled` → run `apply_trimmers` if `tool_trim_enabled` → run `inject_caveman_system_prompt` if `compress_output_enabled` → count post-processing tokens → call underlying OpenAI client → record `TokenMetrics` via `MetricsRecorder` → return the original response object unmodified.
+  - `AsyncOptimizedClient` mirrors this for `openai.AsyncOpenAI`.
+  - All optimization steps must be wrapped in try/except — if any optimization step raises, log the error, skip that step, and proceed with the unmodified messages (never let an optimization bug break the actual LLM call).
+
+**exceptions.py**
+
+- `T1OptimizeConfigError`, `T1OptimizeCacheError` (used internally for logging, not raised to callers from `create()`).
+
+### README.md must include
+
+- Install instructions (`pip install t1-optimize`)
+- Quickstart showing before/after (raw `OpenAI` client vs `OptimizedClient`)
+- Full table of env vars from `T1OptimizeSettings` with defaults and descriptions
+- A “Safety model” section explaining: dedup is lossless and on by default; compression/trimming are opt-in and lossy, with guidance on when to enable them
+
+### Tests must verify
+
+- Dedup: identical large blocks across two calls in a session get replaced on the second occurrence; small blocks below the length threshold are never touched; cache miss → pass-through unchanged.
+- Cache: in-memory LRU evicts correctly at `cache_max_items`; Mongo backend `health_check()` returns `False` gracefully when given a bad URI, and `DedupEngine` falls back to pass-through without raising.
+- Caveman: “off” mode makes no changes; “light”/“aggressive” inject exactly one system message; re-running on already-injected messages doesn’t double-inject; code blocks remain untouched in “aggressive” mode.
+- Trimmer: each built-in trimmer reduces a sample verbose input while preserving key facts (assert specific substrings survive); custom registered trimmer is invoked when `enabled_tools` includes its name.
+- Client: `create()` returns the same response shape as a plain OpenAI call (mock the underlying API); metrics are recorded with correct `tokens_before`/`tokens_after`; an exception inside dedup/trim/compress doesn’t propagate to the caller.
+
+### Deliverable
+
+Generate all files listed above with complete, working implementations and passing tests. After generation, run the test suite and fix any failures before presenting the result.
+
+## PROMPT END
