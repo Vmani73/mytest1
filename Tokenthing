@@ -1,0 +1,134 @@
+# BUILD PROMPT — `ctx-optimizer`: Production-Grade Context Optimization Library
+
+You are building a pip-installable Python library called `ctx-optimizer` that reduces LLM token consumption by 60–90% on agentic workloads with zero quality compromise. It combines four proven techniques behind one API. Build it completely — no stubs, no TODOs, no placeholder functions. Every module must be fully implemented and unit-tested.
+
+## Context
+
+The library sits between an agentic application and an OpenAI-compatible LLM gateway. The gateway base URL, auth header name, and credentials are NEVER hardcoded — read from environment variables (`CTXOPT_GATEWAY_URL`, `CTXOPT_AUTH_HEADER`, `CTXOPT_AUTH_TOKEN`). Two upstream call patterns must be supported:
+
+1. **Synchronous** chat-completions calls.
+1. **Asynchronous enqueue + poll** calls (request submitted to a queue endpoint, result polled later). In this mode the model CANNOT make mid-conversation retrieval round-trips, so any reversible-compression feature that depends on a retrieval tool must be hard-disabled.
+
+Target environment: Python 3.10+, restricted corporate network. Assume HuggingFace model downloads MAY be blocked — every ML-dependent feature must be optional with a deterministic fallback. Internal PyPI mirror only.
+
+## Architecture — the pipeline
+
+Implement a composable pipeline. Each stage is a class implementing a common `Transform` protocol: `apply(messages: list[dict], budget: Budget) -> TransformResult`. Stages run in this fixed order:
+
+```
+messages
+ → [1] Deduplicator          (SHA-256 content-addressing)
+ → [2] ContentRouter          (classify each block: json | code | prose | log | binary)
+ → [3] StructuredCompressor   (json/log blocks → Headroom SmartCrusher)
+ → [4] CodeCompressor         (code blocks → Headroom AST compressor)
+ → [5] ProseCompressor        (prose blocks → Caveman; optional LLMLingua-2 tier)
+ → [6] HistoryManager         (rolling window + per-section token budget)
+ → [7] ToolSchemaPruner       (drop tool definitions irrelevant to current turn)
+ → [8] CacheAligner           (stable prefix ordering for provider KV-cache hits)
+ → [9] QualityGate            (entity-preservation verification, abort on failure)
+ → optimized messages + OptimizationReport
+```
+
+### Stage 1 — Deduplicator
+
+- SHA-256 hash of each tool-result content block (normalized: stripped whitespace, sorted JSON keys).
+- On repeat hash within the conversation: replace body with `[dedup-ref: <hash8>] identical to earlier result at message index N`.
+- Maintain an in-process LRU hash store (configurable max 10k entries). No external storage.
+
+### Stage 2 — ContentRouter
+
+- Deterministic classification, no ML: JSON (parseable via `json.loads` or fenced ```json), code (fenced code blocks, file-extension hints, AST-parse probe for Python/Java/JS), logs (timestamp-prefixed line patterns, log-level tokens), prose (default).
+- A single message may contain mixed blocks — split, route each block independently, reassemble in original order.
+- Router decisions logged into the OptimizationReport for auditability.
+
+### Stage 3 — StructuredCompressor (wraps `headroom-ai`)
+
+- Dependency: `headroom-ai` (base extras ONLY — do not require `[ml]`).
+- Use Headroom’s SmartCrusher for JSON arrays/objects and log outputs.
+- CCR (reversible retrieval) is configurable: `ccr_mode="auto"` enables it only for the synchronous adapter; force-off for enqueue/poll adapter regardless of config.
+- If `headroom-ai` import fails, fall back to an internal deterministic JSON crusher you implement: for arrays of homogeneous dicts keep first 3 + last 2 items + a schema summary + count; collapse repeated keys; truncate string values over 500 chars with `…[+N chars]` markers. This fallback must be fully implemented and tested, not a stub.
+
+### Stage 4 — CodeCompressor
+
+- Use Headroom’s AST-aware compressor where available (Python, JS, Go, Rust, Java, C++).
+- Fallback (must be implemented): signature-level skeletonization — keep imports, class/method signatures, docstrings, and lines containing identifiers mentioned in the user’s latest query; elide bodies with `# …elided (N lines)`.
+- NEVER compress code blocks the user is actively asking to modify (detect: code referenced in the latest user message stays verbatim).
+
+### Stage 5 — ProseCompressor
+
+- Default tier: **Caveman-style telegraphic compression**, implemented natively in this library (do not vendor third-party code; implement the technique): remove articles, copulas, hedges, and connective filler; preserve ALL of: numbers, percentages, identifiers, proper nouns, URLs, file paths, quantifiers (“at least”, “no more than”), negations, units. Use a rule-based pass with a protected-token regex set; optionally use spaCy POS tags if `spacy` + a language model are importable, otherwise pure-regex mode (both fully implemented).
+- Optional tier (off by default, flag `prose_engine="lingua2"`): LLMLingua-2 token-classification compression via the `llmlingua` package — gracefully degrade to caveman tier if the model weights are unavailable.
+- HARD RULE: prose compression applies ONLY to tool results, retrieved docs, and historical assistant messages. NEVER compress: the system prompt, the latest user message, or any message containing instructions to the model.
+
+### Stage 6 — HistoryManager
+
+- Token-budget controller (LLMLingua concept): caller sets `max_input_tokens`; allocate budget per section — system prompt (never touched) > latest user turn (never touched) > recent N turns (light compression) > older turns (aggressive compression) > overflow (drop with a one-line summary marker).
+- Token counting via `tiktoken` if available, else a chars/4 estimator (implement both).
+
+### Stage 7 — ToolSchemaPruner
+
+- Tool definitions often cost thousands of tokens per call. Given the latest user message and conversation, score each tool schema by keyword/identifier overlap; keep tools above threshold plus an always-keep allowlist. Configurable, default conservative (keep if any doubt). Emit pruned-tool names in the report.
+
+### Stage 8 — CacheAligner
+
+- Ensure byte-stable ordering of the static prefix (system prompt, tool schemas, always-keep context) across calls so provider-side prompt caching hits. Deterministic serialization: sorted tool order, normalized whitespace, no timestamps in the prefix.
+
+### Stage 9 — QualityGate (non-negotiable)
+
+After all compression, verify against the ORIGINAL messages:
+
+- Every number, percentage, version string, URL, file path, UUID/hash, and capitalized multi-word entity present in original tool results either survives in compressed output or was inside a dedup-ref/elision marker that points to it.
+- If verification fails for any block: revert THAT block to its original form, log the incident, continue. Never silently ship a lossy block that failed the gate.
+- Global kill switch: env `CTXOPT_BYPASS=1` returns messages untouched.
+
+## Public API
+
+```python
+from ctx_optimizer import Optimizer, OptimizerConfig
+
+opt = Optimizer(OptimizerConfig(
+    max_input_tokens=24000,
+    prose_engine="caveman",      # "caveman" | "lingua2" | "off"
+    ccr_mode="auto",             # "auto" | "off"
+    aggressive=False,            # quality-first defaults
+))
+
+# Sync adapter
+result = opt.optimize(messages, tools=tools, mode="sync")
+client.chat.completions.create(messages=result.messages, tools=result.tools, ...)
+
+# Enqueue/poll adapter (CCR force-off internally)
+result = opt.optimize(messages, tools=tools, mode="async_queue")
+queue_client.enqueue(payload={"messages": result.messages, ...})
+
+print(result.report.tokens_before, result.report.tokens_after,
+      result.report.savings_pct, result.report.per_stage_breakdown)
+```
+
+`OptimizationReport` must include: per-stage token deltas, per-content-type breakdown, dedup hits, pruned tools, quality-gate reverts, wall-clock ms per stage. Provide `opt.stats()` for cumulative session metrics and a `ctxopt stats` CLI entry point.
+
+## Quality / engineering requirements
+
+- **Shadow mode**: `OptimizerConfig(shadow=True)` runs the full pipeline, produces the report, but returns ORIGINAL messages — for risk-free production measurement before cutover.
+- Full type hints, dataclasses for config/results, zero global mutable state, thread-safe.
+- Dependencies: stdlib + `headroom-ai` (optional), `tiktoken` (optional), `spacy` (optional), `llmlingua` (optional). The library must import and run with ZERO optional deps installed.
+- Pytest suite: ≥90% coverage on routing, each compressor, each fallback, the quality gate (including forced-failure revert tests), both adapters, and a golden-file regression test with a realistic 50k-token agent transcript fixture you generate.
+- Property tests (hypothesis): for any input, output token count ≤ input; protected entities always survive; `CTXOPT_BYPASS` is identity.
+- Benchmark script `bench/run.py`: measures compression ratio and latency per stage on the fixture; prints a table.
+- README with architecture diagram (mermaid), quickstart, config reference, and an explicit “quality guarantees” section describing the QualityGate and shadow mode.
+- Packaging: `pyproject.toml`, extras `[headroom]`, `[nlp]`, `[lingua2]`, `[all]`. Version 0.1.0. Apache-2.0.
+- No company names, internal system names, or environment-specific identifiers anywhere in code, comments, or docs.
+
+## Build order
+
+1. Scaffold package + config/result dataclasses + Transform protocol.
+1. ContentRouter + tests (this is the foundation — get it right first).
+1. Deduplicator + tests.
+1. Fallback compressors (JSON crusher, code skeletonizer, caveman prose) + tests — these must work standalone before any optional dependency is touched.
+1. Optional-dependency wrappers (headroom, llmlingua) with import guards + tests using mocks.
+1. HistoryManager, ToolSchemaPruner, CacheAligner + tests.
+1. QualityGate + property tests.
+1. Adapters (sync, async_queue), Optimizer facade, CLI, stats.
+1. Golden-file regression fixture + benchmark + README.
+
+Run the full test suite after every stage. Do not proceed to the next stage with failing tests.
