@@ -1,0 +1,952 @@
+# FINAL BUILD PROMPT — `ctx-optimizer` v1.0.0
+
+# Production-Grade LLM Context Optimization Package
+
+-----
+
+## ROLE
+
+You are a senior Python engineer building a production-grade, pip-installable Python package called `ctx-optimizer`. This package sits between an agentic LLM application and an OpenAI-compatible LLM gateway and reduces token consumption by 60–80% with zero quality compromise. Build everything completely — no stubs, no TODOs, no placeholder functions. Every module, every class, every fallback must be fully implemented, tested, and documented.
+
+-----
+
+## PACKAGE IDENTITY
+
+- **Name**: `ctx-optimizer`
+- **Import as**: `ctx_optimizer`
+- **Version**: `1.0.0`
+- **License**: Apache-2.0
+- **Python**: 3.10+
+- **Platform**: Windows + Linux (cross-platform)
+- **Network**: Restricted corporate environment — no runtime internet access
+- **Target**: OpenAI-compatible LLM gateway (env-configured, never hardcoded)
+
+-----
+
+## ABSOLUTE RULES — READ BEFORE WRITING A SINGLE LINE
+
+1. **No internal names** anywhere in code, comments, tests, or docs. Use env vars for everything.
+1. **No hardcoded URLs, tokens, or credentials** — all config via `pydantic-settings` reading env vars.
+1. **Every optional dependency must be guarded** with a try/except import and a fully-implemented deterministic fallback.
+1. **The library must import and run with zero optional dependencies installed** — core pipeline works on stdlib alone.
+1. **Never modify the original messages list** — all transforms on deep copies.
+1. **Thread-safe** — no global mutable state, no module-level singletons.
+1. **CCR (retrievable compression) is force-disabled for async_queue mode** regardless of config.
+1. **QualityGate reverts individual failing blocks** — never silently ships lossy output.
+1. **Shadow mode returns original messages untouched** — safe for production dark-launch measurement.
+1. **CTXOPT_BYPASS=1 env var is an identity function** — returns messages exactly as received.
+
+-----
+
+## DEPENDENCIES
+
+### Required (pip install these — all have pre-compiled wheels, no Rust build):
+
+```toml
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
+tiktoken>=0.5.0
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+tree-sitter-java>=0.21.0
+structlog>=24.0.0
+cachetools>=5.0.0
+```
+
+### Optional extras (graceful degradation if unavailable):
+
+```toml
+[nlp]     spacy>=3.7.0
+[lingua]  llmlingua>=0.2.0
+[all]     both of the above
+```
+
+### Internal utilities (stdlib only):
+
+`hashlib, json, re, ast, copy, os, time, typing, dataclasses, pathlib, functools, threading`
+
+-----
+
+## DIRECTORY STRUCTURE
+
+Build exactly this structure:
+
+```
+ctx_optimizer/
+├── __init__.py               # Public API surface only
+├── config.py                 # OptimizerConfig via pydantic-settings
+├── types.py                  # All shared types, enums, dataclasses
+├── optimizer.py              # Optimizer facade — the main entry point
+├── adapters/
+│   ├── __init__.py
+│   ├── sync.py               # Synchronous chat-completion adapter
+│   └── async_queue.py        # Enqueue/poll adapter — CCR force-disabled
+├── pipeline/
+│   ├── __init__.py
+│   ├── base.py               # Transform protocol + PipelineRunner
+│   ├── deduplicator.py       # Stage 1: SHA-256 content dedup
+│   ├── router.py             # Stage 2: ContentRouter (classify blocks)
+│   ├── structured.py         # Stage 3: JSON/log compressor
+│   ├── code.py               # Stage 4: Code compressor (Tree-sitter)
+│   ├── prose.py              # Stage 5: Caveman + optional LLMLingua-2
+│   ├── history.py            # Stage 6: HistoryManager + token budget
+│   ├── tool_pruner.py        # Stage 7: Tool schema pruner
+│   ├── cache_aligner.py      # Stage 8: Stable prefix for KV-cache hits
+│   └── quality_gate.py       # Stage 9: Entity preservation verifier
+├── compressors/
+│   ├── __init__.py
+│   ├── json_crusher.py       # Native JSON array/object crusher (fallback)
+│   ├── code_skeletonizer.py  # Native signature extractor (fallback)
+│   ├── caveman.py            # Rule-based prose compressor (always native)
+│   └── lingua.py             # LLMLingua-2 wrapper (optional)
+├── tokens/
+│   ├── __init__.py
+│   └── counter.py            # tiktoken counter + chars/4 fallback
+├── logging/
+│   ├── __init__.py
+│   └── setup.py              # structlog configuration
+├── stats/
+│   ├── __init__.py
+│   └── tracker.py            # Session-level cumulative metrics
+└── cli.py                    # ctxopt CLI entry point
+
+tests/
+├── conftest.py               # Fixtures including 50k-token transcript
+├── unit/
+│   ├── test_deduplicator.py
+│   ├── test_router.py
+│   ├── test_json_crusher.py
+│   ├── test_code_skeletonizer.py
+│   ├── test_caveman.py
+│   ├── test_code_compressor.py
+│   ├── test_prose_compressor.py
+│   ├── test_history.py
+│   ├── test_tool_pruner.py
+│   ├── test_cache_aligner.py
+│   ├── test_quality_gate.py
+│   ├── test_adapters.py
+│   └── test_optimizer.py
+├── integration/
+│   ├── test_pipeline_e2e.py
+│   └── test_shadow_mode.py
+├── property/
+│   └── test_properties.py    # hypothesis property tests
+├── regression/
+│   ├── fixtures/
+│   │   └── transcript_50k.json  # You generate this realistic fixture
+│   └── test_golden.py
+└── bench/
+    └── run.py                # Benchmark: compression ratio + latency per stage
+
+pyproject.toml
+README.md
+CHANGELOG.md
+```
+
+-----
+
+## STAGE-BY-STAGE IMPLEMENTATION SPEC
+
+### STAGE 1 — Deduplicator (`pipeline/deduplicator.py`)
+
+**Purpose**: Eliminate identical tool outputs appearing multiple times in conversation history.
+
+**Implementation**:
+
+- For each message, for each `tool_result` or `content` block:
+  - Normalize: strip leading/trailing whitespace, if valid JSON then `json.dumps(json.loads(content), sort_keys=True, separators=(',', ':'))`, else stripped string
+  - SHA-256 hash of normalized content
+  - First occurrence: store hash → `(message_index, block_index)` in LRU cache
+  - Subsequent occurrence: replace entire block content with: `[DEDUP:sha8=<first8chars>:ref=msg#{original_index}]`
+- LRU cache: `cachetools.LRUCache(maxsize=config.dedup_cache_size)` (default 10,000 entries)
+- Report: `dedup_hits` count, token delta, list of deduplicated hashes
+- Never dedup the latest user message or system prompt
+
+**Edge cases to handle**:
+
+- Binary content: skip, pass through
+- Empty content: skip
+- JSON that parses to a number or boolean: skip normalization
+- Tool result blocks with `is_error=True`: dedup separately (errors are often identical retries)
+
+-----
+
+### STAGE 2 — ContentRouter (`pipeline/router.py`)
+
+**Purpose**: Classify every block in every message into a content type so downstream stages process only what they’re good at.
+
+**Content types** (enum `ContentType`): `JSON`, `CODE`, `LOG`, `PROSE`, `BINARY`, `SKIP`
+
+**Classification logic** (deterministic, zero ML, in this priority order):
+
+1. **SKIP**: system prompt, latest user message, any message where `role == "user"` and it’s the last user message, any message with `role == "system"`. These are NEVER touched by any compressor.
+1. **BINARY**: content that fails UTF-8 decode or is clearly base64 blob (>80% base64 chars, length >500). Pass through.
+1. **JSON**: try `json.loads(content)` — if parses successfully, it’s JSON. Also detect fenced code blocks with `json ... ` markers. Must be dict or list (not scalar).
+1. **CODE**: detect any of:
+- Fenced code blocks: ````python`, ````java`, ````javascript`, ````go`, ````rust`, ````typescript`, ````cpp`, etc.
+- Unfenced: try `ast.parse(content)` for Python (success = CODE)
+- Unfenced: look for Java class/method patterns: `public class`, `private void`, `@Override`, `import com.`, `@Service`, `@Repository`
+- File path hints in the message context: `.py`, `.java`, `.js`, `.ts`, `.go` extensions mentioned in preceding text
+1. **LOG**: line-by-line pattern where ≥60% of lines match timestamp-prefix patterns: `\d{4}-\d{2}-\d{2}`, ISO8601, log levels `(DEBUG|INFO|WARN|ERROR|FATAL|TRACE)`, stack trace patterns `at com.`, `at org.`, `Traceback (most recent call last)`
+1. **PROSE**: default for anything not matched above
+
+**Mixed content handling**: A single message content string may contain multiple block types. Split on fenced code block markers and classify each segment independently. Return a list of `(ContentType, str)` tuples preserving original order for reassembly.
+
+**Report**: For every message, log `{message_index, block_index, content_type, char_count, decision_reason}` into `OptimizationReport.routing_decisions`.
+
+-----
+
+### STAGE 3 — StructuredCompressor (`pipeline/structured.py`)
+
+**Purpose**: Compress JSON arrays, objects, and log outputs.
+
+**Implementation — JSON Crusher** (`compressors/json_crusher.py`):
+
+Fully implement this natively. Rules in order:
+
+For **JSON arrays** of homogeneous dicts (all items share same top-level keys):
+
+- Count: N items
+- Keep: first 3 items verbatim + last 2 items verbatim
+- Replace middle with: `{"__compressed__": true, "omitted_count": N-5, "schema": <keys of first item>, "note": "retrieve original if needed"}`
+- If N ≤ 6: keep all items, no compression
+
+For **JSON arrays** of non-homogeneous items:
+
+- Keep first 3 + last 2
+- Middle items: keep only their first-level keys with value `"<omitted>"`
+
+For **JSON objects** (dict at top level):
+
+- String values > 500 chars: truncate to 500 + `"...[+N chars]"`
+- Nested arrays with >5 items: apply array rules recursively
+- Keep all keys (removing keys loses semantics)
+- Numbers, booleans, null: always keep verbatim (critical data)
+
+For **LOG blocks**:
+
+- Group consecutive lines with same log level
+- Keep: first occurrence of each unique log message pattern (de-duplicate repeated log lines)
+- Keep: all ERROR/FATAL lines (never drop these)
+- Keep: first 5 + last 5 DEBUG/INFO lines, summarize middle as `[... N lines of INFO/DEBUG omitted ...]`
+- Keep: all stack trace lines verbatim
+
+**Quality contract**: every NUMBER (int, float, percentage), every UUID, every URL, every file path present in original JSON must be present in output or inside a `__compressed__` marker. The QualityGate checks this.
+
+-----
+
+### STAGE 4 — CodeCompressor (`pipeline/code.py`)
+
+**Purpose**: Compress code blocks by keeping signatures and removing bodies where safe.
+
+**Primary implementation — Tree-sitter** (when `tree-sitter-python`, `tree-sitter-java`, etc. available):
+
+```python
+# Tree-sitter based skeletonization:
+# 1. Parse code with appropriate language parser
+# 2. Extract: imports, class declarations, method signatures, docstrings
+# 3. Identify: all identifiers in the latest user message (the query)
+# 4. Keep verbatim: any method/class whose name appears in the user query
+# 5. Elide: bodies of methods NOT referenced in user query
+# 6. Elide marker: # ... body elided (N lines)
+```
+
+Languages to support via Tree-sitter: Python, Java, JavaScript, TypeScript, Go.
+
+**Fallback — Native Skeletonizer** (`compressors/code_skeletonizer.py`) when Tree-sitter unavailable:
+
+- For Python: use stdlib `ast` module. Walk AST, extract function/class/method signatures + docstrings. Emit signature + docstring + `# ...body elided (N lines)`.
+- For Java: regex-based. Capture: `import ...;`, `public/private/protected ... class/interface ...{`, `@annotation`, `public/private ... methodName(...)`, javadoc `/** ... */`. Body: everything between `{` and matching `}` → replace with `{ /* body elided (N lines) */ }`.
+- For other languages: return original (safe passthrough).
+
+**HARD RULE**: Never compress:
+
+- Code blocks where any identifier in the block appears in the latest user message as part of a question/instruction
+- Code blocks shorter than 20 lines (compression overhead exceeds benefit)
+- Code blocks that are test files if the user is asking about tests
+
+-----
+
+### STAGE 5 — ProseCompressor (`pipeline/prose.py`)
+
+**Two tiers, tried in order based on config:**
+
+**Tier 1 — Caveman** (`compressors/caveman.py`) — Always implemented natively, no dependencies:
+
+Caveman compresses by removing words the LLM can reconstruct and preserving words it cannot:
+
+**Protected tokens** (NEVER remove — compile as single regex with `re.compile`):
+
+```python
+PROTECTED_PATTERNS = [
+    r'\b\d+\.?\d*\s*%',           # percentages
+    r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?',  # numbers with commas
+    r'https?://\S+',              # URLs
+    r'/[\w./\-]+',                # file paths
+    r'[A-Z][a-zA-Z0-9]*(?:\.[A-Z][a-zA-Z0-9]*)+',  # qualified names
+    r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',  # UUIDs
+    r'\b[A-Z][A-Z0-9_]{2,}\b',   # CONSTANTS / ACRONYMS
+    r'\bv?\d+\.\d+(?:\.\d+)*\b', # version strings
+    r'\b(?:no|not|never|without|none|zero|false|null)\b',  # negations
+    r'\b(?:at least|no more than|at most|exactly|minimum|maximum|up to)\b',  # quantifiers
+    r'\b(?:before|after|when|if|unless|while|until)\b',  # conditionals
+    r'`[^`]+`',                   # inline code
+    r'"[^"]{1,50}"',              # short quoted strings
+    r'\b(?:error|warning|critical|fatal|exception)\b',  # severity terms
+]
+```
+
+**Words to drop** (articles, copulas, hedges, filler — safe to remove):
+
+```python
+DROP_WORDS = {
+    # Articles
+    'a', 'an', 'the',
+    # Copulas
+    'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    # Hedges / filler
+    'basically', 'essentially', 'generally', 'typically', 'usually',
+    'simply', 'just', 'quite', 'rather', 'somewhat', 'very', 'really',
+    'actually', 'indeed', 'certainly', 'obviously', 'clearly',
+    'in order to', 'in terms of', 'with respect to', 'with regard to',
+    'it is worth noting that', 'it should be noted that',
+    'please note that', 'note that',
+    # Transition words (safe to drop)
+    'furthermore', 'moreover', 'additionally', 'consequently',
+    'therefore', 'thus', 'hence', 'accordingly',
+    # Pleasantries
+    'please', 'kindly', 'thank you', 'thanks',
+}
+```
+
+**Optional POS mode** (if spaCy available): Use spaCy to tag POS, then:
+
+- Drop: DET (determiners), AUX (auxiliary verbs unless negated), PART (particles), INTJ (interjections)
+- Keep: NOUN, PROPN, VERB (main verbs), NUM, ADJ (when modifying kept nouns), PRON (when subject is critical)
+- Always keep: named entities (NE tags: ORG, PRODUCT, GPE, PERSON, CARDINAL)
+
+**Caveman compression algorithm**:
+
+```
+1. Tokenize by word boundaries (re.split on \s+)
+2. Mark all protected pattern spans → these tokens are UNTOUCHABLE
+3. For each remaining token: check if in DROP_WORDS → remove
+4. Rejoin remaining tokens, normalize multiple spaces to single space
+5. Verify: character reduction ≥ 10% — if less, return original (compression not worth it)
+```
+
+**Tier 2 — LLMLingua-2** (`compressors/lingua.py`) — optional, only when `llmlingua` importable:
+
+```python
+try:
+    from llmlingua import PromptCompressor
+    _llm_compressor = PromptCompressor(
+        model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+        use_llmlingua2=True,
+        device_map="cpu",  # No GPU assumed in corporate env
+    )
+    LINGUA_AVAILABLE = True
+except ImportError:
+    LINGUA_AVAILABLE = False
+
+def compress_with_lingua(text: str, ratio: float = 0.5) -> str:
+    if not LINGUA_AVAILABLE:
+        return compress_caveman(text)  # Fallback
+    result = _llm_compressor.compress_prompt(
+        text,
+        rate=ratio,
+        force_tokens=['\n', '?', '!', '.'],  # preserve sentence structure
+    )
+    return result['compressed_prompt']
+```
+
+**HARD RULE — Prose compressor applies ONLY to**:
+
+- Tool result content blocks
+- Retrieved document chunks
+- Historical assistant messages (not the most recent N turns, configurable, default 3)
+
+**NEVER apply prose compression to**:
+
+- System prompt (any role == “system”)
+- Latest user message
+- Any message containing XML/JSON/code (routed to other stages)
+- Any message that the ContentRouter classified as SKIP
+
+-----
+
+### STAGE 6 — HistoryManager (`pipeline/history.py`)
+
+**Purpose**: Enforce total token budget across the message list, dropping/compressing oldest turns first.
+
+**Token counter** (`tokens/counter.py`):
+
+```python
+# Primary: tiktoken
+try:
+    import tiktoken
+    def count_tokens(text: str, model: str = "gpt-4") -> int:
+        enc = tiktoken.encoding_for_model(model)
+        return len(enc.encode(text))
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    def count_tokens(text: str, model: str = "gpt-4") -> int:
+        return max(1, len(text) // 4)  # chars/4 estimator
+    TIKTOKEN_AVAILABLE = False
+```
+
+**Budget allocation** (when total tokens > `config.max_input_tokens`):
+
+Section priority (NEVER touch top 2 regardless of budget):
+
+1. `role == "system"` — protected, never modified, budget cost tracked only
+1. Latest user message — protected, never modified, budget cost tracked only
+1. Recent N turns (configurable, default last 3 assistant+user pairs) — light compression only (Caveman tier)
+1. Older turns — aggressive compression (LLMLingua-2 if available, else Caveman)
+1. Overflow (still over budget after compression) — drop oldest turns, replace with: `[HISTORY TRUNCATED: N turns omitted. Summary: assistant was helping with <topic extracted from first dropped message>]`
+
+**History compression is applied as a final pass** on already-pipeline-compressed messages — it’s the safety valve.
+
+-----
+
+### STAGE 7 — ToolSchemaPruner (`pipeline/tool_pruner.py`)
+
+**Purpose**: Tool definitions can be thousands of tokens. Most agentic turns only need 2–3 tools but carry 20+ definitions.
+
+**Algorithm**:
+
+1. Extract keywords from latest user message: split by `\W+`, remove stopwords, keep tokens ≥ 4 chars
+1. For each tool in `tools` list:
+- Score = sum of keyword matches in `name` + `description` + parameter names
+- If score > 0: keep
+- If score == 0 and tool name in `config.always_keep_tools` list: keep
+- If score == 0 and tool not in always_keep: PRUNE
+1. If pruning would leave < `config.min_tools_kept` (default: 3) tools: keep top-N by score
+1. Pruned tools list logged in report as `pruned_tools: [tool_name, ...]`
+1. Append a summary to the last system message: `[TOOLS AVAILABLE BUT PRUNED: tool1, tool2. Request them if needed.]`
+
+**Safety**: If latest user message explicitly mentions a tool name, that tool is ALWAYS kept.
+
+-----
+
+### STAGE 8 — CacheAligner (`pipeline/cache_aligner.py`)
+
+**Purpose**: Make the static prefix of every request byte-identical across calls so the LLM gateway’s KV-cache hits.
+
+**What “static prefix” means**: the sequence of messages that doesn’t change between agent turns — typically: system prompt + tool schemas + long-term context.
+
+**Algorithm**:
+
+1. Identify the static prefix: all messages before the first message where role == “user” in this turn’s context
+1. Normalize the prefix deterministically:
+- Sort tool schemas by `name` (alphabetically)
+- Normalize whitespace: replace all `\s+` with single space, strip leading/trailing
+- Remove timestamps from system prompt if any (timestamps make prefix non-static)
+- Ensure tool schema JSON keys are sorted (`json.dumps(..., sort_keys=True)`)
+1. Return messages with static prefix replaced by the normalized form
+1. Dynamic messages (recent turns) are NOT touched by this stage
+
+-----
+
+### STAGE 9 — QualityGate (`pipeline/quality_gate.py`)
+
+**Purpose**: The only hard guarantee in the library. Verify entity preservation after all compression. Revert any block that fails.
+
+**Entity extraction from ORIGINAL** (run before pipeline on deep copy):
+
+```python
+ENTITY_PATTERNS = {
+    'numbers':      re.compile(r'\b\d+(?:[.,]\d+)*\b'),
+    'percentages':  re.compile(r'\b\d+(?:\.\d+)?\s*%'),
+    'versions':     re.compile(r'\bv?\d+\.\d+(?:\.\d+)*(?:-\w+)?\b'),
+    'uuids':        re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I),
+    'urls':         re.compile(r'https?://\S+'),
+    'file_paths':   re.compile(r'(?:/[\w./\-]+|[A-Za-z]:\\[\w\\./\-]+)'),
+    'constants':    re.compile(r'\b[A-Z][A-Z0-9_]{2,}\b'),
+    'identifiers':  re.compile(r'\b[A-Z][a-zA-Z0-9]{2,}(?:\.[A-Z][a-zA-Z0-9]+)+\b'),  # qualified names
+}
+```
+
+**Verification per block**:
+
+```
+For each entity extracted from original block:
+  Check: entity appears in compressed block OR
+         entity appears in a DEDUP ref marker OR
+         entity appears in an elision marker that points to a valid original
+
+If any entity missing from compressed output AND not in a marker:
+  → REVERT this block to original
+  → log: {block_id, missing_entities, stage_that_compressed, revert=True}
+  → increment quality_gate_reverts in report
+```
+
+**Global bypass**: `os.environ.get("CTXOPT_BYPASS") == "1"` → return original messages immediately, skip all stages.
+
+**Shadow mode**: `config.shadow = True` → run full pipeline, produce full report, but return ORIGINAL messages as `result.messages`. Report still shows what WOULD have been saved.
+
+-----
+
+## PUBLIC API
+
+### `config.py`
+
+```python
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+class OptimizerConfig(BaseSettings):
+    # Gateway — read from env, never hardcoded
+    gateway_url: str = Field(default="", env="CTXOPT_GATEWAY_URL")
+    auth_header: str = Field(default="Authorization", env="CTXOPT_AUTH_HEADER")
+    auth_token: str = Field(default="", env="CTXOPT_AUTH_TOKEN")
+    
+    # Budget
+    max_input_tokens: int = Field(default=32000, gt=0)
+    min_tools_kept: int = Field(default=3, ge=1)
+    
+    # Modes
+    shadow: bool = Field(default=False)              # Measure only, don't modify
+    aggressive: bool = Field(default=False)           # Higher compression, same QualityGate
+    prose_engine: str = Field(default="caveman")      # "caveman" | "lingua2" | "off"
+    ccr_mode: str = Field(default="auto")             # "auto" | "off"
+    
+    # Tuning
+    dedup_cache_size: int = Field(default=10000, gt=0)
+    history_protected_turns: int = Field(default=3, ge=1)
+    code_min_lines: int = Field(default=20, ge=1)    # Min lines before code compression
+    always_keep_tools: list[str] = Field(default_factory=list)
+    
+    # Internals
+    model_name: str = Field(default="gpt-4", env="CTXOPT_MODEL_NAME")  # For tiktoken
+    
+    class Config:
+        env_prefix = "CTXOPT_"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+```
+
+### `types.py`
+
+```python
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass
+class RoutingDecision:
+    message_index: int
+    block_index: int
+    content_type: str
+    char_count: int
+    reason: str
+
+@dataclass
+class StageResult:
+    stage_name: str
+    tokens_before: int
+    tokens_after: int
+    wall_ms: float
+    items_processed: int
+    items_modified: int
+    notes: list[str] = field(default_factory=list)
+
+@dataclass
+class OptimizationReport:
+    tokens_before: int
+    tokens_after: int
+    savings_pct: float
+    per_stage_breakdown: list[StageResult]
+    dedup_hits: int
+    pruned_tools: list[str]
+    quality_gate_reverts: int
+    routing_decisions: list[RoutingDecision]
+    total_wall_ms: float
+    shadow_mode: bool
+    bypass_mode: bool
+
+@dataclass
+class OptimizationResult:
+    messages: list[dict]        # Compressed messages (or original if shadow/bypass)
+    tools: list[dict]           # Pruned tools (or original if shadow/bypass)
+    report: OptimizationReport
+```
+
+### `optimizer.py` — Main facade
+
+```python
+class Optimizer:
+    def __init__(self, config: OptimizerConfig | None = None):
+        self.config = config or OptimizerConfig()
+        self._pipeline = self._build_pipeline()
+        self._session_stats = SessionStats()  # Thread-local per instance
+
+    def optimize(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        mode: str = "sync",  # "sync" | "async_queue"
+    ) -> OptimizationResult:
+        """Main entry point. Thread-safe. Returns compressed messages + report."""
+
+    def stats(self) -> dict:
+        """Cumulative session statistics: total savings, call count, avg ratio."""
+
+    def reset_stats(self) -> None:
+        """Reset session statistics."""
+```
+
+-----
+
+## LOGGING SETUP (`logging/setup.py`)
+
+Configure structlog once at package import:
+
+```python
+import structlog
+
+def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
+    """
+    fmt: "json" for production (queryable), "console" for development
+    """
+    processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    
+    if fmt == "json":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+    
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(
+            getattr(logging, level.upper(), logging.INFO)
+        ),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+```
+
+**Every pipeline stage must log**:
+
+```python
+log = structlog.get_logger()
+
+# At stage start:
+log.info("stage_start", stage=self.name, job_id=ctx.job_id, tokens_before=N)
+
+# At stage end:
+log.info("stage_complete", stage=self.name, job_id=ctx.job_id, 
+         tokens_before=N, tokens_after=M, delta=N-M, wall_ms=elapsed)
+
+# On QualityGate revert:
+log.warning("quality_gate_revert", stage=self.name, block_id=block_id,
+            missing_entities=entities, action="reverted_to_original")
+
+# On optional dependency missing:
+log.info("fallback_activated", feature="tree_sitter", fallback="code_skeletonizer",
+         reason="tree-sitter-java not installed")
+```
+
+-----
+
+## CLI (`cli.py`)
+
+Entry point: `ctxopt`
+
+```
+ctxopt stats                         # Show session stats (requires running process hook or last-run file)
+ctxopt shadow <input_file.json>      # Run shadow mode on a messages JSON file, print report
+ctxopt bench                         # Run benchmark on built-in 50k fixture
+ctxopt check                         # Check which optional deps are available
+ctxopt version                       # Print version
+```
+
+`ctxopt check` output example:
+
+```
+ctx-optimizer v1.0.0 — Dependency Status
+✓  tiktoken          (accurate token counting)
+✓  pydantic v2       (config + result validation)
+✓  tree-sitter       (AST code parsing)
+✓  tree-sitter-python
+✓  tree-sitter-java
+✓  structlog         (production logging)
+✓  llmlingua         (LLMLingua-2 prose compression)
+✗  spacy             (enhanced entity recognition — optional)
+   Install: pip install spacy && python -m spacy download en_core_web_sm
+
+Active compression: dedup + JSON crusher + Tree-sitter code + LLMLingua-2 prose + QualityGate
+Estimated savings profile: 60–80% on JSON tool outputs, 40–60% on prose, 30–50% on code
+```
+
+-----
+
+## TEST REQUIREMENTS
+
+### Fixture (`tests/conftest.py`)
+
+Generate a realistic `transcript_50k.json` fixture with these characteristics:
+
+- 30+ message turns (user/assistant alternating)
+- Tool calls returning: large JSON arrays (500+ items), Java class file contents (300+ lines), Python module contents (200+ lines), log outputs (500+ lines), prose analysis paragraphs
+- Several intentionally duplicated tool results (to test dedup)
+- Mix of languages: Python files, Java files, JSON payloads, markdown docs
+- Total raw token count: ~50,000 tokens (measure with tiktoken)
+- Realistic agent scenario: code analysis on a multi-module project
+
+### Unit tests — mandatory for each stage:
+
+**Deduplicator**:
+
+- Identical tool results → second is dedupped
+- Different tool results → both kept
+- JSON with different key order but same content → treated as identical (normalize before hash)
+- System prompt → never dedupped
+- Latest user message → never dedupped
+
+**ContentRouter**:
+
+- Valid JSON string → classified as JSON
+- Fenced ```java code block → classified as CODE
+- Log lines with timestamps → classified as LOG
+- Regular paragraph → classified as PROSE
+- System message → classified as SKIP
+- Mixed content string → split into multiple typed segments
+- Empty content → SKIP
+
+**JSON Crusher**:
+
+- Array of 100 homogeneous dicts → keeps first 3 + last 2 + summary
+- Array of 5 items → unchanged (≤6 threshold)
+- Nested JSON → recursive compression
+- All numbers/UUIDs/URLs preserved → assert each entity from original appears in output
+- Array of non-homogeneous items → compressed differently
+
+**Code Skeletonizer (fallback)**:
+
+- Python function → body elided, signature kept
+- Python class with methods → class signature + method signatures kept, bodies elided
+- Method name appears in user query → keep verbatim
+- < 20 lines → return unchanged
+- Java class → public method signatures kept, bodies elided
+
+**Caveman**:
+
+- “The system is running normally” → “System running normally”
+- Numbers preserved: “The error rate is 42.5%” → “Error rate 42.5%”
+- URLs preserved: “See <https://example.com> for details” → includes URL
+- Negations preserved: “The system was not available” → includes “not”
+- Quantifiers preserved: “at least 3 retries” → includes “at least”
+- Version strings preserved: “version 2.3.1” → includes “2.3.1”
+
+**QualityGate**:
+
+- Block with all entities preserved → passes, no revert
+- Block with missing number → reverted, incident logged
+- Block with missing UUID → reverted
+- CTXOPT_BYPASS=1 → returns original immediately, skips gate
+- Shadow mode → full report but original messages returned
+
+**Adapters**:
+
+- `mode="async_queue"` → CCR is force-disabled (assert in config applied to pipeline)
+- `mode="sync"` → CCR follows config
+- Both modes → `OptimizationResult` returned with valid report
+
+**Optimizer integration**:
+
+- 50k fixture → tokens_after < tokens_before
+- Shadow mode → result.messages == original messages AND report shows non-zero savings
+- Empty messages list → returns empty, no crash
+- Messages with no compressible content → returns original, zero quality reverts
+- Thread safety → 10 concurrent calls on same Optimizer instance → all return valid results
+
+### Property tests (`tests/property/test_properties.py`)
+
+Using `hypothesis`:
+
+```python
+from hypothesis import given, strategies as st
+
+@given(st.lists(st.text(min_size=1), min_size=0, max_size=100))
+def test_output_never_exceeds_input_tokens(messages_content):
+    # For any input, output token count ≤ input token count
+    ...
+
+@given(st.text(min_size=1))
+def test_protected_entities_survive_caveman(text):
+    # Any number/URL/UUID in input appears in caveman output
+    ...
+
+@given(st.text())
+def test_bypass_is_identity(text):
+    # CTXOPT_BYPASS=1 always returns input unchanged
+    ...
+
+@given(st.lists(st.text()))
+def test_quality_gate_never_silent_loss(messages_content):
+    # After full pipeline, QualityGate reverts any failing block
+    # So output entity count ≥ threshold for every block
+    ...
+```
+
+### Golden file regression (`tests/regression/test_golden.py`)
+
+```python
+def test_50k_fixture_regression():
+    # Load transcript_50k.json
+    # Run optimize()
+    # Assert: tokens_after / tokens_before <= 0.45  (at least 55% savings)
+    # Assert: quality_gate_reverts == 0
+    # Assert: all entities from original appear in output or markers
+    # Assert: report is fully populated (no None fields)
+    # Serialize report to JSON, compare to stored golden report (snapshot test)
+```
+
+-----
+
+## BENCHMARK (`bench/run.py`)
+
+```python
+"""
+Run: python bench/run.py
+
+Output:
+┌─────────────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
+│ Stage               │ Tokens In    │ Tokens Out   │ Reduction    │ Latency (ms) │
+├─────────────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
+│ Deduplicator        │ 50,000       │ 46,200       │  7.6%        │   12ms       │
+│ ContentRouter       │ 46,200       │ 46,200       │  0.0%        │    8ms       │
+│ StructuredComp.     │ 46,200       │ 22,400       │ 51.5%        │   35ms       │
+│ CodeCompressor      │ 22,400       │ 17,800       │ 20.5%        │   55ms       │
+│ ProseCompressor     │ 17,800       │ 13,200       │ 25.8%        │   28ms       │
+│ HistoryManager      │ 13,200       │ 13,200       │  0.0%        │    3ms       │
+│ ToolSchemaPruner    │ 13,200       │ 11,600       │ 12.1%        │    5ms       │
+│ CacheAligner        │ 11,600       │ 11,600       │  0.0%        │    2ms       │
+│ QualityGate         │ 11,600       │ 12,100       │ -4.3%        │   18ms       │
+│ ─────────────────── │ ──────────── │ ──────────── │ ──────────── │ ──────────── │
+│ TOTAL               │ 50,000       │ 12,100       │ 75.8%        │  166ms       │
+└─────────────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
+QualityGate reverts: 0
+Dedup hits: 4
+Pruned tools: ['search_web', 'fetch_url', 'create_file']
+"""
+```
+
+-----
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ctx-optimizer"
+version = "1.0.0"
+description = "Production-grade LLM context optimization — 60-80% token reduction with zero quality compromise"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "tiktoken>=0.5.0",
+    "tree-sitter>=0.21.0",
+    "tree-sitter-python>=0.21.0",
+    "tree-sitter-java>=0.21.0",
+    "structlog>=24.0.0",
+    "cachetools>=5.0.0",
+]
+
+[project.optional-dependencies]
+nlp     = ["spacy>=3.7.0"]
+lingua  = ["llmlingua>=0.2.0"]
+all     = ["ctx-optimizer[nlp,lingua]"]
+
+[project.scripts]
+ctxopt = "ctx_optimizer.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "--tb=short -q --cov=ctx_optimizer --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+omit = ["tests/*", "bench/*"]
+
+[tool.coverage.report]
+fail_under = 90
+```
+
+-----
+
+## README.md — Required Sections
+
+1. **Architecture Diagram** (Mermaid flowchart showing all 9 stages)
+1. **Quickstart** (5 lines of code — sync and async_queue)
+1. **Configuration Reference** (all `OptimizerConfig` fields with defaults + env var names)
+1. **Quality Guarantees** (explain QualityGate entity-preservation, shadow mode, bypass, revert-not-drop policy)
+1. **Dependency Matrix** (table: dependency, what it enables, what fallback activates without it)
+1. **Performance** (expected savings profile per content type)
+1. **Contributing** (build order, test requirements, PR checklist)
+
+-----
+
+## BUILD ORDER — Follow Exactly, Tests Must Pass Before Proceeding
+
+**Step 1**: Scaffold — `pyproject.toml`, `__init__.py`, `types.py`, `config.py`, `logging/setup.py`
+Run: `python -c "from ctx_optimizer import Optimizer"` — must not crash
+
+**Step 2**: Token counter (`tokens/counter.py`) + tiktoken tests
+Run: `pytest tests/unit/test_tokens.py`
+
+**Step 3**: ContentRouter (`pipeline/router.py`) + tests
+Run: `pytest tests/unit/test_router.py`
+
+**Step 4**: Deduplicator (`pipeline/deduplicator.py`) + tests
+Run: `pytest tests/unit/test_deduplicator.py`
+
+**Step 5**: All native compressors (`compressors/`) + tests
+Run: `pytest tests/unit/test_json_crusher.py tests/unit/test_code_skeletonizer.py tests/unit/test_caveman.py`
+
+**Step 6**: Optional wrappers — Tree-sitter code compressor, LLMLingua-2 wrapper (with import guards + mocks) + tests
+Run: `pytest tests/unit/test_code_compressor.py tests/unit/test_prose_compressor.py`
+
+**Step 7**: Remaining stages — HistoryManager, ToolSchemaPruner, CacheAligner + tests
+Run: `pytest tests/unit/test_history.py tests/unit/test_tool_pruner.py tests/unit/test_cache_aligner.py`
+
+**Step 8**: QualityGate + property tests
+Run: `pytest tests/unit/test_quality_gate.py tests/property/`
+
+**Step 9**: Pipeline base + adapters + Optimizer facade + CLI
+Run: `pytest tests/unit/test_adapters.py tests/unit/test_optimizer.py tests/integration/`
+
+**Step 10**: Generate 50k fixture, golden-file regression, benchmark
+Run: `pytest tests/regression/` && `python bench/run.py`
+
+**Final**: Full suite + coverage check
+Run: `pytest --cov=ctx_optimizer --cov-fail-under=90`
+
+-----
+
+## ACCEPTANCE CRITERIA — DO NOT MARK BUILD COMPLETE UNTIL ALL PASS
+
+- [ ] `pip install -e .` succeeds on a clean Python 3.10 env with no optional deps
+- [ ] `ctxopt check` runs and shows dependency status table
+- [ ] `ctxopt shadow tests/regression/fixtures/transcript_50k.json` outputs a report showing ≥50% savings
+- [ ] Full pytest suite passes with ≥90% coverage
+- [ ] Zero failing property tests after 100 hypothesis examples each
+- [ ] Golden regression test passes (savings ≥55%, reverts == 0)
+- [ ] Benchmark table prints without errors
+- [ ] Thread safety test: 10 concurrent `Optimizer.optimize()` calls, all return valid results, no race conditions
+- [ ] `CTXOPT_BYPASS=1 python -c "..."` returns messages identical to input
+- [ ] Shadow mode: `result.messages == original_messages` when `config.shadow=True`
+- [ ] `mode="async_queue"` : inspect pipeline config and assert CCR is disabled
+- [ ] No internal names, URLs, credentials, or environment-specific identifiers anywhere in the codebase
