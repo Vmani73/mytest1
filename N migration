@@ -1,0 +1,276 @@
+# TASK: Integrate C1 (Codemind) Codebase Hardgate Logic into N1 — Full Implementation Required
+
+## PRIME DIRECTIVE
+
+You are a senior integration engineer. You will complete this task END-TO-END without
+stopping, without asking clarifying questions, and without producing partial output.
+Every phase must be fully implemented before you move to the next. If you encounter
+ambiguity, make the most conservative safe assumption, document it inline as a code
+comment, and continue. You do not stop until the DONE CRITERIA at the bottom of this
+prompt are fully satisfied.
+
+## DEFAULT BEHAVIOUR (CRITICAL)
+
+C1 (Codemind) logic is the DEFAULT path. The feature flag exists only as an
+emergency kill-switch to revert to N1 legacy. Out of the box, with no config changes,
+C1 logic must execute. The flag default is TRUE.
+
+-----
+
+## REPOSITORIES
+
+- N1 repo (primary target — you will make changes here): [N1_REPO_PATH]
+- C1 repo (read-only reference — extract logic from here, do not modify): [C1_REPO_PATH]
+
+-----
+
+## PHASE 0 — RECONNAISSANCE (DO THIS FIRST, WRITE NOTHING YET)
+
+You must complete all three steps and print the output before writing a single line
+of implementation code. Do not skip or summarise — produce the full output.
+
+### 0.1 — Full N1 Hardgate Inventory
+
+Grep and AST-search the entire N1 codebase. Produce this exact table for EVERY
+hardgate found — no omissions:
+
+| HardgateName | Category | FilePath | ClassName | MethodName | LineNumber |
+
+Categories must be one of: CODEBASE | PLATFORM | DB | KAFKA | MESSAGING | OTHER
+Only CODEBASE category gates are in scope. Mark all others SKIP.
+
+### 0.2 — Full C1 Codebase Scan Contract
+
+Search the C1 repo and extract:
+
+- The exact entry-point class and method for codebase hardgate evaluation
+- Full method signature (return type, parameter types)
+- Every external dependency the entry-point touches (transitive, one level deep)
+- Whether any of those dependencies are DB/Kafka/broker — flag them explicitly
+
+Print this as a structured block before continuing.
+
+### 0.3 — Input/Output Compatibility Matrix
+
+For each CODEBASE hardgate identified in 0.1:
+
+- What data does N1 pass in at the call site today?
+- What does C1’s entry point expect?
+- Are they compatible? If not, what adapter mapping is needed?
+
+Print a row per hardgate. If any row shows INCOMPATIBLE and you cannot resolve it
+with a pure data mapping, mark it NEEDS_ESCALATION. Continue with all others.
+Do not stop for NEEDS_ESCALATION — implement the compatible ones and leave a
+clearly marked TODO stub for escalated ones.
+
+-----
+
+## PHASE 1 — FEATURE FLAG (KILL-SWITCH ONLY)
+
+### 1.1 Create the Flag
+
+- Name: `C1_CODEBASE_HARDGATE_ENABLED`
+- Type: boolean
+- **Default value: TRUE** — C1 is on by default
+- Wire into N1’s existing config mechanism exactly as other flags are wired
+  (do not introduce Spring profiles, new property files, or new config classes)
+- Add this exact comment above the flag definition:
+  
+  ```
+  // KILL-SWITCH: Set to false to revert codebase hardgates to legacy N1 logic.
+  // Owner: [TEAM], Default: TRUE (C1 is the live path).
+  // To rollback: set C1_CODEBASE_HARDGATE_ENABLED=false and redeploy. No code change needed.
+  ```
+
+### 1.2 Verify Plumbing
+
+- Confirm the flag value is accessible at the exact call site(s) identified in Phase 0
+- Print the config key and the class/method where it is read
+
+-----
+
+## PHASE 2 — ADAPTER IMPLEMENTATION (WRITE ALL CODE NOW)
+
+You will create all files in this phase. Do not defer any file to a later step.
+
+### 2.1 Create the Evaluator Interface
+
+File: `[n1.base.package]/integration/c1/CodebaseHardgateEvaluator.java`
+
+```java
+/**
+ * Abstraction over codebase hardgate evaluation.
+ * Default implementation: C1CodebaseHardgateEvaluator (Codemind agentic logic).
+ * Fallback implementation: N1LegacyCodebaseHardgateEvaluator (original N1 logic).
+ */
+public interface CodebaseHardgateEvaluator {
+    HardgateResult evaluate(CodebaseHardgateContext context);
+}
+```
+
+### 2.2 Create the Context Object
+
+File: `[n1.base.package]/integration/c1/CodebaseHardgateContext.java`
+
+- Fields: exactly what N1 already has at the hardgate call site — no new data fetching
+- Use the same types N1 already uses — no new imports from C1 in this class
+
+### 2.3 Implement N1 Legacy Evaluator
+
+File: `[n1.base.package]/integration/c1/N1LegacyCodebaseHardgateEvaluator.java`
+
+- Extract the existing N1 codebase hardgate logic VERBATIM into this class
+- Do not simplify, refactor, or modernise it — copy it exactly
+- This is the safety net; it must be byte-for-byte equivalent to what N1 does today
+
+### 2.4 Implement C1 Evaluator
+
+File: `[n1.base.package]/integration/c1/C1CodebaseHardgateEvaluator.java`
+
+- Call C1’s entry-point method identified in Phase 0.2
+- Map N1’s CodebaseHardgateContext → C1’s input type IN THIS CLASS ONLY
+- Map C1’s return type → N1’s HardgateResult IN THIS CLASS ONLY
+- Wrap the entire C1 call in a try-catch:
+  
+  ```java
+  try {
+      // call C1 logic
+  } catch (Exception e) {
+      log.error("[C1-HARDGATE] C1 evaluation failed, falling back to N1 legacy. Error: {}", e.getMessage(), e);
+      return legacyEvaluator.evaluate(context); // always inject N1LegacyCodebaseHardgateEvaluator
+  }
+  ```
+- C1 exceptions must NEVER propagate to N1’s call stack
+
+### 2.5 Wire the Router at the N1 Call Site
+
+At every CODEBASE hardgate execution point identified in Phase 0.1, replace the
+existing inline logic with:
+
+```java
+CodebaseHardgateEvaluator evaluator = c1HardgateEnabled
+    ? c1Evaluator      // DEFAULT: C1 agentic logic
+    : legacyEvaluator; // KILL-SWITCH: N1 legacy fallback
+
+return evaluator.evaluate(context);
+```
+
+Rules:
+
+- This two-liner is the ONLY modification to any existing N1 class
+- Both evaluator beans must be injected — do not instantiate inline
+- Use N1’s existing DI mechanism (Spring @Autowired, Guice @Inject, or whatever N1 uses)
+
+-----
+
+## PHASE 3 — SAFETY WALL (VERIFY AFTER WRITING CODE)
+
+After completing Phase 2, run these checks and print PASS or FAIL for each:
+
+|Check                                                       |Result|
+|------------------------------------------------------------|------|
+|Zero modifications to any N1 DB layer class                 |      |
+|Zero modifications to any N1 Kafka/messaging class          |      |
+|Zero modifications to any N1 platform hardgate class        |      |
+|Zero modifications to any existing N1 public API signature  |      |
+|No C1 DB/Kafka/broker dependency imported into N1           |      |
+|All new files are under [n1.base.package].integration.c1    |      |
+|C1 exceptions are caught and never propagate                |      |
+|Flag default is TRUE (C1 is active with zero config changes)|      |
+
+If any row is FAIL, fix it before proceeding to Phase 4. Do not ask — fix and recheck.
+
+-----
+
+## PHASE 4 — TESTS (ALL MUST BE WRITTEN AND PASSING)
+
+Write and run all tests. Do not move on until all pass.
+
+### 4.1 Unit Tests
+
+File: `[n1.test.package]/integration/c1/CodebaseHardgateRouterTest.java`
+
+Test 1 — C1 is the default path (flag=true, no config override):
+
+- Assert: C1Evaluator.evaluate() is called
+- Assert: N1LegacyEvaluator.evaluate() is NOT called
+
+Test 2 — Kill-switch works (flag=false):
+
+- Assert: N1LegacyEvaluator.evaluate() is called
+- Assert: C1Evaluator.evaluate() is NOT called
+
+Test 3 — C1 exception triggers automatic fallback:
+
+- C1Evaluator throws RuntimeException
+- Assert: N1LegacyEvaluator.evaluate() is called as fallback
+- Assert: No exception propagates to the caller
+- Assert: Error is logged with the exception message
+
+Test 4 — Parity test (both paths, same input → same result shape):
+
+- Run both evaluators against an identical known codebase input
+- Assert: HardgateResult structure is identical (field-by-field)
+- This test is the regression canary — if it fails post-deploy, roll back
+
+### 4.2 Integration Smoke Test
+
+File: `[n1.test.package]/integration/c1/C1HardgateIntegrationSmokeTest.java`
+
+- Boot N1 application context with flag=true
+- Trigger one codebase hardgate scan end-to-end
+- Assert: Response is non-null and structurally valid
+- Assert: No exceptions thrown
+
+-----
+
+## PHASE 5 — FINAL DIFF REPORT (PRINT BEFORE DECLARING DONE)
+
+Print this exact report:
+
+```
+=== N1 ↔ C1 INTEGRATION — FINAL DIFF REPORT ===
+
+FILES MODIFIED (existing N1 files touched):
+  1. [filepath] — [one-line reason]
+  (must be ≤ 3 files; if more, explain why)
+
+FILES CREATED (all new):
+  1. [filepath]
+  2. [filepath]
+  ...
+
+SAFETY WALL: ALL CHECKS PASSED ✅ / FAILURES: [list]
+
+TESTS: X/X passing
+
+FLAG DEFAULT: TRUE — C1 active out of the box ✅
+
+ROLLBACK PROCEDURE:
+  Set C1_CODEBASE_HARDGATE_ENABLED=false in [config location] and redeploy.
+  No code change, no restart coordination needed. N1 legacy logic resumes instantly.
+
+NEEDS_ESCALATION ITEMS (if any):
+  [list any hardgates marked NEEDS_ESCALATION in Phase 0.3 with reason]
+```
+
+-----
+
+## DONE CRITERIA — YOU ARE NOT DONE UNTIL ALL OF THESE ARE TRUE
+
+- [ ] Every CODEBASE hardgate in N1 now routes through C1 logic by default
+- [ ] C1 is active with zero config changes (flag default = TRUE)
+- [ ] Kill-switch flag wired and tested — one config change reverts to N1 legacy
+- [ ] C1 exceptions auto-fallback to N1 legacy — nothing propagates
+- [ ] Existing N1 DB, Kafka, platform, and messaging classes are completely untouched
+- [ ] All 5 tests written and passing
+- [ ] Final diff report printed
+- [ ] NEEDS_ESCALATION stubs in place for any unresolvable gaps
+
+## ABSOLUTE PROHIBITION
+
+Do not stop mid-implementation to ask a question.
+Do not produce a plan and wait for approval.
+Do not say “I will now…” — just do it.
+If you are unsure, make the safest conservative choice, comment it, and continue.
+The implementation is done when the DONE CRITERIA checklist above is fully checked off.
