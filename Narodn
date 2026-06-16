@@ -1,0 +1,525 @@
+# `narrowdown` — FINAL Sectioned Build Prompt (provider-aware, fail-safe, no budget cap)
+
+> **Supersedes all earlier drafts.** Single source of truth.
+> **How to use:** each `## SECTION N` is ONE Copilot task. Paste in order, one at a time.
+> Do not advance until the previous section’s `RUN` passes. Package `narrowdown`, import
+> `narrowdown`.
+
+-----
+
+## READ FIRST — Design philosophy (two load-bearing decisions)
+
+**1. No budget ceiling. Compression only.** `narrowdown` saves tokens TRANSPARENTLY under
+whatever config a team already runs. It NEVER imposes a max-token cap, NEVER truncates or drops
+conversation turns, and NEVER changes the team’s behavior. It only makes each request smaller
+by removing redundancy and exploiting provider caching. Teams send the same requests they send
+today; `narrowdown` quietly shrinks the payload underneath. There is no `max_input_tokens`,
+no history-dropping, no overflow handling. Saving ≠ capping — we only ever do the former.
+
+**2. Fail-safe, defense-in-depth robustness.** `narrowdown` must NEVER break or degrade a
+production call. Robustness is the top priority, above savings:
+
+- Every stage is individually wrapped: if a stage raises, its work is discarded and the
+  pipeline continues with that stage’s INPUT (as if the stage were a no-op). The error is
+  logged with full context.
+- The whole pipeline is wrapped: if anything unexpected escapes, `optimize()` returns the
+  ORIGINAL request untouched, with `report.degraded=True` and the error logged.
+- Worst case for any call is a silent no-op, never an exception, never a worse/broken request.
+- The QualityGate revert guarantee (no lossy block ever ships) is in addition to the above.
+
+What actually saves tokens (all deterministic, no HuggingFace):
+provider prompt/context caching (Anthropic markers / OpenAI automatic / Gemini cachedContent)
+→ exact-match + tool-output caching → structural compression (dedup, JSON crush, code skeleton,
+log compaction) → tool-schema pruning → opt-in rule-based prose compression. ML compression
+(LLMLingua, embeddings, headroom’s ML tier) is EXCLUDED: it needs HuggingFace weights (blocked)
+and is lossy.
+
+-----
+
+## SECTION 0 — Orientation & Non-Negotiable Rules (paste first)
+
+You are building `narrowdown`, a generic, production-grade Python library that reduces LLM
+token cost for ANY application calling an OpenAI-compatible OR Gemini-style API. Supports
+synchronous chat-completions and asynchronous enqueue/poll.
+
+**Allowed third-party deps — EXACTLY these:** `pydantic` (v2), `pydantic-settings`, `tiktoken`,
+`spacy`. Everything else stdlib.
+
+**Hard rules (any violation = build failure):**
+
+- No ML model downloads at runtime. No HuggingFace / transformers / sentence-transformers /
+  perplexity / embedding models. No network calls from the library itself.
+- MUST import and run with the spaCy model absent (regex fallback for NER).
+- No placeholders / TODO / `pass`-only stubs / `NotImplementedError`. Fully implement
+  everything; if you cannot, STOP and say so.
+- Never mutate caller input; deep-copy.
+- **Fail-safe everywhere** (see philosophy): per-stage try/except returning the stage input on
+  error; whole-pipeline try/except returning the original request on error; never raise out of
+  `optimize()` for processing errors (only raise `NarrowdownError` for clearly invalid input
+  shapes, and even then the adapters never crash a call).
+- **No budget/ceiling logic at all.** No max-token cap, no turn dropping.
+- Compression is revert-not-drop (QualityGate per block).
+- `NARROWDOWN_BYPASS=1` is an identity function.
+- `shadow=True` returns ORIGINAL messages but a full report.
+- Async/queue mode disables features needing a synchronous round trip.
+- Thread-safe; per-instance state; no module-level mutable singletons.
+- Python 3.10+, Windows + Linux.
+
+Acknowledge. Write no code. Wait for SECTION 1.
+
+-----
+
+## SECTION 1 — Scaffold, Packaging, Config
+
+Create:
+
+```
+narrowdown/
+  __init__.py        # exports Optimizer, OptimizerConfig, NarrowdownError, __version__ (lazy)
+  _version.py        # __version__ = "1.0.0"
+  config.py
+  errors.py          # class NarrowdownError(Exception)
+tests/__init__.py
+tests/test_config.py
+pyproject.toml
+README.md
+```
+
+**`pyproject.toml`** — backend `hatchling`; deps EXACTLY `pydantic>=2,<3`,
+`pydantic-settings>=2,<3`, `tiktoken>=0.5`, `spacy>=3.7`; dev extra `pytest>=8`,
+`pytest-cov>=5`, `hypothesis>=6`; script `narrowdown = "narrowdown.cli:main"`; pytest
+testpaths `tests`; coverage fail_under 90.
+
+**`config.py`** — `OptimizerConfig(BaseSettings)`, env prefix `NARROWDOWN_`, `.env` supported.
+Fields (exact defaults — note: NO max_input_tokens, NO budget fields):
+
+|field                     |type     |default   |meaning                                             |
+|--------------------------|---------|----------|----------------------------------------------------|
+|`model_name`              |str      |`"gpt-4o"`|tiktoken counting model                             |
+|`shadow`                  |bool     |`False`   |measure only                                        |
+|`aggressive`              |bool     |`False`   |stronger compression, same gate                     |
+|`cache_provider`          |str      |`"none"`  |`“none”                                             |
+|`enable_cache_alignment`  |bool     |`True`    |reorder + cache planning                            |
+|`cache_breakpoints`       |int      |`4`       |max Anthropic markers (1–4)                         |
+|`gemini_cache_ttl_seconds`|int      |`3600`    |TTL for created cachedContent                       |
+|`gemini_cache_min_tokens` |int      |`4096`    |Gemini cache floor; below → no cache                |
+|`enable_structural`       |bool     |`True`    |dedup + json/code/log                               |
+|`enable_prose`            |bool     |`False`   |caveman (opt-in)                                    |
+|`enable_exact_cache`      |bool     |`False`   |exact response cache                                |
+|`enable_tool_cache`       |bool     |`False`   |tool-output cache                                   |
+|`history_recent_turns`    |int      |`3`       |recent turns compressed only lightly (never dropped)|
+|`code_min_lines`          |int      |`20`      |skip short code                                     |
+|`dedup_cache_size`        |int      |`10000`   |LRU bound                                           |
+|`min_tools_kept`          |int      |`3`       |tool-prune floor                                    |
+|`always_keep_tools`       |list[str]|`[]`      |never prune these                                   |
+|`fail_safe`               |bool     |`True`    |on error, no-op that stage / whole pipeline         |
+|`log_format`              |str      |`"json"`  |`“json”                                             |
+|`log_level`               |str      |`"INFO"`  |std level                                           |
+
+Validators: `cache_breakpoints` clamp 1–4; `cache_provider` in allowed set; `log_format` in
+{json,console}; positive ints where noted.
+
+**`errors.py`** — `class NarrowdownError(Exception)`: raised ONLY for structurally invalid
+public-API input (e.g. `messages` not a list of dicts). Processing errors never raise when
+`fail_safe=True`.
+
+**TEST:** defaults construct; env override read; `cache_breakpoints=9`→4;
+`cache_provider="bogus"`→`ValidationError`; no `max_input_tokens` attribute exists.
+**RUN:** `pip install -e ".[dev]" && pytest tests/test_config.py && python -c "import narrowdown; print(narrowdown.__version__)"`
+
+-----
+
+## SECTION 2 — Shared Types
+
+Create `narrowdown/types.py` (stdlib dataclasses/enum):
+
+- `class ContentType(str, Enum): JSON, CODE, LOG, PROSE, BINARY, SKIP`
+- `@dataclass(frozen=True) Block`: `role, message_index:int, block_index:int, content_type:ContentType, text:str, protected:bool`
+- `@dataclass RoutingDecision`: `message_index, block_index, content_type:str, char_count:int, reason:str`
+- `@dataclass StageResult`: `stage:str, tokens_before:int, tokens_after:int, wall_ms:float, items_processed:int, items_modified:int, errored:bool=False, notes:list[str]=field(default_factory=list)`
+- `@dataclass CacheBreakpoint`: `message_index:int, kind:str`
+- `@dataclass CacheDirective`: `provider:str, mode:str` (`"markers"|"cached_content"|"none"`),
+  `cached_content_name:str|None, prefix_hash:str|None, breakpoints:list[CacheBreakpoint], create_request:dict|None`
+- `@dataclass OptimizationReport`: `tokens_before, tokens_after:int, savings_pct:float, stages:list[StageResult], dedup_hits:int, pruned_tools:list[str], quality_reverts:int, routing:list[RoutingDecision], cache_directive:CacheDirective|None, cache_hit:bool, degraded:bool, total_wall_ms:float, shadow:bool, bypass:bool`; `to_dict()`
+- `@dataclass OptimizationResult`: `messages:list[dict], tools:list[dict]|None, report:OptimizationReport, cached_response:dict|None`
+
+**TEST:** construct each; `to_dict()` JSON-serializes; `degraded` defaults False.
+**RUN:** `pytest tests/test_types.py`
+
+-----
+
+## SECTION 3 — Token Counting (fail-safe)
+
+Create `narrowdown/tokens.py` → `class TokenCounter`:
+
+- `__init__(model_name)`: `tiktoken.encoding_for_model`; unknown→`cl100k_base`; tiktoken
+  missing→`chars//4`, backend `"estimate"`.
+- `count(text)->int` and `count_messages(messages)->int` (+4/msg overhead; list-content sums
+  parts). Both wrapped so any internal error returns the `chars//4` estimate rather than
+  raising.
+
+**TEST:** `count("")` small; positive on ASCII; `count_messages`≥sum; backend `"tiktoken"`
+in dev; a monkeypatched encoder raising → falls back to estimate, no exception.
+**RUN:** `pytest tests/test_tokens.py`
+
+-----
+
+## SECTION 4 — Logging
+
+Create `narrowdown/logging_setup.py` (stdlib logging): `get_logger(name)`,
+`configure(level, fmt)`, `log_event(logger, event, **fields)`. JSON formatter emits
+`{ts, level, logger, event, **fields}`; console mode readable. Idempotent. Never crashes on
+missing fields. Add a `safe_stage` context-manager/decorator helper here:
+`@safe_stage("name", fail_safe)` that times a stage, catches any exception, logs
+`stage_error` with the traceback string, and signals the caller to keep the stage’s input
+unchanged (return a sentinel or re-raise only when `fail_safe=False`).
+
+**TEST:** JSON record parses with event+fields; configure idempotent; `safe_stage` swallows an
+exception when `fail_safe=True` and re-raises when False.
+**RUN:** `pytest tests/test_logging.py`
+
+-----
+
+## SECTION 5 — Content Router (fail-safe)
+
+Create `narrowdown/pipeline/router.py` → `class ContentRouter`,
+`route(messages)->(list[list[Block]], list[RoutingDecision])`. Priority:
+
+1. SKIP+protected: every `role=="system"`; AND the LAST `role=="user"` message.
+1. Split content on fenced code blocks (regex ````(\w+)?\n.*?\n````, DOTALL), order
+   preserved for exact reassembly.
+1. Classify each non-skip segment: BINARY (utf-8 round-trip fails or base64 blob heuristic
+   len>500 & >85% base64 chars); JSON (`json.loads`→dict/list, or fence tag json); CODE (fence
+   tag in {py,python,java,js,javascript,ts,typescript,go,rust,cpp,c,cs,rb,php}; or `ast.parse`
+   ok; or Java markers `(public|private|protected)\s+(class|interface|void|static)` /
+   `@(Override|Service|Repository|Component|Autowired)`); LOG (≥60% non-empty lines match
+   `^\s*(\d{4}-\d{2}-\d{2}|\[?(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|TRACE))` or `at [\w.$]+\(` or
+   `Traceback (most recent call last)`); else PROSE.
+
+If a single segment classification raises, treat that segment as PROSE (safe default) and log.
+
+**TEST:** system→SKIP/protected; last user→SKIP/protected; JSON→JSON; ````java`→CODE;
+bare Python→CODE; timestamped→LOG; paragraph→PROSE; mixed→ordered multi-block; a segment that
+triggers a parser error → falls back to PROSE, no exception.
+**RUN:** `pytest tests/test_router.py`
+
+-----
+
+## SECTION 6 — Deduplicator
+
+Create `narrowdown/pipeline/dedup.py` → `class Deduplicator(cache_size)`: bounded
+`OrderedDict` LRU + `threading.Lock`, per-instance. Normalize (strip; JSON→
+`json.dumps(sort_keys=True, separators=(",",":"))`; else stripped). `key=sha256`. Repeat →
+`[NARROWDOWN_DEDUP sha=<key8> same_as=msg#<first_mi>]`, count hit. Never dedup protected.
+
+**TEST:** identical JSON→2nd replaced, hits==1; reordered keys→deduped; different→not;
+protected→never; LRU eviction at size 2.
+**RUN:** `pytest tests/test_dedup.py`
+
+-----
+
+## SECTION 7 — JSON Crusher
+
+Create `narrowdown/compressors/json_crusher.py` → `crush(obj, aggressive)` and
+`crush_text(json_text, aggressive)` (parse→crush→`json.dumps(ensure_ascii=False)`; parse fail
+→ input unchanged). Rules: homogeneous-dict list N>6 → first3+last2 + one
+`{"__narrowdown_omitted__":N-5,"keys":sorted}`; N≤6 keep all. Non-homogeneous N>6 → first3+last2,
+middle dicts→`{"__keys__":[...]}`, non-dicts→type name. Dict → recurse; strings >500 (>300
+aggressive)→truncate + `...[+N chars]`; keep ALL keys. Scalars kept verbatim ALWAYS.
+
+**TEST:** 100 homogeneous→5+marker(omitted==95); 5→unchanged; 600-char→truncated; all scalars
+survive; invalid JSON unchanged.
+**RUN:** `pytest tests/test_json_crusher.py`
+
+-----
+
+## SECTION 8 — Code Skeletonizer
+
+Create `narrowdown/compressors/code_skeleton.py`:
+`skeletonize(code, lang, query_terms, min_lines, aggressive)->str` and
+`extract_query_terms(user_text)->set[str]`. `<min_lines`→unchanged. Query-term in code →
+unchanged. Python (lang py/python or `ast.parse` ok): keep signatures + docstrings + imports,
+elide bodies via ORIGINAL-LINE SLICES (`node.lineno`/`end_lineno`, never unparse) →
+`# ...narrowdown: body elided (<k> lines)`. Java/JS/TS: regex keep imports/package/class/iface/
+annotations/method-signatures, elide balanced-brace bodies (respect string/char literals,
+`//`,`/* */`) → `{ /* narrowdown: body elided (<k> lines) */ }`. Other langs unchanged. Any
+parse error → return code unchanged.
+
+**TEST:** 40-line Python skeletonized; query-term func unchanged; 10-line unchanged; Java
+bodies elided; unknown lang unchanged; malformed code → unchanged, no exception.
+**RUN:** `pytest tests/test_code_skeleton.py`
+
+-----
+
+## SECTION 9 — Caveman Prose Compressor
+
+Create `narrowdown/compressors/caveman.py` → `compress(text, aggressive)->str`. Mark PROTECTED
+spans first (percentages, numbers, versions, URLs, paths, qualified names, UUIDs(i), ALLCAPS,
+inline code, short quotes — same regexes as the QualityGate). Drop DROP_WORDS {a,an,the,is,are,
+was,were,be,been,being,basically,essentially,generally,typically,usually,simply,just,quite,
+rather,somewhat,very,really,actually,indeed,certainly,obviously,clearly,furthermore,moreover,
+additionally,please,kindly}; aggressive also phrase-replaces {“in order to”→”to”,“in terms
+of”→””,“with respect to”→””,“it is worth noting that”→””,“it should be noted that”→””,“please
+note that”→””,“note that”→””} before tokenizing. NEVER drop negations {no,not,never,without,
+none,zero,false,null}, quantifiers {“at least”,“no more than”,“at most”,exactly,minimum,
+maximum,“up to”}, conditionals {if,unless,when,before,after,until,while}, severity {error,
+warning,critical,fatal,exception}. Reassemble protected spans in place; collapse whitespace.
+Guardrail: <10% shorter → return ORIGINAL.
+
+**TEST:** filler removed but meaning kept; 42.5% kept; URL intact; “not” kept; “at least”+“3”
+kept; “2.3.1” kept; terse input unchanged.
+**RUN:** `pytest tests/test_caveman.py`
+
+-----
+
+## SECTION 10 — Quality Gate
+
+Create `narrowdown/pipeline/quality_gate.py` → `class QualityGate`. Init tries
+`spacy.load("en_core_web_sm")`; failure→`nlp=None` + one-time log; never raise.
+`extract_entities(text)`: regex set always; + spaCy ents {ORG,PRODUCT,PERSON,GPE,CARDINAL,
+MONEY,QUANTITY,DATE} if available. `verify(original, compressed)`: entity survives if substring
+of compressed OR inside a `[NARROWDOWN_DEDUP …]` / `narrowdown: body elided` /
+`__narrowdown_omitted__` marker. `guard(original, compressed)`: pass→`(compressed, False)`;
+fail→`(original, True)`. Any internal error in guard → return `(original, True)` (safe revert).
+
+**TEST:** all kept→pass; missing number→revert; entity in marker→survives; `nlp=None`→regex
+catches numbers/URLs; forced exception in extract → safe revert.
+**RUN:** `pytest tests/test_quality_gate.py`
+
+-----
+
+## SECTION 11 — Cache Planner (provider-aware; biggest lever)
+
+Create `narrowdown/pipeline/cache_plan.py` → `class CachePlanner(provider, breakpoints, gemini_ttl, gemini_min_tokens, counter)`, `plan(messages, tools)->(new_messages, new_tools, CacheDirective)`. Plans caching; changes no content meaning.
+
+Common prep: ensure system message(s) first (do NOT reorder live turns); sort `tools` by name +
+`json.dumps(sort_keys=True)`; de-volatilize PREFIX ONLY (system + tools) — replace ISO
+timestamps, `request_id=…`, `trace_id=…`, bare UUIDs with `<ts>`/`<id>`; never touch
+user/assistant turns.
+
+- `"anthropic"`→`mode="markers"`; ≤`breakpoints` CacheBreakpoints at boundaries (after last
+  system, after tools, after the static/older-history boundary defined by
+  `history_recent_turns`).
+- `"openai"`→`mode="markers"`, breakpoints advisory (automatic caching); stable prefix only.
+- `"gemini"`→`mode="cached_content"`; `prefix_hash=sha256` of the de-volatilized stable head
+  (system + sorted tools + leading static-context messages); count its tokens. If
+  `<gemini_min_tokens`→`mode="none"`. Else build `create_request` in Gemini `cachedContents`
+  shape `{"model":…, "contents":[…head…], "systemInstruction":{…}, "ttl":f"{ttl}s"}`,
+  `cached_content_name=None`, set `prefix_hash`.
+- `"none"`→`mode="none"`.
+
+Whole method wrapped fail-safe: on any error return `(messages, tools, CacheDirective(provider, "none", None, None, [], None))` and log — caching is an optimization,
+never a failure point.
+
+**TEST:** anthropic markers ≤4 at boundaries; system first; system timestamp→`<ts>`, user-msg
+timestamp untouched; tools sorted+stable across shuffled input; gemini head≥floor→create_request
+populated + prefix_hash set; gemini head<floor→none; meaning preserved; forced error → safe
+`mode="none"`.
+**RUN:** `pytest tests/test_cache_plan.py`
+
+-----
+
+## SECTION 12 — Tool Schema Pruner
+
+Create `narrowdown/pipeline/tool_pruner.py` → `class ToolPruner`,
+`prune(tools, messages, always_keep, min_kept)->(kept, pruned_names)`. Keywords from last user
+message (identifiers + words ≥4 chars, lowercased, minus stopwords). Score = hits across name +
+description + param names/descriptions. Keep score>0 + always_keep + any tool named in last
+user message. If kept<min_kept, add top-scoring remainder. Fail-safe: error → keep ALL tools.
+
+**TEST:** 2 matching kept (≥min_kept); always_keep kept; named tool kept at score 0; never
+fewer than `min(min_kept,len(tools))`; forced error → all tools kept.
+**RUN:** `pytest tests/test_tool_pruner.py`
+
+-----
+
+## SECTION 13 — History Compressor (NO dropping)
+
+Create `narrowdown/pipeline/history.py` → `class HistoryManager`,
+`compress(messages, recent_turns, caveman_fn, json_crush_fn, aggressive)->(new_messages, notes)`.
+**This never drops or truncates anything.** It only compresses older turns more than recent
+ones:
+
+- Protected always untouched: all `role=="system"`; the last user message.
+- Last `recent_turns` user/assistant pairs: light caveman on assistant turns only.
+- Older turns: aggressive caveman + JSON crush on tool/assistant content.
+- Message COUNT is unchanged; no markers for omission; no budget logic exists.
+
+Fail-safe: error on any turn → leave that turn unchanged.
+
+**TEST:** message count identical before/after; system + last user untouched; older turns
+shorter than recent; no turn dropped under any input; forced error on one turn → that turn
+unchanged, others still compressed.
+**RUN:** `pytest tests/test_history.py`
+
+-----
+
+## SECTION 14 — Caching Layer (exact, tool-output, Gemini registry)
+
+Create `narrowdown/cache/backend.py`: `class CacheBackend(Protocol)`; `class MemoryCache`
+(dict + OrderedDict LRU + optional expiry via `time.monotonic()`, thread-safe, bounded).
+Create `narrowdown/cache/exact.py` → `class ExactCache`: key = sha256 of normalized full
+request (messages+tools+model). `lookup`, `store`. Identical-only — zero risk.
+Create `narrowdown/cache/tool_output.py` → `class ToolOutputCache`: key =
+`sha256(tool_name + json.dumps(args, sort_keys=True))`. Document: deterministic tools only.
+Create `narrowdown/cache/registry.py` → `class CacheRegistry` (Gemini): maps
+`prefix_hash→{name, expires_at}`; `get(prefix_hash)->name|None` (None if absent/expired),
+`put(prefix_hash, name, ttl)`. Lets the Gemini adapter SKIP `createCachedContent` when a live
+cache exists for that prefix — create once, reuse until TTL. Thread-safe; pluggable backend.
+**No semantic cache** (needs embeddings/HuggingFace; documented footgun; excluded).
+
+All cache ops fail-safe: any error → treat as a miss (proceed to call), never raise.
+
+**TEST:** MemoryCache get/set/expiry/LRU; ExactCache identical hit / one-field miss;
+ToolOutputCache same-args hit / diff miss; CacheRegistry None after expiry, name while live;
+forced backend error → treated as miss.
+**RUN:** `pytest tests/test_cache.py`
+
+-----
+
+## SECTION 15 — Pipeline Runner + Optimizer Facade (defense-in-depth)
+
+Create `narrowdown/pipeline/runner.py` → `PipelineRunner`. Order, each wrapped in `safe_stage`
+(error → use that stage’s input, mark `StageResult.errored=True`, continue): 1) ContentRouter;
+2) Deduplicator (if structural); 3) Structural per block — JSON→`crush_text`, CODE→`skeletonize`,
+LOG→log-compaction, each + `QualityGate.guard`; 4) Prose→`caveman.compress`+guard (if prose);
+5) reassemble blocks in exact order; 6) ToolPruner (if tools); 7) HistoryManager (compress, no
+drop); 8) CachePlanner (if cache_alignment) LAST → CacheDirective.
+
+Create `narrowdown/optimizer.py` → `class Optimizer`:
+
+```
+def __init__(self, config=None, cache_backend=None, cache_registry=None): ...
+def optimize(self, messages, tools=None, mode="sync") -> OptimizationResult
+def store_response(self, messages, tools, response) -> None
+def register_gemini_cache(self, prefix_hash, name, ttl) -> None
+def stats(self) -> dict
+def reset_stats(self) -> None
+```
+
+Facade:
+
+- Validate input shape; raise `NarrowdownError` only for structurally invalid input
+  (messages not list-of-dicts). Everything else is handled.
+- **Whole-pipeline fail-safe:** wrap the entire optimize body; on ANY unexpected exception when
+  `config.fail_safe` is True, return `OptimizationResult(original_messages, original_tools, report(degraded=True, tokens_before==tokens_after))` and log. Never raise a processing error.
+- `NARROWDOWN_BYPASS=1`→identity, `report.bypass=True`.
+- `enable_exact_cache` hit→return `cached_response`, `cache_hit=True`, skip pipeline (sync; in
+  async_queue exact cache may still short-circuit, no round-trip features run).
+- Run pipeline; count tokens; fill report incl. cache_directive.
+- Shadow→full report, `result.messages/tools`=originals.
+- Gemini: if directive `mode=="cached_content"`, fill `cached_content_name` from
+  `CacheRegistry.get(prefix_hash)`; keep `create_request` only on registry miss.
+- `store_response` populates exact+tool caches; `register_gemini_cache` updates registry.
+- `stats()` per-instance, lock-protected: calls, tokens_before_total, tokens_after_total,
+  avg_savings_pct, cache_hits, quality_reverts_total, degraded_calls.
+
+**TEST:** bypass identity; shadow returns originals + savings>0 on compressible input;
+incompressible→originals, 0 reverts; 10-thread concurrency valid + consistent stats; exact-hit
+short-circuits; **fault injection: monkeypatch a stage to raise → optimize returns a valid
+result (degraded or stage-skipped), never raises**; invalid input (messages=42) →
+`NarrowdownError`; gemini directive create_request on miss, name after register.
+**RUN:** `pytest tests/test_optimizer.py`
+
+-----
+
+## SECTION 16 — Adapters (sync + async_queue) + provider payloads
+
+Create `narrowdown/adapters/sync.py` → `build_sync_payload(result, model, extra=None)->dict`:
+base `{"model", "messages", "tools", **extra}`. anthropic markers→attach
+`cache_control={"type":"ephemeral"}` at breakpoint blocks (no-op if ignored). openai→nothing
+extra. gemini cached_content: if `cached_content_name` present→add `"cached_content":name` and
+OMIT cached prefix from `contents`; if only `create_request`→expose
+`{"_narrowdown_create_cache":create_request}` for the two-step create→reference flow. Append
+pruned-tools note to system message if pruning occurred. Wrap fail-safe: on error building the
+payload, return the plain base payload with original messages/tools.
+
+Create `narrowdown/adapters/async_queue.py` → `build_queue_payload(result, model, extra)`: same
+shape; no round-trip features; markers/cached_content references safe to include.
+
+**TEST:** sync payload shape; anthropic breakpoints carry cache_control; gemini name→
+cached_content + prefix omitted; gemini create_request→`_narrowdown_create_cache`; pruned note
+appended; queue payload free of round-trip features; all JSON-serializable; payload-build error
+→ safe base payload.
+**RUN:** `pytest tests/test_adapters.py`
+
+-----
+
+## SECTION 17 — CLI
+
+Create `narrowdown/cli.py` → `def main(argv=None)->int` (argparse):
+
+- `check` — live capabilities: tiktoken backend, spaCy sm present?, cache_provider, flags on.
+- `shadow <path.json>` — load `{"messages":[...],"tools":[...]}`, shadow optimize, print report
+  (tokens before/after, savings %, per-stage incl. any `errored`, reverts, cache directive,
+  degraded flag).
+- `bench` — built-in fixture (SECTION 18), per-stage table + totals.
+- `version`.
+
+**TEST:** `check` exits 0; `shadow` prints `tokens_after<tokens_before`; `version`→1.0.0.
+**RUN:** `pytest tests/test_cli.py && narrowdown check`
+
+-----
+
+## SECTION 18 — Fixtures, Regression, Benchmark
+
+Create `tests/fixtures/build_fixture.py` (seeded, deterministic) → `transcript_mixed.json`:
+~30 turns; ≥200-item homogeneous JSON tool result; 300-line Java class; 200-line Python module;
+400 log lines; prose paragraphs; ≥2 duplicated tool results. Commit generator + output.
+
+Create `tests/test_regression.py`: load fixture; optimize (structural+prose+cache_alignment,
+`cache_provider="anthropic"`); assert `tokens_after/tokens_before<=0.55`; `quality_reverts==0`;
+`degraded is False`; **message count identical** (history never drops); every scalar/number/
+URL/UUID from original present in output or a marker; snapshot `report.to_dict()` (minus
+timings) to golden JSON.
+
+Create `bench/run.py`: per-stage table (tokens in/out/Δ%, ms, errored) + totals + dedup hits +
+pruned tools + reverts.
+
+**RUN:** `python tests/fixtures/build_fixture.py && pytest tests/test_regression.py && python bench/run.py`
+
+-----
+
+## SECTION 19 — Property Tests, README, Final Acceptance
+
+Create `tests/test_properties.py` (hypothesis): `tokens_after<=tokens_before` for any input;
+numbers/URLs/UUIDs survive caveman; `NARROWDOWN_BYPASS=1` identity; post-pipeline every block
+keeps all entities or equals original; **message count never decreases** (no dropping);
+**fault injection property: a stage raising on arbitrary input never makes optimize raise**.
+
+Create `README.md`: what/why; Mermaid pipeline; quickstart (sync + async_queue);
+full config table; provider-caching section (Anthropic markers / OpenAI automatic / Gemini
+cachedContent + two-step create→reference + CacheRegistry reuse); “Robustness” section
+(per-stage + whole-pipeline fail-safe, worst case = no-op, QualityGate revert); “No budget /
+transparent” section (no cap, no dropping, drop-in under existing config); “Why no semantic
+cache / no ML” section; dependency table; honest “Expected savings” by dynamic vs static-repeat
+workload.
+
+**FINAL ACCEPTANCE — all must pass:**
+
+- [ ] `pip install -e ".[dev]"` clean.
+- [ ] `import narrowdown` works with spaCy model NOT installed.
+- [ ] Full `pytest` green; coverage ≥90%.
+- [ ] Hypothesis properties pass at 100 examples each (incl. fault-injection + no-drop).
+- [ ] Regression: ≥45% reduction, `quality_reverts==0`, `degraded False`, message count
+  identical, entity survival 100%.
+- [ ] Fault injection: any single stage forced to raise → optimize returns a valid result,
+  never raises; `report.stages[i].errored` reflects it (or `degraded=True` for whole-
+  pipeline faults).
+- [ ] `NARROWDOWN_BYPASS=1` identity; `shadow=True` originals + populated report.
+- [ ] No `max_input_tokens` / budget / turn-dropping logic anywhere.
+- [ ] `cache_provider="gemini"`: create_request on registry miss; cached_content reference
+  after register; `mode="none"` below floor.
+- [ ] `mode="async_queue"` excludes round-trip features; payloads JSON-serializable.
+- [ ] Deps exactly pydantic, pydantic-settings, tiktoken, spacy. No HuggingFace / transformers /
+  embeddings / Rust-source.
+- [ ] No stubs / TODO / NotImplementedError / placeholder returns in `narrowdown/`.
+
+-----
+
+### Build order (one section = one Copilot turn)
+
+0 rules → 1 scaffold → 2 types → 3 tokens → 4 logging → 5 router → 6 dedup → 7 json →
+8 code → 9 caveman → 10 quality gate → 11 cache planner → 12 tool pruner → 13 history(no-drop)
+→ 14 caching → 15 runner+facade(fail-safe) → 16 adapters → 17 cli → 18 fixtures/regression/
+bench → 19 properties/readme/acceptance. Confirm each RUN green before the next.
