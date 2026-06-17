@@ -1,0 +1,49 @@
+Upgrade my existing .github folder for CodeMindIDE. Do NOT rebuild from 
+scratch — only update or add alongside existing files. Keep all current 
+files. Output file by file. Begin with playbooks.
+
+1. PLAYBOOKS — Rewrite every file in .github/playbooks/ to a strict 
+structure: frontmatter (name, description, trigger, inputs, outputs) and 
+body (numbered ordered steps, preconditions, explicit "done" definition). 
+Fix any vague or incomplete playbook.
+
+2. ROBUST AGENTS — For each agent in .github/agents/, add resilience:
+   - Retry with exponential backoff on timeout/network error (3 retries, 
+     increasing delay).
+   - Fallback model/role if primary is unavailable.
+   - Explicit failure reporting if all retries fail (never hang or return 
+     empty silently).
+   - Per-step timeout guard so one stuck call can't block the run.
+   Document these in each agent definition.
+
+3. MULTI-AGENT ORCHESTRATION (ask once, then show progress):
+   - At the START of a task, ask the user ONE question: "Run in parallel 
+     with multiple agents, or as a single agent?" Then proceed without 
+     asking again.
+   - If parallel: give each sub-agent a non-overlapping scope. Display 
+     each sub-agent's name, current task, and status (running/done/failed) 
+     so the user always sees what's happening.
+   - On completion, MERGE all sub-agent outputs into one consolidated 
+     changeset, presented as if a single agent did it. Show a final 
+     "merged — done" confirmation listing what each agent contributed.
+   - Conflict rule: configurable, default flag-for-review.
+
+4. OMP-LIKE FEATURES — Add these as markdown specs/tools in the folder:
+   - TODO tracking: phased task lists with states (pending, in_progress, 
+     completed, abandoned); exactly one in_progress at a time.
+   - ASK tool: structured multiple-choice / multi-select questions.
+   - CODE REVIEW: a /review flow producing findings with P0–P3 priorities 
+     and an approve / request-changes / comment verdict.
+   - COMMIT: conventional-commit generation with change analysis and 
+     optional changelog entry.
+   - MODEL ROLES: default, fast, slow, plan — and which tasks use which.
+   - TTSR-STYLE RULES: rules that inject only when a regex pattern appears 
+     in output (e.g. deprecated API), one-shot per session, to save context.
+   - CONTEXT NOTES: a lightweight per-project memory file the agents read 
+     at start and update as they learn.
+
+5. CONSISTENCY — Ensure playbooks, agents, orchestration, and features 
+cross-reference correctly with consistent naming.
+
+6. SUMMARY — List every file changed/added, what was hardened, and 
+anything still unclear.
