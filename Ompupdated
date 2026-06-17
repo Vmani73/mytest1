@@ -1,0 +1,78 @@
+Upgrade my existing .github folder for CodeMindIDE to behave like oh-my-pi 
+(omp). Do NOT rebuild from scratch — only update existing files or add 
+alongside them. Keep all current files; never delete. Keep "playbooks" as the 
+name and folder — do NOT rename them to skills. Output file by file. Work in 
+this order: playbooks, agents, orchestration, omp-like features, consistency, 
+summary.
+
+== 1. PLAYBOOKS (primary unit; apply omp's skill-discovery mechanism to them) ==
+- Discover playbooks one level under .github/playbooks/ as 
+  playbooks/<name>/PLAYBOOK.md (non-recursive; ignore nested paths).
+- Each PLAYBOOK.md frontmatter: name (defaults to folder name), description 
+  (drives when the playbook triggers), trigger (when to use), inputs, outputs.
+- Body: numbered steps in execution order, preconditions, and an explicit 
+  "done" definition. Where a playbook is a real ordered sequence, preserve 
+  order; otherwise don't impose one.
+- Deduplicate by name; highest-precedence/first wins on collision.
+- Support a "hide" flag: hidden playbooks still load and stay reachable by 
+  explicit reference, but are not auto-injected.
+- Bring any existing skill-style content (sonar-governance-validation, 
+  synaptiq, token-usage-summary, ise_detect.md) into the playbook structure 
+  without renaming the playbooks concept.
+- Validate every playbook against this spec; flag and fix anything vague, 
+  incomplete, or non-conforming so each is unambiguous and self-contained.
+
+== 2. ROBUST AGENTS (no silent timeouts / network failures) ==
+For every agent in .github/agents/, add and document:
+- Retry with exponential backoff on timeout/network error (3 retries, 
+  increasing delay).
+- Fallback model/role if the primary is unavailable.
+- Explicit failure reporting if all retries fail — never hang or return empty.
+- Per-step timeout guard so one stuck call can't block the whole run.
+- A yield/structured-output reminder: if an agent stops without returning its 
+  structured result, re-prompt it once before continuing.
+
+== 3. MULTI-AGENT ORCHESTRATION (modeled on omp's verified task system) ==
+- ASK ONCE at task start: "Run in parallel with multiple agents, or single 
+  agent?" Then proceed without asking again.
+- SCOPING: give each sub-agent a NON-OVERLAPPING file/area scope so siblings 
+  never edit the same lines (avoid conflicts by isolation, not after-the-fact 
+  resolution).
+- BOUNDED PARALLELISM: run sub-agents concurrently up to a fixed limit 
+  (e.g. 4) rather than unbounded.
+- STRUCTURED YIELD: each sub-agent returns a structured result (files touched 
+  + proposed change/patch + summary), not free prose. If one finishes without 
+  yielding, inject a reminder and re-request before continuing.
+- PARENT MERGE: the parent collects all results, reviews them, and applies 
+  them as ONE consolidated changeset, presented as if a single agent did the 
+  whole job. List what each sub-agent contributed.
+- VISIBLE STATUS: show each sub-agent's name, scope, and status 
+  (running / yielded / failed) so the user always sees progress.
+- ABORT: a stop request halts scheduling new sub-agents; in-flight ones finish 
+  or clean up.
+
+== 4. OMP-LIKE FEATURES (as markdown specs/tools in the folder) ==
+- TODO tracking: phased task lists with states (pending, in_progress, 
+  completed, abandoned); exactly one in_progress at a time.
+- ASK tool: structured multiple-choice / multi-select questions.
+- CODE REVIEW: a /review flow producing findings ranked P0-P3 with a confidence 
+  score and an approve / request-changes / comment verdict; able to review a 
+  branch, a single commit, or uncommitted work.
+- COMMIT: conventional-commit generation with change analysis, split into 
+  atomic commits when changes are unrelated, optional changelog entry.
+- MODEL ROLES: default, fast (smol), slow, plan, commit — and which tasks use 
+  which role.
+- TTSR-STYLE RULES: rules that inject only when a regex pattern appears in 
+  output (e.g. deprecated API), one-shot per session, to save context.
+- CONTEXT NOTES: a lightweight per-project memory file the agents read at 
+  start and update as they learn.
+
+== 5. CONSISTENCY ==
+- Ensure playbooks, agents, orchestration, and features cross-reference 
+  correctly and use consistent naming.
+
+== 6. SUMMARY ==
+- List every file created or modified, what was hardened, and anything still 
+  unclear that needs my input.
+
+Prioritize playbooks and agents first. Follow omp conventions throughout.
