@@ -1,0 +1,751 @@
+# 🧭 Component Taxonomy Report — CodeMind Playbook
+
+> **Purpose:** Automatically analyze any repository and produce a rich, structured Component Taxonomy Report — covering architectural classification, technology profile, responsibility mapping, health signals, and actionable recommendations. No hardcoding; every inference is derived dynamically from the repository contents.
+
+---
+
+## 📋 Playbook Metadata
+
+```yaml
+playbook_id:       component-taxonomy-report
+playbook_version:  1.0.0
+target_tool:       CodeMind IDE
+report_type:       Component Taxonomy & Architectural Classification
+applicable_to:     Any software repository (microservice, library, monolith, batch job, UI app, data pipeline, etc.)
+generated_by:      CodeMind AI Agent
+```
+
+---
+
+## 🎯 What This Report Produces
+
+A **Component Taxonomy Report** classifies a repository along key architectural dimensions and produces:
+
+| Section | What It Answers |
+|---|---|
+| **Identity** | What is this component? Who owns it? |
+| **Taxonomy** | Category → Sub-Category → Type classification |
+| **Tech Profile** | Languages, frameworks, runtime, build tooling |
+| **Responsibility Map** | What does it do? What does it NOT do? |
+| **Integration Topology** | How does it connect to the outside world? |
+| **Deployment Fingerprint** | How and where does it run? |
+| **Code Quality Signals** | What does the code itself reveal about maturity? |
+| **Risk & Gap Analysis** | What's missing or concerning? |
+| **Recommendations** | Concrete next steps |
+
+---
+
+## 🔍 Phase 1 — Repository Discovery
+
+> Agent collects raw facts before making any classification decisions.
+
+### 1.1 — Identity Extraction
+
+Scan for identity signals in this priority order:
+
+```
+SOURCES (in priority order):
+  1. README.md / README.rst / README.txt        → project name, purpose, owner
+  2. package.json / pom.xml / build.gradle      → artifactId, name, version, description
+  3. setup.py / pyproject.toml / Cargo.toml     → name, authors
+  4. .github/CODEOWNERS                         → team ownership
+  5. Makefile / Dockerfile / docker-compose.yml → service name, image name
+  6. CI config (.github/workflows, .gitlab-ci.yml, Jenkinsfile) → pipeline name
+  7. Kubernetes manifests (deployment.yaml, service.yaml) → app label, namespace
+  8. OpenShift / Helm chart values.yaml         → release name, chart name
+  9. Directory name (repo root folder name)     → fallback identifier
+```
+
+**Collect:**
+- `component_name` — canonical name of the component
+- `team_owner` — team or individual responsible
+- `description` — one-line purpose (from any above source)
+- `version` — current version string if available
+- `repository_url` — remote origin if detectable
+- `report_timestamp` — ISO 8601 timestamp of analysis run
+
+---
+
+### 1.2 — File Inventory
+
+Enumerate the full file tree and compute:
+
+```
+INVENTORY SIGNALS:
+  - Total file count by extension (.java, .py, .ts, .go, .yaml, .json, etc.)
+  - Presence/absence of: tests, docs, CI config, IaC, migration files, schema files
+  - Directory structure pattern (flat, layered, hexagonal, feature-sliced, etc.)
+  - Largest files by line count (signals complexity hotspots)
+  - Config file count vs source file count ratio
+```
+
+---
+
+### 1.3 — Language & Framework Detection
+
+```
+LANGUAGE DETECTION:
+  - Primary language: file extension frequency + config file type
+  - Secondary languages: scripting, IaC, config DSLs
+
+FRAMEWORK DETECTION (match against well-known indicators):
+
+  JVM / Spring:
+    build.gradle or pom.xml contains: spring-boot, spring-web, spring-data,
+    spring-kafka, spring-batch, spring-cloud, spring-security
+
+  Python:
+    requirements.txt or pyproject.toml contains: fastapi, flask, django,
+    celery, sqlalchemy, pydantic, airflow, prefect, luigi
+
+  Node / JS / TS:
+    package.json dependencies contain: express, nest, next, react, vue,
+    angular, fastify, hapi, bull, kafkajs
+
+  Go:
+    go.mod contains: gin, echo, fiber, chi, grpc, sarama
+
+  .NET:
+    *.csproj contains: Microsoft.AspNetCore, Entity Framework, MassTransit
+
+  General cross-language:
+    - Message broker: kafka, rabbitmq, sqs, pubsub, nats, activemq
+    - Database ORM: hibernate, sequelize, sqlalchemy, gorm, prisma
+    - Cache: redis, memcached, hazelcast
+    - gRPC: .proto files present
+    - GraphQL: .graphql / schema.graphql present
+    - OpenAPI: openapi.yaml / swagger.yaml present
+```
+
+---
+
+### 1.4 — Deployment & Infrastructure Fingerprint
+
+```
+SCAN FOR (presence = signal, absence = signal):
+
+  Containerization:
+    Dockerfile, docker-compose.yml, .dockerignore
+
+  Kubernetes / OpenShift:
+    deployment.yaml, service.yaml, route.yaml, configmap.yaml,
+    hpa.yaml, pvc.yaml, serviceaccount.yaml, networkpolicy.yaml
+
+  Helm:
+    Chart.yaml, values.yaml, templates/ directory
+
+  Serverless:
+    serverless.yml, template.yaml (SAM), function.json (Azure Functions)
+
+  IaC:
+    terraform/ directory, *.tf files, cdk.json, pulumi.yaml
+
+  CI/CD:
+    .github/workflows/*.yml, .gitlab-ci.yml, Jenkinsfile,
+    azure-pipelines.yml, .circleci/config.yml, bitbucket-pipelines.yml
+
+  Database Migrations:
+    flyway/, liquibase/, migrations/ directory, alembic/, db/migrate/
+
+  Observability:
+    Presence of logging config (logback.xml, log4j2.xml, logging.properties)
+    Presence of metrics annotations (@Timed, prometheus_client, micrometer)
+    Presence of tracing (opentelemetry, jaeger, zipkin dependencies)
+    Presence of health endpoint code (/actuator/health, /health, /ping)
+```
+
+---
+
+## 🏷️ Phase 2 — Taxonomy Classification
+
+> Apply the following decision trees to assign the three-level taxonomy: Category → Sub-Category → Type.
+
+### 2.1 — Category Classification
+
+```
+CATEGORY DECISION TREE:
+
+  IF built and maintained entirely in-house with no COTS license files,
+     no vendor SDK jars, and no proprietary framework indicators
+  → Category: CUSTOM
+
+  ELSE IF primary codebase is a vendor product being configured/extended
+     (e.g., Salesforce config, ServiceNow customization, SAP extensions)
+  → Category: COMMERCIAL-OFF-THE-SHELF (COTS)
+
+  ELSE IF a mix of in-house code wrapping a licensed SDK or platform
+  → Category: HYBRID
+
+  ELSE IF purely configuration/deployment of an open-source product
+     with no custom application code
+  → Category: OPEN-SOURCE-DEPLOYMENT
+
+  Document ALL signals used for this decision in the report.
+```
+
+---
+
+### 2.2 — Sub-Category Classification
+
+```
+SUB-CATEGORY DECISION TREE:
+
+  Web Application / Service:
+    - REST controller annotations present (@RestController, @GetMapping, router.get(), etc.)
+    - HTTP server framework in dependencies (spring-web, express, fastapi, gin)
+    - Exposes HTTP endpoints
+
+  Messaging / Event-Driven Service:
+    - Kafka/RabbitMQ/SQS consumer/producer code present
+    - No HTTP controller code (or HTTP is secondary)
+    - Message listener annotations (@KafkaListener, @RabbitListener, @SqsListener)
+
+  Batch / Scheduled Processing:
+    - Job scheduler present (Spring Batch, Quartz, Airflow, Celery Beat)
+    - @Scheduled / cron / timer annotations dominant
+    - No HTTP or messaging consumer as primary interface
+
+  Data Pipeline / ETL:
+    - Extract-Transform-Load pattern present in code
+    - Data ingestion, transformation, and sink components present
+    - Pipeline orchestration files present (Airflow DAGs, Prefect flows)
+
+  UI / Frontend Application:
+    - Frontend framework dependencies present (React, Angular, Vue, etc.)
+    - Public assets directory (public/, static/, assets/)
+    - HTML entry point (index.html)
+    - Build tool (webpack, vite, parcel, esbuild)
+
+  Library / SDK:
+    - No main application entry point
+    - Exported interfaces/classes designed for external consumption
+    - No Dockerfile or deployment manifests
+    - Published to artifact registry (Maven Central, npm, PyPI)
+
+  CLI Tool:
+    - main() entry point with argument parsing (argparse, cobra, commander, picocli)
+    - No server startup code
+    - No persistent deployment manifests
+
+  Infrastructure / Platform Component:
+    - Primarily IaC files (Terraform, CDK, Helm chart-only repo)
+    - No application source code
+```
+
+---
+
+### 2.3 — Type Classification
+
+```
+TYPE DECISION TREE:
+
+  Microservice:
+    - Single focused responsibility (validate, transform, notify, etc.)
+    - Own deployment unit (Dockerfile + K8s manifests)
+    - Communicates via REST or messaging APIs
+    - Stateless (no local database, no shared filesystem)
+    - No UI
+
+  Monolith:
+    - Multiple distinct domains in one deployment unit
+    - Shared database accessed from multiple layers
+    - Contains both business logic AND persistence AND (possibly) UI
+
+  Monorepo / Multi-Module:
+    - Multiple sub-projects under one root
+    - Shared build tooling across modules
+    - Each module may be independently deployable
+
+  Sidecar:
+    - Injected alongside a primary container
+    - Handles cross-cutting concern (logging, proxy, auth)
+
+  Serverless Function:
+    - Single-purpose handler function
+    - Invoked by trigger (HTTP, event, schedule)
+    - No persistent server process
+
+  Gateway / Proxy:
+    - Routes, aggregates, or transforms requests
+    - Contains routing rules, filters, rate limiting logic
+    - No direct business logic
+
+  Worker / Consumer:
+    - Subscribes to queue/topic
+    - Processes messages asynchronously
+    - Persists results or triggers downstream actions
+```
+
+---
+
+## 📝 Phase 3 — Responsibility Analysis
+
+> Determine what the component IS responsible for and what it is NOT.
+
+### 3.1 — Core Responsibility
+
+```
+DERIVE FROM:
+  - README purpose statement (if available)
+  - Controller/handler endpoint names and method signatures
+  - Service class names and their primary methods
+  - Domain model names
+  - Key business logic class names
+
+ARTICULATE AS:
+  "This component is responsible for [VERB] [DOMAIN OBJECT/CONCEPT]
+   and returning [OUTPUT] to [CONSUMER]."
+
+Example derivation:
+  Controller has @PostMapping("/api/tvs/v1/trades")
+  Service has method validateTrade(TradeRequest req)
+  → "This component is responsible for validating trade entities
+     against business rules and returning validation results via REST API."
+```
+
+---
+
+### 3.2 — Explicit Non-Responsibilities (What It Is NOT)
+
+```
+FOR EACH of the following dimensions, check presence/absence and state:
+
+  Database / Persistence:
+    IF no JPA/Hibernate/ORM dependencies AND no database connection config
+    → "Does not own or manage persistent data storage"
+
+  UI / Frontend:
+    IF no frontend framework, no HTML templates, no static assets
+    → "Does not serve a user interface"
+
+  Message Orchestration:
+    IF no Kafka/RabbitMQ producer/consumer
+    → "Does not produce or consume async messages"
+
+  Scheduling / Batching:
+    IF no @Scheduled, no batch job config, no cron expressions (beyond cache refresh)
+    → "Does not perform scheduled batch processing"
+
+  Service Orchestration:
+    IF no calls to multiple downstream services being coordinated
+    → "Does not orchestrate other services"
+
+  Authentication:
+    IF no security config, no JWT/OAuth libraries
+    → "Does not handle authentication or authorization directly"
+    (Note if delegated to gateway/sidecar)
+```
+
+---
+
+## 🔗 Phase 4 — Integration Topology
+
+> Map all inbound and outbound integration points.
+
+```
+INBOUND SIGNALS (how this component is called):
+  - HTTP endpoint paths (scan @*Mapping annotations, router definitions, OpenAPI spec)
+  - Port numbers (application.properties, server.port, Dockerfile EXPOSE)
+  - Queue/topic subscriptions (@KafkaListener topics, @RabbitListener queues)
+  - Triggered by: Scheduled cron, event bridge, pubsub subscription
+
+OUTBOUND SIGNALS (what this component calls):
+  - HTTP client config (RestTemplate, WebClient, Axios, fetch, requests, httpx)
+  - Service URLs in config (application.yaml, .env, config maps)
+  - Database connection strings (datasource.url, DATABASE_URL, DB_HOST)
+  - Kafka producer topics
+  - Cache connections (redis.host, REDIS_URL)
+  - External SDK calls (AWS, Azure, GCP SDKs)
+
+OUTPUT FORMAT FOR REPORT:
+  Inbound:
+    - [PROTOCOL] [PATH/TOPIC] → [PURPOSE]
+
+  Outbound:
+    - [PROTOCOL] [TARGET/URL-PATTERN] → [PURPOSE]
+```
+
+---
+
+## ⚕️ Phase 5 — Code Quality & Maturity Signals
+
+> Assess quality indicators without executing the code.
+
+```
+QUALITY SIGNAL MATRIX:
+
+  Testing Coverage Signals:
+    ✅ Test directory present (src/test, tests/, __tests__, spec/)
+    ✅ Test files present (*.test.*, *Spec.*, *Test.java)
+    ✅ Mocking frameworks in dependencies (Mockito, Jest, pytest-mock)
+    ✅ Integration test directory separate from unit tests
+    ⚠️  No test directory found
+    ⚠️  Test files present but test count < 20% of source file count
+
+  Documentation Signals:
+    ✅ README.md present and > 200 words
+    ✅ API docs (Swagger/OpenAPI spec present)
+    ✅ CHANGELOG.md or HISTORY.md present
+    ✅ Javadoc / docstrings on public methods > 50%
+    ⚠️  README.md absent or < 50 words
+    ⚠️  No API documentation found
+
+  Security Signals:
+    ✅ Security dependency present (Spring Security, Passport, PyJWT)
+    ✅ Secrets not hardcoded (no API keys in source files)
+    ✅ Dependency audit config present (OWASP plugin, npm audit, Snyk)
+    ⚠️  Secrets detected in source files (flag without exposing values)
+    ⚠️  No security dependency detected for an externally-exposed service
+
+  Observability Signals:
+    ✅ Structured logging configured
+    ✅ Metrics endpoint (Actuator, Prometheus /metrics)
+    ✅ Health check endpoint present
+    ✅ Distributed tracing dependency (OpenTelemetry, Sleuth, Jaeger)
+    ⚠️  No health endpoint detected
+    ⚠️  No metrics instrumentation found
+
+  Dependency Hygiene:
+    - Count of direct dependencies
+    - Count of outdated/flagged dependency versions (if lockfile present)
+    - Presence of SBOM (Software Bill of Materials)
+
+  Code Structure:
+    - Separation of concerns (Controller → Service → Repository pattern, or equivalent)
+    - Presence of dependency injection vs static/singleton abuse
+    - Configuration externalized vs hardcoded (check for literal IPs, hardcoded URLs)
+```
+
+---
+
+## ⚠️ Phase 6 — Risk & Gap Analysis
+
+> Surface gaps between what the component is and what it should have.
+
+```
+RISK ASSESSMENT RULES:
+
+  For each taxonomy Type, apply expected standards and flag gaps:
+
+  Microservice risks:
+    - MISSING: Health endpoint (required for K8s liveness/readiness probes)
+    - MISSING: Structured/JSON logging (required for log aggregation)
+    - MISSING: Graceful shutdown handling
+    - MISSING: Circuit breaker / retry logic for downstream calls
+    - MISSING: Externalized config (no hardcoded URLs, credentials)
+    - MISSING: Distributed tracing
+
+  Library risks:
+    - MISSING: Published artifact configuration (no pom.xml distributionManagement)
+    - MISSING: Semantic versioning enforcement
+    - MISSING: Public API documentation
+    - MISSING: Backward compatibility strategy
+
+  Batch job risks:
+    - MISSING: Job restart/resume logic
+    - MISSING: Dead-letter / failure handling
+    - MISSING: Run history / audit trail
+
+  ALL types:
+    - NO_TESTS: No test directory or zero test files found
+    - NO_DOCS: No README.md or empty README
+    - SECRETS_IN_CODE: Credential patterns detected in source
+    - LARGE_FILES: Files > 500 lines (complexity risk)
+    - NO_CI: No CI/CD configuration found
+```
+
+---
+
+## 📊 Phase 7 — Report Rendering
+
+> Generate the final structured report from all collected signals.
+
+### 7.1 — Report Structure
+
+```markdown
+---
+title:        "[component_name] — Component Taxonomy Report"
+component:    "[component_name]"
+owner:        "[team_owner]"
+version:      "[version]"
+analyzed_at:  "[ISO 8601 timestamp]"
+generated_by: "CodeMind AI Agent"
+---
+
+# Component Taxonomy Report — [component_name]
+
+## 📌 Executive Summary
+[2–3 sentence plain-language summary: what this component is, what it does, how it fits in the architecture]
+
+---
+
+## 🏷️ Taxonomy
+
+| Dimension    | Classification              | Confidence |
+|---|---|---|
+| Category     | [value]                     | [High / Medium / Low] |
+| Sub-Category | [value]                     | [High / Medium / Low] |
+| Type         | [value]                     | [High / Medium / Low] |
+
+### Classification Rationale
+> Explain WHY each classification was assigned, citing specific file names,
+> annotation names, dependency names, or config keys as evidence.
+
+**Category — [value]:**
+[Evidence-based reasoning...]
+
+**Sub-Category — [value]:**
+[Evidence-based reasoning...]
+
+**Type — [value]:**
+[Evidence-based reasoning...]
+
+---
+
+## 🛠️ Technology Profile
+
+| Dimension       | Value |
+|---|---|
+| Primary Language | [value] |
+| Secondary Languages | [value, value] |
+| Frameworks | [value, value] |
+| Build Tool | [value] |
+| Runtime | [value] |
+| Containerized | [Yes / No] |
+| Orchestration | [Kubernetes / OpenShift / ECS / None / Unknown] |
+| CI/CD | [GitHub Actions / Jenkins / GitLab CI / None] |
+
+---
+
+## 🎯 Responsibility Map
+
+### ✅ This component IS responsible for:
+- [Responsibility 1 — derived from code signals]
+- [Responsibility 2]
+- ...
+
+### 🚫 This component is NOT responsible for:
+- [Non-responsibility 1 — with evidence of absence]
+- [Non-responsibility 2]
+- ...
+
+---
+
+## 🔗 Integration Topology
+
+### Inbound Interfaces
+| Protocol | Path / Topic / Trigger | Purpose |
+|---|---|---|
+| [HTTP/gRPC/Kafka/etc.] | [path or topic] | [what it receives] |
+
+### Outbound Dependencies
+| Protocol | Target | Purpose |
+|---|---|---|
+| [HTTP/JDBC/Kafka/etc.] | [target] | [what it calls] |
+
+---
+
+## ⚕️ Code Quality & Maturity
+
+| Signal | Status | Detail |
+|---|---|---|
+| Unit Tests | [✅ Present / ⚠️ Absent / ℹ️ Partial] | [file count or note] |
+| Integration Tests | [✅ / ⚠️ / ℹ️] | [note] |
+| API Documentation | [✅ / ⚠️ / ℹ️] | [note] |
+| README Quality | [✅ / ⚠️ / ℹ️] | [word count / note] |
+| Health Endpoint | [✅ / ⚠️ / ℹ️] | [endpoint path or note] |
+| Metrics Instrumentation | [✅ / ⚠️ / ℹ️] | [note] |
+| Distributed Tracing | [✅ / ⚠️ / ℹ️] | [note] |
+| Secrets Safety | [✅ / ⚠️ / ℹ️] | [note — never expose values] |
+| Config Externalized | [✅ / ⚠️ / ℹ️] | [note] |
+| CI/CD Pipeline | [✅ / ⚠️ / ℹ️] | [tool name or note] |
+
+**Overall Maturity Score:** [X / 10]
+
+---
+
+## ⚠️ Risk & Gap Analysis
+
+[For each identified risk, present in this format:]
+
+### [RISK_ID]: [Risk Title]
+- **Severity:** [Critical / High / Medium / Low]
+- **Finding:** [What was found or not found]
+- **Impact:** [What could go wrong]
+- **Evidence:** [Specific file, line, or absence signal]
+
+---
+
+## 💡 Recommendations
+
+[Ordered by priority: Critical → High → Medium → Low]
+
+### Priority 1 — Critical
+- [ ] [Specific, actionable recommendation with "what" and "why"]
+
+### Priority 2 — High
+- [ ] [Recommendation]
+
+### Priority 3 — Medium
+- [ ] [Recommendation]
+
+### Priority 4 — Low / Enhancement
+- [ ] [Recommendation]
+
+---
+
+## 📁 Key Files Referenced
+
+| File | Significance |
+|---|---|
+| [filename] | [Why this file was important to the analysis] |
+
+---
+
+## 🔑 Classification Signal Summary
+
+> Compact list of ALL code signals used in classification decisions (for auditability)
+
+- [Signal 1]: [File or annotation or dependency name] → [what it signals]
+- [Signal 2]: ...
+- ...
+
+---
+
+*Report generated by CodeMind AI Agent | [timestamp]*
+*For questions about this classification, contact [team_owner]*
+```
+
+---
+
+### 7.2 — Confidence Scoring Rules
+
+```
+CONFIDENCE LEVELS:
+
+  High:
+    - 3+ independent signals agree on the classification
+    - Signals are unambiguous (e.g., @RestController AND HTTP port AND REST endpoints)
+
+  Medium:
+    - 2 signals agree, OR 1 strong signal without corroboration
+    - Some ambiguity exists (e.g., has both REST and messaging but unclear which is primary)
+
+  Low:
+    - Only 1 weak signal
+    - Conflicting signals present
+    - Key files absent (no README, no build file)
+    → Always explain LOW confidence in the rationale
+```
+
+---
+
+### 7.3 — Maturity Score Calculation
+
+```
+MATURITY SCORE (out of 10):
+
+  +1  Unit tests present
+  +1  Integration tests present
+  +1  Code coverage report configured
+  +1  README.md with > 200 words
+  +1  API documentation (OpenAPI/Swagger)
+  +1  Health endpoint present
+  +1  Metrics instrumentation present
+  +1  CI/CD pipeline configured
+  +1  No secrets hardcoded
+  +1  Config fully externalized (no hardcoded URLs/IPs)
+
+  Penalty:
+  -1  for each CRITICAL risk identified (minimum score: 0)
+```
+
+---
+
+## 🚀 Phase 8 — Output Options
+
+```
+OUTPUT FORMATS (agent should support all):
+
+  1. Markdown (.md)         — Default; renders in CodeMind and GitHub
+  2. HTML                   — Rich formatted report with collapsible sections
+  3. JSON                   — Machine-readable; for pipeline consumption
+  4. PDF                    — Stakeholder distribution
+
+FILENAME CONVENTION:
+  {component_name}-taxonomy-report-{YYYYMMDD}.{ext}
+
+STORAGE LOCATION:
+  Place in: .codemind/reports/ directory at repo root
+  (create if not exists)
+```
+
+---
+
+## 🔄 Playbook Execution Checklist
+
+```
+AGENT EXECUTION SEQUENCE:
+
+  [ ] Phase 1.1 — Extract identity signals
+  [ ] Phase 1.2 — Build file inventory
+  [ ] Phase 1.3 — Detect language and frameworks
+  [ ] Phase 1.4 — Detect deployment and infrastructure signals
+
+  [ ] Phase 2.1 — Classify Category (with confidence)
+  [ ] Phase 2.2 — Classify Sub-Category (with confidence)
+  [ ] Phase 2.3 — Classify Type (with confidence)
+
+  [ ] Phase 3.1 — Derive core responsibility statement
+  [ ] Phase 3.2 — Enumerate non-responsibilities with evidence
+
+  [ ] Phase 4   — Map inbound and outbound integrations
+
+  [ ] Phase 5   — Evaluate all quality signals
+
+  [ ] Phase 6   — Identify risks with severity ratings
+
+  [ ] Phase 7.1 — Render full structured report
+  [ ] Phase 7.2 — Assign confidence levels
+  [ ] Phase 7.3 — Calculate maturity score
+
+  [ ] Phase 8   — Write output file in requested format
+```
+
+---
+
+## 📌 Agent Behavior Rules
+
+```
+RULES THE AGENT MUST FOLLOW:
+
+  1. NO HARDCODING — Every value in the report must be derived from
+     repository contents. Never assume a technology, framework, or
+     responsibility that isn't evidenced by a file or dependency.
+
+  2. CITE EVIDENCE — Every classification claim must name the specific
+     file, annotation, dependency, or configuration key that supports it.
+
+  3. STATE ABSENCES — When a signal is absent, say so explicitly.
+     "No database dependency detected" is more informative than silence.
+
+  4. SURFACE UNCERTAINTY — Use confidence levels. Never present a
+     Medium or Low confidence classification as definitive.
+
+  5. NO SECRET EXPOSURE — When flagging secrets-in-code risks, describe
+     the pattern or file, never the actual secret value.
+
+  6. ACTIONABLE RECOMMENDATIONS — Every recommendation must be specific
+     enough that a developer knows exactly what to do next.
+
+  7. NEUTRAL TONE — The report is an architectural record, not a
+     performance review. Avoid evaluative language about team choices.
+
+  8. HANDLE EMPTY REPOS — If the repository has no source files, say so
+     and classify as UNKNOWN with Low confidence across all dimensions.
+```
+
+---
+
+*CodeMind Component Taxonomy Playbook v1.0.0*
+*Generic | Repository-Agnostic | No Hardcoding*
