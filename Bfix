@@ -1,0 +1,52 @@
+You are fixing a bug in the Discovery Agent backend where `capabilities` 
+and `decomposition` fields are returning `null` in the API response.
+
+## Context
+- The API response has this shape:
+  {
+    "capabilities": null,       // should be populated
+    "decomposition": null,      // should be populated
+    "catalog_matches": [...]    // working correctly
+  }
+- The frontend renders "Component Layers" and "Architecture Composition" 
+  sections only when these fields are non-null.
+- The root cause is suspected to be LLM model misconfiguration.
+
+## Task
+Fix the backend so that `capabilities` and `decomposition` are correctly 
+populated. Make minimal, surgical changes. Do not refactor existing logic.
+
+## LLM Model Rules — CRITICAL
+- All LLM calls MUST use the model name read from the environment variable 
+  defined in .env (e.g. GEMINI_MODEL or similar — check existing .env and 
+  usage, do not assume the key name).
+- Default model for ALL agents/playbooks = the Gemini 2.5 Pro value from .env.
+- EXCEPTION: If the playbook name contains "hardgate" OR "ise_detect" 
+  (case-insensitive substring match), use the Sonnet model from .env instead.
+- NO hardcoded model strings anywhere. Every model reference must come 
+  from environment variables.
+- Apply this model selection logic as a single shared utility function 
+  (e.g. `get_model_for_playbook(playbook_name: str) -> str`) and use it 
+  everywhere LLM calls are made.
+
+## Constraints
+- Do not break any existing functionality.
+- Do not change API contracts or response schemas.
+- Do not add new dependencies.
+- Keep changes production-grade: proper error handling, logging, no silent 
+  failures on the capabilities/decomposition steps.
+- If capabilities or decomposition generation fails, log the error clearly 
+  and return an empty list/dict rather than null, so the frontend degrades 
+  gracefully.
+
+## Steps to follow
+1. Find all places where `capabilities` and `decomposition` are set in the 
+   response — trace from the API handler back to the agent/LLM call.
+2. Find all LLM model instantiation points in the codebase.
+3. Replace every hardcoded model string with the env-var-based utility 
+   function above.
+4. Verify the capabilities/decomposition steps are actually being invoked 
+   and not silently skipped (check for early returns, None guards, or 
+   conditional branches that bypass them).
+5. Add a debug log line just before each LLM call showing which model is 
+   being used and the playbook name — this helps confirm the fix in UAT.
