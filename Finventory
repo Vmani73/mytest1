@@ -1,0 +1,879 @@
+# 📖 Functional Use Case Inventory — CodeMind Playbook
+
+> **Purpose:** Instruct the CodeMind AI agent to analyze any repository and produce a
+> comprehensive Functional Use Case Inventory Report — covering every externally-observable
+> behavior, business rules, validation logic, test coverage, traceability, and gaps.
+> Zero hardcoding. Every finding is derived exclusively from repository content.
+
+---
+
+## 📋 Playbook Metadata
+
+```yaml
+playbook_id:       functional-usecase-inventory
+playbook_version:  1.0.0
+target_tool:       CodeMind IDE
+report_type:       Functional Use Case Inventory
+applicable_to:     Any software repository (microservice, monolith, library,
+                   batch job, data pipeline, UI app, CLI tool)
+generated_by:      CodeMind AI Agent
+output_filename:   {component_name}-functional-inventory-{YYYYMMDD}.md
+```
+
+---
+
+## 🔬 What This Report Produces
+
+A **Functional Use Case Inventory** reverse-engineers the complete behavioral specification
+of a component directly from source code — without relying on external documentation.
+
+| Section | What It Answers |
+|---|---|
+| **Functional Capabilities Summary** | What can this component do? (FC inventory) |
+| **Use Case Catalog** | Who triggers it, how, what happens, what can go wrong? |
+| **Acceptance Criteria Matrix** | Given/When/Then behavioral assertions per UC |
+| **Test Coverage Mapping** | Which UCs have tests? Which framework? Which gaps? |
+| **Requirements Traceability** | Requirement → UC → Validator → Error Code → Test |
+| **Validation & Business Rules** | Every rule the code enforces, with trigger and logic |
+| **Gap Analysis** | What's missing, partial, or undocumented? |
+| **Report Metadata** | Counts, frameworks, fixtures, summary statistics |
+
+---
+
+## ⚙️ Agent Behavior Principles
+
+```
+STRICT RULES — NON-NEGOTIABLE:
+
+  1. NO ASSUMPTION — Only state what is directly evidenced by code, config,
+     or test files. Never infer a business rule that isn't in the code.
+
+  2. NO HARDCODING — Component name, entry points, actors, rules, error codes —
+     all must be derived from scanning repository files. No defaults.
+
+  3. CITE EVERY CLAIM — For every functional capability, use case, rule, or
+     gap identified, name the exact source file(s) that evidence it.
+
+  4. STATE UNCERTAINTY EXPLICITLY — If a file is ambiguous, say so.
+     If a flow cannot be fully traced, mark it PARTIAL with explanation.
+
+  5. DISTINGUISH ABSENCE FROM UNKNOWN — "No test found for this UC"
+     is different from "Test existence could not be determined."
+
+  6. NEVER EXPOSE SECRETS — When scanning config files, never include
+     actual credentials, tokens, or connection strings in the report.
+
+  7. PRESERVE ORIGINAL NAMES — Use exact class names, method names,
+     annotation values, endpoint paths, and error code strings as found
+     in source. Do not paraphrase or normalize them.
+```
+
+---
+
+## 🔍 Phase 1 — Repository Bootstrap
+
+> Collect all raw facts needed before any functional analysis begins.
+
+### 1.1 — Component Identity
+
+```
+SCAN IN THIS ORDER:
+  1. README.md / README.rst / README.adoc    → component name, description, owner
+  2. build.gradle / pom.xml / package.json   → artifactId / name / description
+  3. pyproject.toml / Cargo.toml / go.mod    → name, version
+  4. Kubernetes deployment.yaml              → app label, namespace, team label
+  5. Helm Chart.yaml                         → name, description, version
+  6. .github/CODEOWNERS                      → owning team
+  7. Root directory name                     → fallback component name
+
+COLLECT:
+  component_name:    [canonical name from above]
+  team_owner:        [team or individual]
+  description:       [one-line purpose]
+  version:           [version string if found]
+  primary_language:  [Java / Python / TypeScript / Go / C# / etc.]
+  primary_framework: [Spring Boot / FastAPI / Express / Gin / etc.]
+  report_timestamp:  [ISO 8601 at time of agent run]
+```
+
+---
+
+### 1.2 — Entry Point Discovery
+
+```
+SCAN FOR ALL ENTRY POINTS — these become Functional Capabilities:
+
+  HTTP Endpoints (REST):
+    Java/Spring:
+      @GetMapping, @PostMapping, @PutMapping, @DeleteMapping, @PatchMapping,
+      @RequestMapping on controller classes
+      → Capture: HTTP method, path pattern, controller class, handler method name
+
+    Python/FastAPI:
+      @app.get(), @app.post(), @router.get(), @router.post(), etc.
+      → Capture: HTTP method, path pattern, function name
+
+    Python/Flask:
+      @app.route(), @blueprint.route()
+
+    Node/Express:
+      router.get(), router.post(), app.get(), app.use()
+
+    Go/Gin/Chi/Echo:
+      r.GET(), r.POST(), group.POST(), etc.
+
+    .NET:
+      [HttpGet], [HttpPost], [Route], [ApiController] attributes
+
+  Message Consumers:
+    @KafkaListener(topics = ...) → capture topic name, group ID, handler method
+    @RabbitListener(queues = ...) → capture queue name, handler method
+    @SqsListener, @EventListener, @StreamListener
+    → Python: @app.task (Celery), consumer.subscribe()
+    → Node: consumer.run(), channel.consume()
+
+  Scheduled / Cron Triggers:
+    @Scheduled(cron = ...) or @Scheduled(fixedRate = ...)
+    @EnableScheduling + method annotations
+    Python: @scheduler.scheduled_job(), celery beat config
+    → Capture: cron expression or interval, method name
+
+  CLI Entry Points:
+    main() / main.py with argparse / cobra commands / click decorators
+    → Capture: command name, arguments
+
+  Event Listeners (internal):
+    @EventListener, ApplicationListener<>, Observer pattern implementations
+    → Capture: event class name, handler method
+
+  gRPC:
+    .proto service definitions → capture service name, RPC method names
+
+  GraphQL:
+    Query / Mutation / Subscription resolvers → capture operation names
+```
+
+---
+
+### 1.3 — File Inventory for Analysis
+
+```
+BUILD A WORKING INDEX OF:
+
+  Source files:
+    - All controller / handler / router files
+    - All service layer files
+    - All validator / rules engine files
+    - All repository / DAO / data access files
+    - All model / domain / DTO / entity files
+    - All configuration files (application.yml, .properties, .env.example)
+    - All constants / enum files (often contain error codes)
+    - All exception / error class files
+
+  Test files:
+    - All unit test files (*Test.java, *_test.py, *.test.ts, *Spec.rb)
+    - All integration test files (*IT.java, *Integration*, test_integration_*)
+    - All BDD / feature files (*.feature, *.story)
+    - All test data / fixture files (*.json, *.xml, *.csv in test resources)
+
+  Config / Infrastructure:
+    - application.yml / application.properties / .env.example
+    - Kubernetes ConfigMap yamls
+    - Helm values.yaml
+    - CI pipeline files
+
+  Documentation (if any):
+    - OpenAPI / Swagger spec (openapi.yaml, swagger.json)
+    - Any *.md files beyond README
+```
+
+---
+
+## 🗂️ Phase 2 — Functional Capabilities Summary
+
+> Build the FC (Functional Capability) table. One row per entry point discovered.
+
+### 2.1 — FC Table Construction Rules
+
+```
+FOR EACH entry point discovered in Phase 1.2:
+
+  Assign sequential FC-ID:  FC-1, FC-2, FC-3, ...
+  (Order: HTTP endpoints first, then messaging, then scheduled, then internal)
+
+  DERIVE each column:
+
+  Capability Name:
+    - Read from method/handler name: validateTrade → "Trade Validation"
+    - Or from endpoint path: /api/v1/error-codes → "Error Code Registry"
+    - Or from @KafkaListener topic name
+    - Do NOT invent a name; derive from code identifiers
+
+  Entry Point:
+    - HTTP: "[METHOD] [path]"    e.g. POST /api/v1/trades
+    - Kafka: "TOPIC: [topic-name]"
+    - Scheduled: "@Scheduled([expression])"
+    - CLI: "[command] [args]"
+    - Internal: "[EventClass]"
+
+  Type:
+    - API          → exposes HTTP endpoint callable by external consumers
+    - CONSUMER     → listens to message queue/topic
+    - SYSTEM       → internal scheduled or event-driven, not directly callable
+    - INTERNAL     → called by other components within same process
+    - CLI          → command-line invokable
+
+  Description:
+    - Read from: method Javadoc/docstring, OpenAPI summary if present,
+      or derive from method body's primary operation
+    - One sentence maximum
+    - If no doc exists: derive from what the method actually does
+
+  Source Evidence:
+    - [ClassName.java:methodName] or [filename.py:function_name]
+```
+
+---
+
+### 2.2 — FC Table Output Format
+
+```markdown
+## 1. Functional Capabilities Summary
+
+| FC-ID | Capability | Entry Point | Type | Description | Source |
+|---|---|---|---|---|---|
+| FC-1 | [derived] | [derived] | [derived] | [derived] | [file:method] |
+| FC-2 | ... | ... | ... | ... | ... |
+```
+
+---
+
+## 📘 Phase 3 — Use Case Catalog
+
+> For each FC, produce a full Use Case card with all observable behavioral attributes.
+
+### 3.1 — Use Case Card Construction
+
+```
+FOR EACH FC-ID, create a UC card with the following attributes.
+ALL values derived from code — not invented:
+
+  UC-ID:
+    UC-[N] matching FC-[N]
+    (If one FC has multiple distinct behavioral variants — e.g., different
+    action types handled by same endpoint — create UC-[N]a, UC-[N]b, etc.)
+
+  Actor:
+    DERIVE FROM:
+      - OpenAPI spec consumer description (if present)
+      - Controller class name prefix (e.g., ExternalApiController → "External System")
+      - @CrossOrigin origin values (if present)
+      - Swagger @Tag annotations
+      - Integration test setup: what test actor is simulated?
+      - Kafka consumer group name (e.g., "billing-service" → "Billing Service")
+      - README "Used By" or "Consumers" section
+      - If undetermined: mark as "Unknown — see README"
+
+  Precondition:
+    DERIVE FROM:
+      - @Valid annotations on request body → what must be structurally valid
+      - Guard clauses at method entry (if (x == null) throw ...)
+      - @PreAuthorize / security annotations → auth requirement
+      - Required request parameters (@RequestParam required=true)
+      - Kafka consumer: what state must exist before processing
+      - Any explicit validation at entry point before main logic runs
+
+  Flow:
+    TRACE THE EXECUTION PATH:
+      Step 1: Entry (controller/handler receives request)
+      Step 2: Input validation layer (what validators run first?)
+      Step 3: Business logic layer (what service methods are called?)
+      Step 4: Data access (what repositories, caches, external calls happen?)
+      Step 5: Response construction (what is returned?)
+
+    REPRESENT AS:
+      "[Entry] → [Validation Layer] → [Business Logic] → [Data Access] → [Response]"
+      Use actual class/method names, not generic labels.
+      Use + to show parallel steps, → for sequential steps.
+
+  Postcondition:
+    DERIVE FROM:
+      - Return type of handler method
+      - HTTP status codes set (@ResponseStatus, ResponseEntity<>)
+      - What state changes are made (DB write, cache update, event published)
+      - What the test assertions verify (look at test assertThat/assertEquals)
+
+  Error Paths:
+    DERIVE FROM:
+      - catch blocks in controller and service layers
+      - @ExceptionHandler methods in @ControllerAdvice classes
+      - Custom exception classes and their messages
+      - Validation error response patterns
+      - Test cases that test failure scenarios
+      - Error code constants / enums
+    FORMAT:
+      "[Trigger condition] → [Error code or exception] → [HTTP status or behavior]"
+
+  Key Difference (only for variant UCs):
+    What distinguishes THIS variant from other similar UCs?
+    Derive from: conditional logic branches, different request fields required,
+    different validator chains invoked, different downstream calls made.
+```
+
+---
+
+### 3.2 — UC Card Output Format
+
+```markdown
+## 2. Use Case Catalog
+
+### UC-[N]: [Capability Name from FC table]
+
+| Attribute | Value |
+|---|---|
+| FC Reference | FC-[N] |
+| Actor | [derived value] |
+| Precondition | [derived value] |
+| Flow | [derived step chain] |
+| Postcondition | [derived value] |
+| Error Paths | [derived error conditions] |
+| Source Files | [list of relevant source files] |
+```
+
+---
+
+## ✅ Phase 4 — Acceptance Criteria Matrix
+
+> Derive behavioral assertions in Given/When/Then format from code and tests.
+
+### 4.1 — Criteria Derivation Rules
+
+```
+FOR EACH UC, derive acceptance criteria from:
+
+  PRIMARY SOURCE — BDD feature files (*.feature):
+    Extract: Scenario titles + Given/When/Then steps verbatim
+    Map each scenario to its UC-ID by: entry point path, trade type,
+    or action discriminator present in the scenario
+
+  SECONDARY SOURCE — Unit/integration test method names:
+    Java: @Test + method name pattern "should[Verb][Condition]"
+    Python: def test_[condition]_[expected_outcome]
+    JS/TS: it("should [condition]", ...) or test("[condition]", ...)
+    → Translate test method name to Given/When/Then language
+
+  TERTIARY SOURCE — @ExceptionHandler + error code analysis:
+    If a specific error code is thrown for a specific condition,
+    that IS an acceptance criterion even if no test covers it.
+    Mark source as "INFERRED FROM CODE — NO TEST FOUND"
+
+  FORMAT EACH CRITERION:
+    Given: [precondition / system state]
+    When:  [action taken / input provided]
+    Then:  [expected outcome / response]
+
+    + Source: [feature file name OR test method name OR "INFERRED"]
+    + Test Status: [COVERED / PARTIAL / NOT COVERED]
+```
+
+---
+
+### 4.2 — Acceptance Criteria Output Format
+
+```markdown
+## 3. Acceptance Criteria Matrix
+
+| UC | Given | When | Then | Source | Status |
+|---|---|---|---|---|---|
+| UC-1 | [state] | [action] | [outcome] | [source file] | COVERED |
+| UC-1 | [state] | [action] | [outcome] | INFERRED | NOT COVERED |
+```
+
+---
+
+## 🧪 Phase 5 — Test Coverage Mapping
+
+> Map every UC to its test coverage — framework, location, and scenario count.
+
+### 5.1 — Test Discovery Rules
+
+```
+SCAN ALL TEST FILES AND BUILD A MAP:
+
+  For BDD / Feature files (*.feature):
+    - File path
+    - Framework: Cucumber / Karate / Behave / SpecFlow / etc.
+    - Scenario count (count "Scenario:" or "Scenario Outline:" occurrences)
+    - Detect which UC it covers by: path in URL step, trade type in step,
+      keyword matching scenario titles to FC capability names
+
+  For Unit test files (*Test.*, *_test.*, *.spec.*):
+    - File path
+    - Framework: JUnit 4/5 / pytest / Jest / Mocha / NUnit / etc.
+    - Test method count
+    - Detect which UC it covers by: which controller/service class it tests,
+      which endpoint it calls in mock setup
+
+  For Integration test files:
+    - Same structure as unit tests
+    - Note: marks full flow coverage vs isolated layer coverage
+
+  FOR EACH UC produce coverage summary:
+    - Test files that cover it
+    - Framework used
+    - Scenario/test count
+    - Coverage type: Unit / Integration / BDD / None
+    - If None: mark as COVERAGE GAP
+```
+
+---
+
+### 5.2 — Test Coverage Output Format
+
+```markdown
+## 4. Test Coverage Mapping
+
+| UC | Test File | Framework | Scenarios / Tests | Coverage Type |
+|---|---|---|---|---|
+| UC-1 | [path/to/file] | [framework] | [N] | BDD + Unit |
+| UC-3 | — | — | 0 | ⚠️ NONE |
+```
+
+---
+
+## 🔗 Phase 6 — Requirements Traceability
+
+> Build a full traceability chain: Requirement → UC → Validator → Error Code → Test.
+
+### 6.1 — Requirement Extraction Rules
+
+```
+SOURCES FOR REQUIREMENTS (in priority order):
+
+  1. Explicit requirements in README (e.g., "## Business Requirements" section)
+  2. Comments in source code stating requirements (//REQ:, //RULE:, //BIZ:)
+  3. Validator class names (e.g., MandatoryFieldValidator → requirement:
+     "All mandatory fields must be present")
+  4. Error code strings (e.g., "invalid.product" → requirement:
+     "Product must be valid/registered")
+  5. BDD feature file names and scenario titles
+  6. Acceptance test class names
+
+  DERIVE REQUIREMENT STATEMENT:
+    From validator name + what it checks → natural language requirement
+    Example: TradeLimitValidator.validate(trade) checks notional against limits
+    → Requirement: "Trade notional must be within defined limits"
+
+  ASSIGN REQUIREMENT ID:
+    REQ-001, REQ-002, ... (sequential)
+    If source assigns its own ID (e.g., from a comment), preserve it.
+```
+
+---
+
+### 6.2 — Traceability Chain Construction
+
+```
+FOR EACH REQUIREMENT:
+
+  UC Coverage:
+    Which UC(s) exercise this requirement?
+    (Match by: validator called in UC flow, error code appears in UC error paths)
+
+  Validator / Enforcer:
+    Which class/method enforces this requirement?
+    (Exact class name + method name from source)
+
+  Error Code:
+    What error code is produced when this requirement is violated?
+    (From: exception message strings, error constant values, enum names,
+     MessageSource keys, i18n property files)
+
+  BDD Feature:
+    Which feature file / scenario covers this requirement?
+    If none: mark as NOT COVERED
+
+  Traceability Status:
+    FULL:    REQ → UC → Validator → Error Code → Test all present
+    PARTIAL: One or more links missing
+    BROKEN:  Validator exists but no UC, or error code with no test
+```
+
+---
+
+### 6.3 — Traceability Output Format
+
+```markdown
+## 5. Requirements Traceability
+
+| Requirement | UC | Validator | Error Code | BDD Feature | Status |
+|---|---|---|---|---|---|
+| REQ-001: [text] | UC-[N] | [ClassName] | `[error.code]` | [feature file] | FULL |
+| REQ-002: [text] | UC-[N] | [ClassName] | `[error.code]` | — | PARTIAL |
+```
+
+---
+
+## 📏 Phase 7 — Validation & Business Rules
+
+> Extract every rule the code enforces, regardless of whether it has a UC or test.
+
+### 7.1 — Rule Discovery Sources
+
+```
+SCAN THESE LOCATIONS FOR RULES:
+
+  Validator classes:
+    Any class named *Validator, *Rule, *Check, *Guard, *Policy
+    Any class implementing Validator<T>, ConstraintValidator<A,T>
+    → For each: identify trigger condition, logic, and error produced
+
+  Bean validation annotations:
+    @NotNull, @NotEmpty, @Size, @Min, @Max, @Pattern, @Email, @Future, @Past
+    → On which field? In which model class? What error?
+
+  Service layer conditional logic:
+    if/else branches with throw statements or error accumulation
+    → Identify: condition tested, what triggers the rule, what's returned
+
+  Constants / Enums:
+    Files named *ErrorCode, *ValidationCode, *RuleCode, *MessageCode
+    → Extract all defined constants as rule identifiers
+
+  i18n / MessageSource files:
+    messages.properties, errors.properties, ValidationMessages.properties
+    → Extract: key → message pairs (these are error codes + human messages)
+
+  Configuration-driven rules:
+    Rules loaded from external config (limits from DB, holidays from cache)
+    → Identify: config source, what rule uses it, how it's applied
+
+  For each rule discovered:
+    ASSIGN: VR-001, VR-002, VR-003, ... (sequential)
+    IF source assigns its own ID, preserve it.
+```
+
+---
+
+### 7.2 — Rule Output Format
+
+```markdown
+## 6. Validation & Business Rules
+
+| Rule ID | Rule Name | Trigger | Validation Logic | Error Code | Source |
+|---|---|---|---|---|---|
+| VR-001 | [derived name] | [what triggers check] | [logic summary] | `[code]` | [file:line] |
+```
+
+**Rule Name derivation:**
+- From validator class name minus "Validator": `MandatoryFieldValidator` → "Mandatory Field Presence"
+- From error code: `invalid.product` → "Product Validity"
+- From method name: `checkTradeLimits()` → "Trade Limit Enforcement"
+
+---
+
+## 🔎 Phase 8 — Gap Analysis
+
+> Identify every area where the component falls short of completeness.
+
+### 8.1 — Gap Categories and Detection Rules
+
+```
+GAP CATEGORY 1: TEST COVERAGE GAPS
+  Detection:
+    - UC has no test file mapped to it (from Phase 5)
+    - UC has unit test but no integration or BDD test
+    - BDD feature file exists but has no scenarios tagged to a UC
+    - Validator class has no corresponding test class
+  Severity:
+    CRITICAL: Core business flow UC has zero coverage
+    HIGH:     Error path has no test
+    MEDIUM:   Happy path covered but edge cases not
+    LOW:      Internal utility method uncovered
+
+GAP CATEGORY 2: DOCUMENTATION GAPS
+  Detection:
+    - Controller method has no Javadoc / docstring / OpenAPI @Operation
+    - No OpenAPI/Swagger spec file present for an HTTP service
+    - README has no usage / endpoint documentation section
+    - Error codes have no human-readable message in i18n files
+      (e.g., code appears in source but missing from messages.properties)
+  Severity:
+    HIGH:    Public API endpoint with zero documentation
+    MEDIUM:  Internal endpoint undocumented
+    LOW:     Minor fields undocumented
+
+GAP CATEGORY 3: ERROR HANDLING GAPS
+  Detection:
+    - Exception thrown in service but not caught in controller or @ControllerAdvice
+    - Error code constant defined but never used in code
+    - Error code used in code but not defined as constant (magic string)
+    - Catch block that swallows exceptions (catch(Exception e) { log.warn })
+    - No error response body standardization (inconsistent error schemas)
+  Severity:
+    HIGH:    Uncaught exception reaches caller as 500 with no message
+    MEDIUM:  Inconsistent error response format across endpoints
+    LOW:     Magic string error codes (no constant)
+
+GAP CATEGORY 4: BUSINESS RULE GAPS
+  Detection:
+    - TODO / FIXME / HACK comments in validator or service layer
+    - Commented-out validation logic
+    - Rules referenced in test data fixtures but not enforced in code
+    - Error codes defined in messages.properties not triggered by any code path
+    - Partial rule implementation (method stub or empty body)
+  Severity:
+    CRITICAL: Commented-out security or compliance check
+    HIGH:     Partial rule implementation
+    MEDIUM:   TODO in validation logic
+    LOW:      Unused error code
+
+GAP CATEGORY 5: OBSERVABILITY GAPS
+  Detection:
+    - Endpoint with no request logging
+    - Business rule violation with no audit log or metric increment
+    - No correlation ID / trace ID propagation in request handling
+    - Error path that fails silently (no log, no metric)
+  Severity:
+    HIGH:    Production error paths with no logging
+    MEDIUM:  Business events not emitted for audit
+    LOW:     Debug logging inconsistency
+
+GAP CATEGORY 6: TRACEABILITY GAPS
+  Detection:
+    - Validator exists with no UC claiming it
+    - UC flow references a class that doesn't exist in codebase
+    - Feature file scenario has no matching source implementation
+    - Requirement inferred from test with no code enforcement found
+  Severity:
+    HIGH:   Feature file tests behavior not implemented
+    MEDIUM: Validator exists but untriggered from any entry point
+    LOW:    Minor naming inconsistency between test and source
+```
+
+---
+
+### 8.2 — Gap Output Format
+
+```markdown
+## 7. Gap Analysis
+
+| # | Area | Gap Category | Severity | Detail | Evidence |
+|---|---|---|---|---|---|
+| G-001 | [area name] | [category] | [CRITICAL/HIGH/MEDIUM/LOW] | [what's missing or wrong] | [file reference] |
+```
+
+---
+
+## 📊 Phase 9 — Report Metadata
+
+> Compute summary statistics from all phases above.
+
+```
+COMPUTE:
+
+  total_functional_capabilities:   COUNT of FC rows
+  total_use_cases:                  COUNT of UC cards
+  total_acceptance_criteria:        COUNT of rows in criteria matrix
+  total_requirements:               COUNT of REQ rows
+  total_validation_rules:           COUNT of VR rows
+  total_gaps_identified:            COUNT of G rows
+
+  test_frameworks_detected:         LIST of [framework_name: file_count]
+    (from Phase 5 scan)
+
+  bdd_feature_files:                COUNT of *.feature files
+  unit_test_files:                  COUNT of *Test.* unit test files
+  integration_test_files:           COUNT of *IT.* or *Integration* files
+  test_data_fixtures:               COUNT + names of test fixture files
+
+  coverage_summary:
+    fully_covered_ucs:              COUNT of UCs with FULL coverage
+    partially_covered_ucs:          COUNT of UCs with PARTIAL coverage
+    uncovered_ucs:                  COUNT of UCs with NO coverage
+    coverage_percentage:            (fully + 0.5*partial) / total * 100
+
+  traceability_summary:
+    full_chain_requirements:        COUNT where status=FULL
+    partial_chain_requirements:     COUNT where status=PARTIAL
+    broken_chain_requirements:      COUNT where status=BROKEN
+
+  gap_severity_breakdown:
+    critical_gaps:                  COUNT
+    high_gaps:                      COUNT
+    medium_gaps:                    COUNT
+    low_gaps:                       COUNT
+```
+
+---
+
+### 9.1 — Metadata Output Format
+
+```markdown
+## 8. Report Metadata
+
+| Field | Value |
+|---|---|
+| Component | [component_name] |
+| Version | [version] |
+| Owner | [team_owner] |
+| Primary Language | [language] |
+| Primary Framework | [framework] |
+| Total Functional Capabilities | [N] |
+| Total Use Cases | [N] |
+| Total Acceptance Criteria | [N] |
+| Total Validation Rules | [N] (covering ~[M] individual error codes) |
+| Total Requirements Traced | [N] |
+| Test Frameworks | [list] |
+| BDD Feature Files | [N] |
+| Unit Test Files | [N] |
+| Test Data Fixtures | [N] ([names]) |
+| UC Coverage: Full / Partial / None | [N] / [N] / [N] |
+| Traceability: Full / Partial / Broken | [N] / [N] / [N] |
+| Gaps: Critical / High / Medium / Low | [N] / [N] / [N] / [N] |
+| Analyzed At | [ISO 8601 timestamp] |
+| Generated By | CodeMind AI Agent |
+```
+
+---
+
+## 📄 Phase 10 — Final Report Assembly
+
+### 10.1 — Complete Report Structure
+
+```markdown
+---
+title:        "[component_name] — Functional Use Case Inventory"
+component:    "[component_name]"
+version:      "[version]"
+owner:        "[team_owner]"
+analyzed_at:  "[timestamp]"
+generated_by: "CodeMind AI Agent"
+---
+
+# Functional Use Case Inventory — [component_name]
+
+## Executive Summary
+[3–4 sentences: what this component does functionally, how many behaviors it exposes,
+state of test coverage, most critical gaps. Derived entirely from phases above.]
+
+---
+
+[Section 1: Functional Capabilities Summary — Phase 2 output]
+[Section 2: Use Case Catalog — Phase 3 output]
+[Section 3: Acceptance Criteria Matrix — Phase 4 output]
+[Section 4: Test Coverage Mapping — Phase 5 output]
+[Section 5: Requirements Traceability — Phase 6 output]
+[Section 6: Validation & Business Rules — Phase 7 output]
+[Section 7: Gap Analysis — Phase 8 output]
+[Section 8: Report Metadata — Phase 9 output]
+
+---
+
+## Appendix A: Source Files Analyzed
+[Flat list of every file read during analysis, grouped by type]
+
+## Appendix B: Files Referenced But Not Found
+[Any file name encountered in code (import, config reference) that
+could not be located in the repository — signals missing dependencies
+or incomplete repositories]
+
+## Appendix C: Analysis Limitations
+[Any phase where coverage was incomplete due to:
+  - Obfuscated or generated code
+  - External config not available
+  - Dynamic dispatch patterns that couldn't be traced statically
+  - Files that couldn't be read]
+```
+
+---
+
+### 10.2 — Quality Gates Before Report Finalization
+
+```
+AGENT MUST VERIFY BEFORE WRITING FINAL REPORT:
+
+  [ ] Every FC row has a corresponding UC card
+  [ ] Every UC card has at least one acceptance criterion
+      (even if status = NOT COVERED)
+  [ ] Every error code string found in source is listed in Section 6
+  [ ] Every test file discovered is mapped to at least one UC
+      (unmappable tests go to Appendix A with note "mapping undetermined")
+  [ ] No cell in any table contains "N/A" without explanation
+  [ ] No claim lacks a source file reference
+  [ ] Gap severity ratings are consistent with the definitions in Phase 8.1
+  [ ] Metadata counts match actual row counts in sections above
+```
+
+---
+
+## 🚀 Phase 11 — Output Options
+
+```
+OUTPUT FORMATS:
+
+  Default:   Markdown (.md)   — full fidelity, renders in CodeMind and GitHub
+  Optional:  HTML             — collapsible sections per UC, syntax highlighted
+             JSON             — machine-readable for pipeline consumption
+             CSV (tables)     — for import into Jira/Confluence
+
+FILENAME:
+  {component_name}-functional-inventory-{YYYYMMDD}.{ext}
+
+STORAGE:
+  Write to: .codemind/reports/ at repository root (create if not exists)
+  Also print summary to CodeMind agent output panel.
+```
+
+---
+
+## 🔄 Agent Execution Checklist
+
+```
+PHASE 1  — Bootstrap
+  [ ] 1.1  Extract component identity
+  [ ] 1.2  Discover all entry points (HTTP, messaging, scheduled, CLI, events)
+  [ ] 1.3  Build full file inventory index
+
+PHASE 2  — Functional Capabilities Summary
+  [ ] 2.1  Assign FC-IDs and derive all FC table columns
+  [ ] 2.2  Write FC table
+
+PHASE 3  — Use Case Catalog
+  [ ] 3.1  For each FC, trace Actor / Precondition / Flow / Postcondition / Error Paths
+  [ ] 3.2  Write UC cards
+
+PHASE 4  — Acceptance Criteria Matrix
+  [ ] 4.1  Extract from BDD files, unit tests, inferred from error codes
+  [ ] 4.2  Mark coverage status per criterion
+
+PHASE 5  — Test Coverage Mapping
+  [ ] 5.1  Scan all test files and map to UCs
+  [ ] 5.2  Compute coverage type and identify gaps
+
+PHASE 6  — Requirements Traceability
+  [ ] 6.1  Extract requirements from all sources
+  [ ] 6.2  Build traceability chain per requirement
+  [ ] 6.3  Classify chain completeness
+
+PHASE 7  — Validation & Business Rules
+  [ ] 7.1  Extract all rules from validators, annotations, service logic
+  [ ] 7.2  Assign VR-IDs and map error codes
+
+PHASE 8  — Gap Analysis
+  [ ] 8.1  Run all 6 gap detection categories
+  [ ] 8.2  Assign severity per gap
+
+PHASE 9  — Metadata
+  [ ] 9.1  Compute all counts and summary statistics
+
+PHASE 10 — Final Report
+  [ ] 10.1 Assemble complete report in order
+  [ ] 10.2 Run quality gates checklist
+  [ ] 10.3 Write output file
+```
+
+---
+
+*CodeMind Functional Use Case Inventory Playbook v1.0.0*
+*Generic | Repository-Agnostic | Evidence-Only | No Hardcoding*
