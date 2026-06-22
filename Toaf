@@ -1,0 +1,1332 @@
+# 🏛️ TOGAF Governance & Risk Metrics — CodeMind Playbook
+
+> **Purpose:** Instruct the CodeMind AI agent to analyze one or two repositories and produce
+> a production-grade TOGAF Governance & Risk Metrics Report — covering current-state
+> architecture assessment, governance structure health, compliance monitoring, risk
+> identification & tracking, operational metrics & KPIs, TOGAF domain maturity scoring,
+> and prioritized governance recommendations.
+>
+> **Zero hardcoding. Every finding derived exclusively from repository artifacts.
+> Dual-repo side-by-side comparison supported. One unified Markdown file output.**
+
+---
+
+## 📋 Playbook Metadata
+
+```yaml
+playbook_id:        togaf-governance-risk-metrics
+playbook_version:   1.0.0
+target_tool:        CodeMind IDE
+report_type:        TOGAF Governance & Risk Metrics
+applicable_to:      Any 1 or 2 software repositories — any language, any framework
+generated_by:       CodeMind AI Agent
+output_filename:    {component_name[s]}-togaf-governance-{YYYYMMDD}.md
+output_location:    .codemind/reports/
+```
+
+---
+
+## 🗺️ Report Structure at a Glance
+
+```
+PART 0  ── Cover Page & Governance Executive Summary
+PART 1  ── Repository Bootstrap & Identity
+PART 2  ── Current State Architecture (TOGAF Architecture Baseline)
+PART 3  ── Governance Structures Assessment
+PART 4  ── Compliance Monitoring
+PART 5  ── Risk Identification & Tracking
+            5.1  Error Handling Patterns
+            5.2  Retry & Fallback Mechanisms
+            5.3  Operational Risk Signals
+PART 6  ── Metrics & KPIs
+            6.1  Functional Metrics
+            6.2  Compliance Metrics
+            6.3  Risk Metrics
+PART 7  ── TOGAF Architecture Governance Assessment
+            (Business / Data / Application / Technology Architecture domains)
+PART 8  ── Governance Gap Analysis
+PART 9  ── Prioritized Governance Recommendations
+PART 10 ── Governance Scorecard & Statistics
+APPENDIX A ── Evidence Index (all files referenced)
+APPENDIX B ── TOGAF Reference Alignment Notes
+APPENDIX C ── Analysis Limitations
+```
+
+---
+
+## ⚙️ Non-Negotiable Agent Rules
+
+```
+RULE 1 — NO HARDCODING
+  Every attribute, value, finding, and metric must be derived from
+  actual files in the repository. Never assume a governance structure,
+  compliance control, or risk pattern not evidenced by code or config.
+
+RULE 2 — CITE EVERY FINDING
+  Every table row must reference the specific file, annotation, config key,
+  class name, or pipeline step that evidences it.
+  Format: [FileName] → [specific signal]
+  Format for absence: "Not detected — [files scanned]"
+
+RULE 3 — THREE-STATE EVERY CONTROL
+  Every governance control must be assessed as one of:
+    ✅ ENFORCED    — evidence of active enforcement found
+    ⚠️ IMPLIED     — partial or indirect evidence only
+    ⛔ NOT DETECTED — scanned relevant files; signal absent
+  Never leave a control unrated.
+
+RULE 4 — TOGAF DOMAIN MATURITY SCALE
+  Rate each TOGAF domain on a 5-level scale:
+    1 — Initial    (ad-hoc, undocumented)
+    2 — Managed    (some process, inconsistently applied)
+    3 — Defined    (documented, consistently applied)
+    4 — Measured   (quantitative metrics tracked)
+    5 — Optimizing (continuous improvement in place)
+  Derive from evidence only. Never assign a level without justification.
+
+RULE 5 — RISK LEVEL ASSIGNMENT
+  CRITICAL — Immediate production or compliance risk
+  HIGH     — Reliability or security risk, no mitigation found
+  MEDIUM   — Quality or governance risk with partial mitigation
+  LOW      — Minor improvement opportunity
+
+RULE 6 — NEVER EXPOSE SECRETS
+  Flag credential patterns by file name and type only. Never print values.
+
+RULE 7 — PRESERVE EXACT NAMES
+  Use exact class names, annotation values, config keys, endpoint paths,
+  pipeline step names, enum values as found in source.
+
+RULE 8 — DUAL-REPO MODE
+  When two repositories are provided, analyze each independently,
+  then produce side-by-side comparison columns in all tables.
+  Label all repo-specific findings [REPO-1] or [REPO-2].
+
+RULE 9 — QUALITY GATE BEFORE OUTPUT
+  Run the checklist in Part 10 before writing the final file.
+```
+
+---
+
+## 🔍 PHASE 1 — Repository Bootstrap & Identity
+
+> Run independently for each repo. In dual-repo mode, label [REPO-1] and [REPO-2].
+
+### 1.1 — Identity Extraction
+
+```
+SCAN IN PRIORITY ORDER:
+  1. README.md / README.rst / README.adoc     → name, description, owner, purpose
+  2. build.gradle / pom.xml                   → artifactId, group, version, description
+  3. package.json                             → name, version, description, author
+  4. pyproject.toml / Cargo.toml / go.mod     → name, version, authors
+  5. Kubernetes deployment.yaml              → metadata.labels (app, team, env, version)
+  6. Helm Chart.yaml                         → name, description, appVersion
+  7. .github/CODEOWNERS                      → code ownership by path
+  8. .github/MAINTAINERS / MAINTAINERS.md    → named maintainers
+  9. docker-compose.yml                      → service name
+  10. Root directory name                    → last-resort identifier
+
+COLLECT PER REPO:
+  component_name     ← canonical identifier
+  app_id             ← application ID label (from K8s labels, build config)
+  team_owner         ← team or person
+  description        ← one-line purpose
+  version            ← version string (or "Not found")
+  repository_url     ← git remote origin (if detectable)
+  report_timestamp   ← ISO 8601 at time of analysis run
+```
+
+### 1.2 — Full File Inventory
+
+```
+ENUMERATE AND GROUP ALL FILES:
+
+  Group A — Application Source
+    Controllers / Handlers
+    Services / Business Logic
+    Validators / Rules
+    Repositories / DAOs
+    Models / Entities / DTOs
+    Constants / Enums / Error Codes
+    Exception / Error classes
+    Frameworks / Base classes / Utilities
+
+  Group B — Configuration & Infrastructure
+    application.yml / application-{env}.yml / .properties
+    Kubernetes manifests (deployment, service, configmap, secret,
+                          route, hpa, networkpolicy, serviceaccount)
+    Helm (Chart.yaml, values.yaml, values-{env}.yaml, templates/)
+    Docker (Dockerfile, docker-compose.yml, .dockerignore)
+    IaC (*.tf, cdk.json, pulumi.yaml, serverless.yml)
+    Security config (SecurityConfig.java, Spring Security filters)
+
+  Group C — CI/CD & Governance Automation
+    .github/workflows/*.yml
+    .gitlab-ci.yml / Jenkinsfile / azure-pipelines.yml
+    .github/CODEOWNERS / MAINTAINERS
+    .github/PULL_REQUEST_TEMPLATE.md / pull_request_template.md
+    .github/branch-protection rules (inferred from PR workflow triggers)
+    sonar-project.properties / .sonarcloud.properties
+    .editorconfig / checkstyle.xml / pmd.xml / spotbugs config
+    owasp-dependency-check plugin / Snyk config / Trivy config
+    openapi.yaml / swagger.json / api-docs.yaml
+
+  Group D — Tests & Quality
+    Unit test files (*Test.java, *_test.py, *.test.ts)
+    Integration test files (*IT.java, *Integration*)
+    BDD / Feature files (*.feature)
+    Test config (application-test.yml, conftest.py)
+    Test fixtures
+
+  Group E — Documentation & ADRs
+    README.md and all *.md files
+    docs/adr/ or any Architecture Decision Records
+    CHANGELOG.md / HISTORY.md
+    docs/runbook*.md / ops/*.md
+    LICENSE / NOTICE files (for COTS detection)
+
+  Group F — Build & Dependency Management
+    build.gradle / pom.xml / package.json
+    Dependency lock files
+    BOM / version catalog files
+```
+
+---
+
+## 🏛️ PART 2 — Current State Architecture (TOGAF Baseline)
+
+> Document the as-is architecture state from repository artifacts only.
+> This is the TOGAF Architecture Baseline — what exists TODAY in code and config.
+
+### 2.1 — Current State Architecture Table
+
+```markdown
+## Part 2 — Current State Architecture
+
+| Attribute               | Value                                  | Evidence (File → Signal)                  |
+|-------------------------|----------------------------------------|-------------------------------------------|
+| Application Name        | [derived from build/K8s]               | [file] → [field/key]                      |
+| App / System ID         | [derived from label/config]            | [file] → [label key]                      |
+| Architecture Style      | [Microservice / Monolith / Serverless] | [file] → [specific annotation/signal]     |
+| Runtime Environment     | [JVM 17 / Node 20 / Python 3.11 / etc]| [build.gradle sourceCompatibility / etc.] |
+| Primary Framework       | [Spring Boot / FastAPI / Express / etc]| [dependency in build file]                |
+| Internal Framework      | [proprietary framework name or None]   | [dependency or plugin in build file]      |
+| Data Layer              | [DB type / Stateless / Cache-only]     | [dependency or config key]                |
+| Caching                 | [Redis / Coherence / Hazelcast / None] | [dependency + cache config]               |
+| Message Broker          | [Kafka / RabbitMQ / SQS / None]        | [dependency + listener annotation]        |
+| API Style               | [REST / gRPC / GraphQL / None]         | [controller annotation / proto files]     |
+| Deployment Platform     | [OpenShift / K8s / ECS / Lambda / etc] | [deployment.yaml / serverless.yml]        |
+| Container Runtime       | [Docker / Podman / None]               | [Dockerfile presence + base image]        |
+| Service Orchestration   | [Helm / Kustomize / kubectl / None]    | [Chart.yaml / kustomization.yaml]         |
+| CI/CD Toolchain         | [GitHub Actions / Jenkins / etc]       | [workflow file names]                     |
+| CD Toolchain            | [Harness / ArgoCD / FluxCD / None]     | [config reference or pipeline step]       |
+| External Auth / Auth-N  | [OpenFin / OAuth2 / None]              | [security config or dependency]           |
+| Secrets Management      | [K8s Secret / Vault / Absent]          | [secret.yaml / Vault annotation]          |
+| Config Management       | [ConfigMap / Env Vars / Props File]    | [configmap.yaml / application.yml]        |
+| Observability Stack     | [tools detected]                       | [dependencies / config]                   |
+```
+
+```
+DERIVATION RULES PER ROW:
+
+  Architecture Style:
+    Microservice → single Dockerfile + K8s manifests + focused responsibility
+    Monolith     → multiple domains in one build artifact + shared DB
+    Serverless   → serverless.yml / Lambda function config
+
+  Runtime Environment:
+    Java: sourceCompatibility / java.toolchain.languageVersion in build.gradle
+          OR <java.version> in pom.xml
+    Node: "engines": { "node": "..." } in package.json OR .nvmrc
+    Python: python_requires in pyproject.toml OR runtime in serverless.yml
+    Go: go directive in go.mod
+
+  Internal / Proprietary Framework:
+    Scan build file for non-public-registry dependencies
+    Plugins with company-specific group IDs
+    BOM imports from internal artifact repositories
+
+  Caching:
+    Oracle Coherence → coherence:* in build.gradle OR CoherenceCache config
+    Redis           → spring-data-redis OR redis in deps + @Cacheable
+    Hazelcast       → hazelcast in deps
+    Caffeine        → caffeine in deps + @Cacheable
+
+  CD Toolchain:
+    Harness → cicd.executionURL reference, Harness pipeline variables
+              (<+project.name>, <+pipeline.triggeredBy.name>)
+    ArgoCD  → argocd-app.yaml or argocd annotations in K8s manifests
+    FluxCD  → flux kustomization files
+
+  External Auth:
+    OpenFin → OpenFin dependency or container agent check config
+    OAuth2  → spring-security-oauth2 or equivalent
+    mTLS    → tls config in application.yml or K8s service mesh config
+```
+
+---
+
+## 🏗️ PART 3 — Governance Structures Assessment
+
+> Evaluate the governance mechanisms that control how this component is built,
+> reviewed, deployed, and changed. Derive from CI/CD config, repo config, and source.
+
+### 3.1 — Governance Structure Detection Rules
+
+```
+SCAN THESE FILES FOR GOVERNANCE SIGNALS:
+
+  Code Ownership:
+    .github/CODEOWNERS        → named owners per path pattern
+    MAINTAINERS / MAINTAINERS.md → named maintainers
+    ABSENT if neither found
+
+  Branch Protection (inferred from pipeline):
+    PR-triggered workflows    → branch protection implied
+    Required status checks    → infer from workflow trigger conditions
+    Review requirements       → PR_TEMPLATE or branch rule references
+    ABSENT if no PR workflow found
+
+  Deployment Approvals:
+    environment.protection_rules in GitHub Actions workflow
+    when: manual in GitLab CI
+    Harness approval stage reference
+    Manual gate in Jenkins pipeline
+    ABSENT if no approval gate detected in any pipeline stage
+
+  Architecture Review:
+    docs/adr/ directory with ADR files
+    ARCHITECTURE.md or DESIGN.md
+    PR template with architecture review checklist
+    ABSENT if no ADR directory or architecture docs found
+
+  Security Review Gates:
+    SonarQube: sonar-project.properties OR sonar plugin in build
+    Snyk:      .snyk file OR snyk step in CI pipeline
+    Veracode:  veracode plugin OR veracode step in pipeline
+    Trivy:     trivy step in CI pipeline
+    OWASP DC:  dependency-check plugin in build.gradle or pom.xml
+    ABSENT if none of above detected
+
+  API Contract Governance:
+    openapi.yaml / swagger.json / api-docs.yaml present
+    Spectral / OpenAPI linting in pipeline
+    @Operation / @ApiResponse annotations on controllers
+    ABSENT if no spec file and no OpenAPI annotations
+
+  Change Management Process:
+    CHANGELOG.md → evidence of structured change tracking
+    Semantic versioning in build file
+    Conventional commits config (.commitlintrc.yml)
+    ABSENT if no CHANGELOG and no versioning convention
+
+  Naming Convention Enforcement:
+    checkstyle.xml / .editorconfig → code style enforcement
+    Consistent package structure → derive from source directory
+    ABSENT if no style config found
+
+  Dependency Version Management:
+    gradle/libs.versions.toml (version catalog)
+    <dependencyManagement> in pom.xml (BOM)
+    package-lock.json / yarn.lock / poetry.lock (lock files)
+    ABSENT if no centralized version control found
+
+  License Compliance:
+    LICENSE file present → infer license type
+    license-maven-plugin or license-check in build
+    ABSENT if no LICENSE file
+```
+
+### 3.2 — Governance Structures Table
+
+```markdown
+## Part 3 — Governance Structures Assessment
+
+| Governance Structure          | [REPO-1] Status | [REPO-1] Evidence                              | [REPO-2] Status | [REPO-2] Evidence                    |
+|-------------------------------|-----------------|------------------------------------------------|-----------------|--------------------------------------|
+| Code Ownership                | ✅/⚠️/⛔        | [CODEOWNERS file / named owners]               | ✅/⚠️/⛔        | [evidence or "Not detected"]         |
+| Branch Protection             | ✅/⚠️/⛔        | [PR workflow file → trigger condition]         | ✅/⚠️/⛔        | [evidence]                           |
+| Mandatory PR / Code Review    | ✅/⚠️/⛔        | [PR template / workflow required checks]       | ✅/⚠️/⛔        | [evidence]                           |
+| Deployment Approvals          | ✅/⚠️/⛔        | [pipeline file → approval stage or gate]       | ✅/⚠️/⛔        | [evidence]                           |
+| Architecture Review Process   | ✅/⚠️/⛔        | [ADR directory / ARCHITECTURE.md]             | ✅/⚠️/⛔        | [evidence]                           |
+| Security Scanning (SAST)      | ✅/⚠️/⛔        | [SonarQube/Veracode plugin or pipeline step]  | ✅/⚠️/⛔        | [evidence]                           |
+| Dependency Vulnerability Scan | ✅/⚠️/⛔        | [OWASP DC / Snyk / Trivy in build or pipeline]| ✅/⚠️/⛔        | [evidence]                           |
+| API Contract Enforcement      | ✅/⚠️/⛔        | [openapi.yaml / Spectral lint step]           | ✅/⚠️/⛔        | [evidence]                           |
+| Naming Convention Enforcement | ✅/⚠️/⛔        | [checkstyle.xml / .editorconfig]              | ✅/⚠️/⛔        | [evidence]                           |
+| Dependency Version Management | ✅/⚠️/⛔        | [version catalog / BOM / lock file]           | ✅/⚠️/⛔        | [evidence]                           |
+| Change Management Tracking    | ✅/⚠️/⛔        | [CHANGELOG.md / conventional commits]         | ✅/⚠️/⛔        | [evidence]                           |
+| License Compliance            | ✅/⚠️/⛔        | [LICENSE file / license plugin]               | ✅/⚠️/⛔        | [evidence]                           |
+| Runbook / Ops Documentation   | ✅/⚠️/⛔        | [docs/runbook*.md / ops/*.md]                 | ✅/⚠️/⛔        | [evidence]                           |
+| Container Image Signing       | ✅/⚠️/⛔        | [cosign step / notation step in pipeline]     | ✅/⚠️/⛔        | [evidence]                           |
+| SBOM Generation               | ✅/⚠️/⛔        | [syft / cyclonedx step in pipeline]           | ✅/⚠️/⛔        | [evidence]                           |
+
+### Governance Score
+
+| Repo     | Controls Enforced (✅) | Controls Implied (⚠️) | Not Detected (⛔) | Score (✅ + 0.5×⚠️) / 15 |
+|----------|------------------------|------------------------|---------------------|--------------------------|
+| [REPO-1] | [N]                    | [N]                    | [N]                 | [X / 15]                 |
+| [REPO-2] | [N]                    | [N]                    | [N]                 | [X / 15]                 |
+```
+
+---
+
+## 📋 PART 4 — Compliance Monitoring
+
+> Assess each compliance control — what standard requires it, what enforces it,
+> and what evidence exists in the repository.
+
+### 4.1 — Compliance Control Detection Rules
+
+```
+SCAN FOR COMPLIANCE SIGNALS:
+
+  Code Quality Gates:
+    Gradle: check task, PMD plugin, Checkstyle plugin, SpotBugs plugin,
+            JaCoCo coverage enforcement, compilejava task
+    Maven:  checkstyle:check, pmd:check, spotbugs:check, jacoco:check
+    Node:   eslint / tslint in package.json scripts
+    Python: flake8 / pylint / mypy in pipeline or tox.ini
+    → Status: ENFORCED if quality plugin present AND fails build on violation
+              IMPLIED if plugin present but no fail-on-error config found
+              NOT DETECTED if no quality plugin found
+
+  API Contract Enforcement:
+    openapi.yaml / swagger.json present → ENFORCED (spec exists)
+    @Operation / @ApiResponse annotations only → IMPLIED (annotation-only docs)
+    No OpenAPI spec, no annotations → NOT DETECTED
+
+  Naming Conventions:
+    .editorconfig present → IMPLIED (editor-level enforcement)
+    checkstyle.xml with naming rules → ENFORCED
+    Consistent package structure (e.g., com.company.domain.service.*) → IMPLIED
+    No config → NOT DETECTED (but can note observed convention from source)
+
+  Dependency Version Management:
+    gradle/libs.versions.toml → ENFORCED (centralized catalog)
+    <dependencyManagement> BOM → ENFORCED
+    Lock file (package-lock.json, poetry.lock, gradle.lockfile) → ENFORCED
+    No centralized version control → NOT DETECTED
+
+  Security Standards:
+    TLS / mTLS config in application.yml or K8s → ENFORCED
+    @PreAuthorize / Spring Security filter chain → ENFORCED
+    CORS config (@CrossOrigin or WebSecurityConfigurerAdapter) → ENFORCED/IMPLIED
+    Input validation (@Valid, @Validated, custom validators) → ENFORCED
+
+  Data Privacy Controls:
+    @JsonIgnore on sensitive fields → IMPLIED
+    PII masking in logging config → ENFORCED if present
+    Data classification annotations or comments → IMPLIED
+
+  Audit Logging:
+    Audit trail class / @Audited annotation → ENFORCED
+    Request/response logging interceptor → IMPLIED
+    No audit mechanism → NOT DETECTED
+
+  Regulatory Compliance (domain-specific):
+    Scan for regulatory keywords in: class names, validator names,
+    error code constants, comments, README
+    Examples: 12CFR1, SMMP, QIB, GDPR, PCI, SOX, HIPAA, MiFID
+    → List each found with evidence file and class/constant name
+```
+
+### 4.2 — Compliance Monitoring Table
+
+```markdown
+## Part 4 — Compliance Monitoring
+
+### 4A. Technical Compliance Controls
+
+| Control                        | Standard / Requirement      | [REPO-1] Status | [REPO-1] Evidence                                   | [REPO-2] Status | [REPO-2] Evidence            |
+|--------------------------------|-----------------------------|-----------------|-----------------------------------------------------|-----------------|------------------------------|
+| Code Quality Gates             | Engineering Standard        | ✅/⚠️/⛔        | [plugin name in build file]                         | ✅/⚠️/⛔        | [evidence]                   |
+| Static Analysis (SAST)         | Security Policy             | ✅/⚠️/⛔        | [SonarQube/SpotBugs/Semgrep config]                | ✅/⚠️/⛔        | [evidence]                   |
+| Dependency Vulnerability Scan  | Security Policy             | ✅/⚠️/⛔        | [OWASP DC / Snyk / Trivy in build/pipeline]        | ✅/⚠️/⛔        | [evidence]                   |
+| API Contract Enforcement       | API Governance Standard     | ✅/⚠️/⛔        | [openapi.yaml or annotation-only]                  | ✅/⚠️/⛔        | [evidence]                   |
+| Naming Conventions             | Engineering Standard        | ✅/⚠️/⛔        | [.editorconfig / checkstyle.xml / package pattern] | ✅/⚠️/⛔        | [evidence]                   |
+| Dependency Version Management  | Engineering Standard        | ✅/⚠️/⛔        | [version catalog / BOM / lock file]                | ✅/⚠️/⛔        | [evidence]                   |
+| Input Validation               | Security / Data Quality     | ✅/⚠️/⛔        | [@Valid / custom Validator classes]                 | ✅/⚠️/⛔        | [evidence]                   |
+| Authentication Enforcement     | Security Policy             | ✅/⚠️/⛔        | [Spring Security / filter chain config]            | ✅/⚠️/⛔        | [evidence]                   |
+| CORS Policy                    | Security Policy             | ✅/⚠️/⛔        | [@CrossOrigin value / WebSecurity config]          | ✅/⚠️/⛔        | [evidence]                   |
+| Secrets Management             | Security Policy             | ✅/⚠️/⛔        | [K8s Secret ref / Vault / no hardcoded creds]     | ✅/⚠️/⛔        | [evidence]                   |
+| PII / Data Masking in Logs     | Privacy Regulation          | ✅/⚠️/⛔        | [@JsonIgnore / log masking pattern]                | ✅/⚠️/⛔        | [evidence]                   |
+| Audit Trail                    | Audit / Compliance Standard | ✅/⚠️/⛔        | [@Audited / audit interceptor / log pattern]       | ✅/⚠️/⛔        | [evidence]                   |
+| License Compliance             | Legal / IP Policy           | ✅/⚠️/⛔        | [LICENSE file type / license-check plugin]         | ✅/⚠️/⛔        | [evidence]                   |
+| Container Security Baseline    | Security Policy             | ✅/⚠️/⛔        | [non-root USER in Dockerfile / read-only fs]       | ✅/⚠️/⛔        | [evidence]                   |
+
+### 4B. Regulatory & Domain-Specific Compliance
+
+| Regulation / Standard | Detected In Component  | Enforcing Class / Constant              | Scope                                    | Evidence File                |
+|-----------------------|------------------------|-----------------------------------------|------------------------------------------|------------------------------|
+| [REG-NAME-1]          | [Yes / No / Partial]   | [ClassName or constant name]            | [which UCs / trade types it applies to]  | [file path]                  |
+| [REG-NAME-2]          | [Yes / No / Partial]   | [ClassName]                             | [scope]                                  | [file path]                  |
+| ...                   | ...                    | ...                                     | ...                                      | ...                          |
+```
+
+```
+REGULATORY DETECTION:
+  Scan source code for these keyword patterns (case-insensitive):
+  12cfr1, cfr1, cfr, mifid, gdpr, pci, sox, hipaa, smmp, qib,
+  finra, basel, emir, dodd-frank, aml, kyc, fatca, crs, mica,
+  restricted, cusip, isin, lei, regulatory
+
+  For each found: record the file, class, method or constant name,
+  and what the keyword appears in (class name, validator name, error code,
+  comment, annotation value).
+  Do not infer what the regulation requires — only note that it is
+  referenced and where.
+```
+
+---
+
+## ⚠️ PART 5 — Risk Identification & Tracking
+
+### 5.1 — Error Handling Pattern Analysis
+
+```
+SCAN FOR ERROR HANDLING SIGNALS:
+
+  Typed Error / Result Objects:
+    Custom Result<T> / ValidationResult / Either<E,T> classes
+    → Indicates structured error accumulation vs exception-throwing
+
+  Exception Hierarchy:
+    Custom exception classes extending RuntimeException / Exception
+    → Capture: class names, hierarchy depth, HTTP status mappings
+
+  Global Exception Handling:
+    @ControllerAdvice / @RestControllerAdvice classes
+    @ExceptionHandler methods
+    ProblemDetail / RFC 7807 error response format
+    → Capture: which exceptions are handled, what HTTP status returned
+
+  Controller-Level Handling:
+    try-catch blocks directly in controller methods
+    → Note: indicates lack of centralized handling if present
+
+  Severity / Level Classification:
+    Enum with severity levels (INFO, WARN, ERROR, FATAL, etc.)
+    → Capture: enum class name, level names and ordinal values
+
+  Fail-Fast vs Accumulating Pattern:
+    Fail-fast: stops validation at first error
+    Accumulating: collects all errors before returning
+    → Detect from: composite validator logic, result list accumulation
+
+  Silent Failure Detection:
+    catch(Exception e) { log.warn(...); } with no rethrow → flag as risk
+    Empty catch blocks → flag as CRITICAL risk
+
+  HTTP Status Mapping:
+    @ResponseStatus annotations on exception classes
+    ResponseEntity with explicit status in @ExceptionHandler
+    → Map: ExceptionClass → HTTP status code
+```
+
+### 5.1 Output Table
+
+```markdown
+## Part 5 — Risk Identification & Tracking
+
+### 5.1 Error Handling Patterns
+
+| Pattern                      | Implementation                                          | Evidence (File:Class:Method)                    | Governance Assessment        |
+|------------------------------|---------------------------------------------------------|-------------------------------------------------|------------------------------|
+| Error Capture Mechanism      | [Result object / Exception / Mixed]                     | [file:class]                                    | [GOOD / AT-RISK / MISSING]   |
+| Global Exception Handler     | [ControllerAdvice class name or Absent]                 | [file:class]                                    | [GOOD / AT-RISK / MISSING]   |
+| Exception Hierarchy          | [N custom exception classes, depth N]                   | [file:class names]                              | [GOOD / AT-RISK / MISSING]   |
+| Severity Classification      | [Enum class name: LEVEL0, LEVEL1, ... or Absent]        | [file:enum class]                               | [GOOD / AT-RISK / MISSING]   |
+| Fail-Fast vs Accumulating    | [Fail-fast at LevelN / Accumulating / Mixed]            | [file:class:method]                             | [GOOD / AT-RISK / MISSING]   |
+| Silent Failure Risk          | [N catch blocks swallowing exceptions / None found]     | [file:class:method list]                        | [GOOD / CRITICAL RISK]       |
+| HTTP Status Mapping          | [N exception types mapped to HTTP status]               | [@ControllerAdvice class or @ResponseStatus]    | [GOOD / PARTIAL / MISSING]   |
+| Error Response Format        | [RFC 7807 / Custom DTO / Inconsistent / None]           | [file:class]                                    | [GOOD / AT-RISK / MISSING]   |
+```
+
+### 5.2 — Retry & Fallback Mechanism Analysis
+
+```
+SCAN FOR RESILIENCE PATTERNS:
+
+  Retry Mechanisms:
+    AOP-based retry → @Aspect class with retry logic around Cache/external calls
+    Spring Retry    → @Retryable annotation, RetryTemplate
+    Resilience4j    → @Retry, RetryRegistry
+    Manual retry    → for loop with sleep/wait in service layer
+    → Capture: class name, what is retried, max attempts config key/value
+
+  Circuit Breaker:
+    Resilience4j    → @CircuitBreaker annotation
+    Hystrix         → @HystrixCommand (legacy)
+    → Capture: class name, what is protected, fallback method name
+
+  Fallback / Degraded Mode:
+    Stale data retention on refresh failure
+    Default value returned on cache miss
+    Feature flag disabling behavior on downstream failure
+    → Capture: class:method implementing fallback, what data is retained
+
+  Timeout Configuration:
+    RestTemplate / WebClient → connection/read timeout config
+    HTTP client config in application.yml (timeout keys)
+    → Capture: config keys and values (not secret values)
+
+  Bulkhead / Rate Limiting:
+    @Bulkhead (Resilience4j) / ThreadPoolBulkhead
+    Rate limit filter in Spring Security or gateway config
+    → Capture: class:annotation or config
+
+  Dead Letter / Error Queue:
+    Kafka DLQ topic config or @KafkaListener errorHandler
+    RabbitMQ dead-letter-exchange config
+    → Capture: DLQ topic/queue name if found
+```
+
+### 5.2 Output Table
+
+```markdown
+### 5.2 Retry & Fallback Mechanisms
+
+| Mechanism              | Pattern Detected                              | Config / Max Attempts         | Protects                           | Evidence (File:Class)              | Adequacy         |
+|------------------------|-----------------------------------------------|-------------------------------|------------------------------------|------------------------------------|------------------|
+| Retry                  | [AOP / @Retryable / Manual / Absent]          | [max attempts from config]    | [what operation is retried]        | [file:class]                       | [ADEQUATE/GAP]   |
+| Circuit Breaker        | [Resilience4j / Hystrix / Absent]             | [threshold if found]          | [what is protected]                | [file:class]                       | [ADEQUATE/GAP]   |
+| Fallback / Degraded    | [Stale data / Default value / Absent]         | [N/A]                         | [what falls back]                  | [file:class:method]                | [ADEQUATE/GAP]   |
+| Timeout Configuration  | [Configured / Not Configured]                 | [timeout values from config]  | [HTTP / DB / Cache]                | [application.yml key]              | [ADEQUATE/GAP]   |
+| Bulkhead               | [Present / Absent]                            | [config if found]             | [what resource is isolated]        | [file:class]                       | [ADEQUATE/GAP]   |
+| Dead Letter Queue      | [Present / Absent]                            | [DLQ name if found]           | [which consumer is protected]      | [config / listener annotation]     | [ADEQUATE/GAP]   |
+| Manual Recovery        | [Endpoint / Script / Absent]                  | [N/A]                         | [what can be manually recovered]   | [file:endpoint path]               | [ADEQUATE/GAP]   |
+```
+
+### 5.3 — Operational Risk Signals
+
+```
+SCAN THESE SIGNALS FROM CONFIG AND INFRASTRUCTURE FILES:
+
+  Health Check Probes:
+    Kubernetes livenessProbe / readinessProbe / startupProbe in deployment.yaml
+    Spring Actuator health endpoint: management.endpoints config
+    → RISK if probes disabled (healthcheck.enabled: false in values.yaml)
+    → Capture: probe type, path, initial delay, period from deployment.yaml
+
+  Graceful Shutdown:
+    server.shutdown: GRACEFUL in application.yml → PRESENT
+    @PreDestroy hooks in managed beans → IMPLIED
+    → RISK if absent and service is deployed in containerized environment
+
+  Auto-Scaling (HPA):
+    hpa.enabled: true in values.yaml → PRESENT
+    HorizontalPodAutoscaler resource in K8s manifests → PRESENT
+    minReplicas / maxReplicas values → capture from manifest
+    → NOTE: HPA in prod-only is a governance gap (inconsistent environments)
+
+  Resource Limits:
+    resources.limits.memory / resources.limits.cpu in deployment.yaml
+    resources.requests.memory / resources.requests.cpu
+    → Capture: exact values from config (not secret)
+    → RISK if limits absent (unbounded resource consumption)
+
+  Security Context:
+    runAsNonRoot: true in pod spec → ENFORCED
+    readOnlyRootFilesystem: true → ENFORCED
+    allowPrivilegeEscalation: false → ENFORCED
+    → RISK if securityContext absent from deployment.yaml
+
+  Network Policy:
+    networkpolicy.yaml present → ingress/egress rules defined
+    → RISK if absent for a service handling sensitive data
+
+  Environment Parity:
+    Compare values.yaml across environments (dev/qa/uat/prod)
+    → Flag inconsistencies: feature enabled in prod only, different replica counts
+    → GOVERNANCE GAP if significant parity violations found
+
+  Pod Disruption Budget:
+    poddisruptionbudget.yaml present → PRESENT
+    → RISK if absent for production-deployed service
+```
+
+### 5.3 Output Table
+
+```markdown
+### 5.3 Operational Risk Signals
+
+| Signal                     | [REPO-1] Value                              | [REPO-1] Risk Level | [REPO-1] Evidence                            | [REPO-2] Value | [REPO-2] Risk Level | [REPO-2] Evidence |
+|----------------------------|---------------------------------------------|---------------------|----------------------------------------------|----------------|---------------------|-------------------|
+| Liveness Probe             | [Enabled/Disabled/Absent]                   | [CRITICAL/H/M/L]    | [deployment.yaml: livenessProbe config]      | [value]        | [level]             | [evidence]        |
+| Readiness Probe            | [Enabled/Disabled/Absent]                   | [CRITICAL/H/M/L]    | [deployment.yaml: readinessProbe config]     | [value]        | [level]             | [evidence]        |
+| Startup Probe              | [Enabled/Disabled/Absent]                   | [H/M/L]             | [deployment.yaml: startupProbe]              | [value]        | [level]             | [evidence]        |
+| Graceful Shutdown          | [GRACEFUL/IMMEDIATE/Absent]                 | [H/M/L]             | [application.yml: server.shutdown]           | [value]        | [level]             | [evidence]        |
+| HPA / Auto-Scaling         | [Enabled(prod) / Enabled(all) / Absent]     | [H/M/L]             | [values.yaml: hpa.enabled, min/maxReplicas]  | [value]        | [level]             | [evidence]        |
+| Memory Limit               | [Xg limit / Xi request or Absent]           | [H/M/L]             | [values.yaml: container.memory]              | [value]        | [level]             | [evidence]        |
+| CPU Limit                  | [Xm limit / Xm request or Absent]           | [H/M/L]             | [values.yaml: container.cpu]                 | [value]        | [level]             | [evidence]        |
+| Security Context           | [Configured/Partial/Absent]                 | [CRITICAL/H/M/L]    | [deployment.yaml: securityContext]           | [value]        | [level]             | [evidence]        |
+| Network Policy             | [Present/Absent]                            | [H/M/L]             | [networkpolicy.yaml]                         | [value]        | [level]             | [evidence]        |
+| Pod Disruption Budget      | [Present/Absent]                            | [M/L]               | [poddisruptionbudget.yaml]                   | [value]        | [level]             | [evidence]        |
+| CORS Policy                | [Restricted / Open (*) / Absent]            | [CRITICAL/H/M/L]    | [@CrossOrigin value / security config]       | [value]        | [level]             | [evidence]        |
+| Environment Parity         | [Consistent / N gaps found]                 | [H/M/L]             | [values-{env}.yaml comparison]               | [value]        | [level]             | [evidence]        |
+```
+
+---
+
+## 📊 PART 6 — Metrics & KPIs
+
+### 6.1 — Functional Metrics Derivation Rules
+
+```
+DERIVE THESE METRICS FROM SOURCE CODE:
+
+  API Endpoint Count:
+    COUNT of HTTP handler methods (@GetMapping, @PostMapping, etc.)
+    Source: all controller classes
+
+  Validation Level Count:
+    Detect distinct validation layers/levels from:
+    - Enum with level names (L0, L1, L2, L3 or equivalent)
+    - Ordered validator chain execution
+    - Level-tagged validator classes
+    Source: ValidationLevel enum / validator orchestration class
+
+  Total Validator Count:
+    COUNT of distinct validator classes + inline validation methods
+    GROUP by level if levels detected
+    Source: all *Validator.java / *Rule.* / *Check.* classes
+
+  Registered Error Codes:
+    COUNT of distinct error code strings from:
+    - Error code constants / enums
+    - messages.properties keys
+    - Exception class message patterns
+    Source: error code registry method return type, constants files, i18n files
+
+  Supported Entity / Trade / Request Types:
+    Detect from: enum with type names, factory pattern switch/if on type,
+    discriminator field in request DTO
+    Source: TradeType enum / entity type enum / request discriminator field
+
+  Supported Action / Operation Types:
+    Same approach as above for action discriminator
+    Source: ActionType / OperationType enum
+
+  Internal Framework / Library Count:
+    COUNT of internal/proprietary dependencies
+    Source: build file — company-specific group IDs or private registry plugins
+```
+
+### 6.1 Output Table
+
+```markdown
+## Part 6 — Metrics & KPIs
+
+### 6.1 Functional Metrics
+
+| Metric                          | [REPO-1] Value                        | Derivation Method                                                    | [REPO-2] Value | Derivation Method     |
+|---------------------------------|---------------------------------------|----------------------------------------------------------------------|----------------|-----------------------|
+| API Endpoint Count              | [N]                                   | Controller method count (@GetMapping etc.)                           | [N]            | [same]                |
+| Validation Levels               | [N (e.g. L0–L3)]                      | ValidationLevel enum / layered validator chain                       | [N]            | [derivation]          |
+| Total Atomic Validators         | [N]                                   | Count of *Validator / *Rule / *Check classes                         | [N]            | [derivation]          |
+| Validators per Level            | [L0:N, L1:N, L2:N, ...]              | Group validator classes by level annotation / naming pattern         | [breakdown]    | [derivation]          |
+| Registered Error Codes          | [~N]                                  | Error code registry / constants file / messages.properties           | [~N]           | [derivation]          |
+| Entity / Trade Types Supported  | [N (list names)]                      | TradeType / EntityType enum value count                              | [N (names)]    | [derivation]          |
+| Action / Operation Types        | [N (list names)]                      | ActionType / OperationType enum value count                          | [N (names)]    | [derivation]          |
+| Internal Framework Dependencies | [N (names)]                           | Build file — company-specific group IDs                              | [N (names)]    | [derivation]          |
+| External Service Dependencies   | [N (names)]                           | HTTP client config / RestTemplate/WebClient bean definitions         | [N (names)]    | [derivation]          |
+| Configuration Properties        | [N keys]                              | application.yml key count (approximate)                              | [N keys]       | [derivation]          |
+```
+
+### 6.2 — Compliance Metrics Derivation Rules
+
+```
+DERIVE THESE FROM VALIDATORS, CONSTANTS, AND SOURCE:
+
+  Regulatory Validation Count:
+    COUNT of validators enforcing named regulations
+    (detected from: class names, error codes, comments with regulatory keywords)
+    LIST which regulations
+
+  Security Validation Count:
+    COUNT of validators enforcing security rules
+    (auth checks, CUSIP/ISIN restricted lists, permission checks)
+
+  Authentication Enforcement:
+    Where and how auth is enforced
+    (container agent / gateway / Spring Security / per-endpoint)
+    Source: SecurityConfig / @PreAuthorize / deployment agent config
+
+  Compliance Rule Coverage:
+    Which regulatory requirements have dedicated validator(s)
+    Which have test coverage
+    Derive from: traceability between VR table and test coverage
+```
+
+### 6.2 Output Table
+
+```markdown
+### 6.2 Compliance Metrics
+
+| Metric                             | [REPO-1] Value           | Notes / Evidence                                    | [REPO-2] Value | Notes                     |
+|------------------------------------|--------------------------|-----------------------------------------------------|----------------|---------------------------|
+| Regulatory Validations             | [N]                      | [regulation names: e.g. 12CFR1, SMMP, QIB]         | [N]            | [names]                   |
+| Security Validations               | [N]                      | [what is validated: CUSIP restriction, auth, etc.]  | [N]            | [description]             |
+| Authentication Enforcement Level   | [Gateway / Container /   | [where auth is enforced, evidence file]             | [level]        | [evidence]                |
+|                                    |  Per-Endpoint / None]    |                                                     |                |                           |
+| Compliance Test Coverage           | [N rules tested / N total]| [test files covering regulatory validators]        | [N/N]          | [evidence]                |
+| Audit Logging Coverage             | [Full / Partial / None]  | [audit mechanism class or absence]                  | [level]        | [evidence]                |
+| Data Classification Controls       | [Present / Absent]       | [@JsonIgnore / masking / classification annotation] | [level]        | [evidence]                |
+```
+
+### 6.3 — Risk Metrics Derivation Rules
+
+```
+DERIVE THESE FROM INFRASTRUCTURE, PIPELINE, AND SOURCE:
+
+  For each risk metric:
+    - Scan the relevant file(s) listed under evidence
+    - Determine the current state (value)
+    - Assign risk level based on the rules below
+
+  RISK LEVEL ASSIGNMENT RULES:
+
+    Health Probes Disabled:
+      → CRITICAL: Kubernetes cannot auto-restart unhealthy pods
+      → Detect: healthcheck.enabled: false in values.yaml, or
+                livenessProbe absent from deployment.yaml
+
+    CORS Unrestricted (value = "*"):
+      → HIGH: assumes internal network only; external CSRF risk
+      → Detect: @CrossOrigin("*") or allowedOrigins("*")
+
+    No Security Scanning in Pipeline:
+      → HIGH: unknown vulnerability exposure in 3rd-party deps
+      → Detect: absence of OWASP DC / Snyk / Trivy in pipeline
+
+    No OpenAPI Spec:
+      → LOW: API contract not formally documented
+      → Detect: no openapi.yaml / swagger.json / springdoc in deps
+
+    Partial Error Message Coverage:
+      → LOW: consumer cannot parse all error responses reliably
+      → Detect: error codes that log "<NOT_MAPPED>" or missing i18n keys
+```
+
+### 6.3 Output Table
+
+```markdown
+### 6.3 Risk Metrics
+
+| Metric                          | [REPO-1] Value      | Risk Level      | Impact if Unaddressed                                      | Evidence                                   |
+|---------------------------------|---------------------|-----------------|------------------------------------------------------------|--------------------------------------------|
+| Health Probes Enabled           | [Yes/No/Partial]    | [CRITICAL/H/M/L]| [Kubernetes cannot auto-restart unhealthy pods]            | [values.yaml: healthcheck.enabled]         |
+| CORS Restriction                | [Value or "*"]      | [CRITICAL/H/M/L]| [risk description]                                         | [@CrossOrigin / security config]           |
+| Security Scanning in CI         | [Yes/No/Partial]    | [H/M/L]         | [unknown vuln exposure in 3rd-party deps]                  | [pipeline file step name]                  |
+| Dependency Vulnerability Scan   | [Yes/No/Partial]    | [H/M/L]         | [risk description]                                         | [build plugin or pipeline step]            |
+| API Spec Documented             | [Yes/No/Partial]    | [M/L]           | [API contract not formally enforced for consumers]         | [openapi.yaml / swagger.json or Absent]    |
+| Error Message Coverage          | [Full/Partial/None] | [M/L]           | [consumer cannot parse all error responses reliably]       | [messages.properties / NOT_MAPPED pattern] |
+| Secret Hardcoding Risk          | [None / N found]    | [CRITICAL/H/M/L]| [credential exposure]                                      | [file type only — never values]            |
+| Config Externalization          | [Full/Partial/None] | [H/M/L]         | [environment-specific config not portable]                 | [hardcoded URL / IP pattern in source]     |
+| Pod Security Context            | [Configured/Absent] | [H/M/L]         | [container runs as root / privilege escalation risk]       | [deployment.yaml: securityContext]         |
+| Network Isolation               | [Policy/None]       | [H/M/L]         | [unrestricted pod-to-pod communication]                    | [networkpolicy.yaml or Absent]             |
+```
+
+---
+
+## 🏛️ PART 7 — TOGAF Architecture Governance Assessment
+
+> Assess maturity across the four TOGAF Architecture Domains.
+> Each domain is rated on a 1–5 maturity scale with key findings.
+
+### 7.1 — TOGAF Domain Assessment Rules
+
+```
+ASSESS EACH DOMAIN — DERIVE MATURITY FROM EVIDENCE:
+
+DOMAIN 1: BUSINESS ARCHITECTURE
+  Questions to answer from code:
+    - Is the business capability clearly defined and documented?
+    - Are business rules explicitly encoded (not buried in logic)?
+    - Are compliance requirements (regulatory) explicitly implemented?
+    - Is the business domain model clean and well-named?
+    - Are there defined business metrics tracked?
+
+  Evidence sources:
+    README business purpose section
+    Clearly named domain model classes / DTOs
+    Explicit business rule validator classes
+    Regulatory compliance validators
+    README or docs describing supported business processes
+
+  Maturity signal mapping:
+    Level 1: No README, unnamed classes, no explicit rules
+    Level 2: README exists, some named rules, no compliance docs
+    Level 3: Clear domain model, documented compliance requirements,
+             named business rules with error codes
+    Level 4: Business metrics tracked (endpoint count, rule counts,
+             compliance coverage quantified)
+    Level 5: ADRs present, business governance review process documented,
+             metrics evolve based on business feedback
+
+DOMAIN 2: DATA ARCHITECTURE
+  Questions to answer:
+    - Is data well-structured with clear models?
+    - Is reference data management explicit and documented?
+    - Are data quality rules enforced?
+    - Is data lifecycle (cache TTL, retention) defined?
+    - Are data contracts (request/response schemas) documented?
+
+  Evidence sources:
+    DTO / entity class structure and naming
+    Cache config (TTL, eviction policy)
+    Reference data loading mechanism
+    OpenAPI request/response schema documentation
+    Validation rules on data fields
+
+  Maturity signal mapping:
+    Level 1: Unstructured data, no DTOs, no validation
+    Level 2: DTOs exist, basic validation, no caching strategy doc
+    Level 3: Well-structured DTOs, explicit cache strategy, reference
+             data management with fallback, field-level validation
+    Level 4: Data contracts documented (OpenAPI), cache metrics,
+             data quality KPIs tracked
+    Level 5: Data governance policy, schema evolution strategy,
+             automated contract testing
+
+DOMAIN 3: APPLICATION ARCHITECTURE
+  Questions to answer:
+    - Is the application structure clean with separation of concerns?
+    - Are components loosely coupled?
+    - Is the error handling robust and standardized?
+    - Is the retry/resilience pattern implemented?
+    - Is the application stateless (for microservices)?
+    - Is the API well-designed and documented?
+
+  Evidence sources:
+    Controller → Service → Validator → Repository layer separation
+    Absence of DB dependency (stateless)
+    ControllerAdvice for centralized error handling
+    Retry / circuit breaker implementation
+    OpenAPI documentation completeness
+    Dependency injection usage (not static singletons)
+
+  Maturity signal mapping:
+    Level 1: Mixed concerns, no layering, poor error handling
+    Level 2: Basic layering, some error handling, no resilience
+    Level 3: Clean separation of concerns, centralized error handling,
+             basic resilience (retry), stateless design
+    Level 4: Full resilience patterns (retry + circuit breaker + fallback),
+             documented API, structured error responses
+    Level 5: Event-driven architecture, contract testing, chaos engineering
+
+DOMAIN 4: TECHNOLOGY ARCHITECTURE
+  Questions to answer:
+    - Is the technology stack modern and supported?
+    - Is the deployment platform appropriate?
+    - Is the CI/CD pipeline robust with quality gates?
+    - Is observability (logs/metrics/traces) implemented?
+    - Are security baselines enforced in deployment?
+    - Is the infrastructure as code?
+
+  Evidence sources:
+    Runtime version (Java 17+ / Node 20+ / Python 3.11+ = modern)
+    Kubernetes / OpenShift / Helm = cloud-native
+    CI/CD pipeline completeness and quality gates
+    Logging / metrics / tracing dependency presence
+    Health check configuration
+    Resource limits, security context, network policy in K8s manifests
+    IaC presence (Terraform / CDK)
+
+  Maturity signal mapping:
+    Level 1: Legacy runtime, no CI/CD, no observability
+    Level 2: Modern runtime, basic CI/CD (build + deploy), some logging
+    Level 3: Cloud-native platform, quality gates in pipeline,
+             structured logging + metrics + health checks
+    Level 4: Full observability (logs + metrics + traces), auto-scaling,
+             security baseline in K8s, dependency scanning in CI
+    Level 5: GitOps, chaos engineering, FinOps cost tracking,
+             continuous compliance validation
+```
+
+### 7.2 — TOGAF Assessment Output Table
+
+```markdown
+## Part 7 — TOGAF Architecture Governance Assessment
+
+| TOGAF Domain              | [REPO-1] Maturity | [REPO-1] Key Finding                                            | [REPO-2] Maturity | [REPO-2] Key Finding                     |
+|---------------------------|-------------------|----------------------------------------------------------------|-------------------|------------------------------------------|
+| Business Architecture     | [1–5] — [Label]   | [1–2 sentence finding derived from evidence]                   | [1–5] — [Label]   | [finding]                                |
+| Data Architecture         | [1–5] — [Label]   | [finding]                                                      | [1–5] — [Label]   | [finding]                                |
+| Application Architecture  | [1–5] — [Label]   | [finding]                                                      | [1–5] — [Label]   | [finding]                                |
+| Technology Architecture   | [1–5] — [Label]   | [finding]                                                      | [1–5] — [Label]   | [finding]                                |
+| **Overall TOGAF Maturity**| **[avg, 1 dec]**  | **[overall assessment sentence]**                              | **[avg]**         | **[overall]**                            |
+
+### TOGAF Domain Rationale
+
+#### Business Architecture — [REPO-1]: Level [N] — [Label]
+> [3–5 sentences explaining exactly why this level was assigned.
+>  Name the specific files, classes, or patterns that justify the rating.
+>  Name what would need to exist to achieve the next level.]
+
+#### Data Architecture — [REPO-1]: Level [N] — [Label]
+> [same structure]
+
+#### Application Architecture — [REPO-1]: Level [N] — [Label]
+> [same structure]
+
+#### Technology Architecture — [REPO-1]: Level [N] — [Label]
+> [same structure]
+
+[Repeat for REPO-2 if dual-repo mode]
+```
+
+---
+
+## 🔎 PART 8 — Governance Gap Analysis
+
+### 8.1 — Gap Detection Rules
+
+```
+DERIVE ALL GAPS FROM EVIDENCE. NEVER INVENT A GAP.
+
+GAP CATEGORY 1: OBSERVABILITY GAPS
+  ⛔ Health probes disabled in any environment → CRITICAL
+  ⛔ No liveness probe → CRITICAL (K8s cannot restart unhealthy pod)
+  ⛔ No readiness probe → HIGH (traffic sent to unready pod)
+  ⚠️ No metrics instrumentation → MEDIUM
+  ⚠️ No distributed tracing → MEDIUM
+  ⚠️ No structured JSON logging → MEDIUM
+
+GAP CATEGORY 2: SECURITY GOVERNANCE GAPS
+  ⛔ No dependency vulnerability scan in pipeline → HIGH
+  ⛔ CORS set to "*" without documented justification → HIGH
+  ⛔ Pod security context absent → HIGH
+  ⛔ No secret management (secrets in source) → CRITICAL
+  ⚠️ No SAST tool in pipeline → MEDIUM
+  ⚠️ No network policy → MEDIUM
+  ⚠️ Container running as root (no runAsNonRoot) → HIGH
+
+GAP CATEGORY 3: GOVERNANCE STRUCTURE GAPS
+  ⛔ No CODEOWNERS / MAINTAINERS file → MEDIUM
+  ⛔ No architecture review process (no ADRs) → MEDIUM
+  ⛔ No deployment approval gate for production → HIGH
+  ⚠️ No PR template → LOW
+  ⚠️ No change log → LOW
+
+GAP CATEGORY 4: COMPLIANCE GAPS
+  ⛔ No API contract / OpenAPI spec → MEDIUM
+  ⛔ No code quality enforcement in pipeline → MEDIUM
+  ⛔ Regulatory validator present but not tested → HIGH
+  ⚠️ Error codes with no i18n message (NOT_MAPPED) → LOW
+  ⚠️ No audit trail for state-changing operations → MEDIUM
+
+GAP CATEGORY 5: RESILIENCE GAPS
+  ⛔ External HTTP calls with no timeout config → HIGH
+  ⛔ External HTTP calls with no circuit breaker → MEDIUM
+  ⛔ Message consumer with no dead-letter queue → HIGH
+  ⚠️ Cache with no TTL / eviction policy → MEDIUM
+  ⚠️ No graceful shutdown config → MEDIUM
+
+GAP CATEGORY 6: DOCUMENTATION GAPS
+  ⛔ No README or README under 100 words → MEDIUM
+  ⛔ No API documentation (OpenAPI / Swagger) → MEDIUM
+  ⚠️ No runbook or operational documentation → MEDIUM
+  ⚠️ No CHANGELOG → LOW
+  ⚠️ Public API methods without Javadoc/docstring → LOW
+
+GAP CATEGORY 7: INFRASTRUCTURE HYGIENE
+  ⛔ No resource limits on containers → HIGH
+  ⛔ HPA not enabled in production → MEDIUM
+  ⛔ No pod disruption budget → LOW
+  ⚠️ Environment parity violations (feature in prod only) → MEDIUM
+  ⚠️ No container image vulnerability scan → HIGH
+```
+
+### 8.2 — Gap Table Output
+
+```markdown
+## Part 8 — Governance Gap Analysis
+
+| G-ID  | Repo     | TOGAF Domain              | Category       | Severity | Finding                                                    | Evidence (File → Signal)                | Recommended Action                                   |
+|-------|----------|---------------------------|----------------|----------|------------------------------------------------------------|------------------------------------------|------------------------------------------------------|
+| G-001 | [REPO-1] | Technology Architecture   | Observability  | CRITICAL | [liveness probe disabled in all environments]              | [values.yaml: healthcheck.enabled: false]| Enable liveness/readiness probes in all environments |
+| G-002 | [REPO-1] | Technology Architecture   | Security       | HIGH     | [no dependency vulnerability scan in CI pipeline]          | [pipeline file — step absent]            | Add OWASP DC / Snyk / Trivy to pipeline              |
+| G-003 | [REPO-1] | Business Architecture     | Governance     | MEDIUM   | [no CODEOWNERS file found]                                 | [.github/CODEOWNERS absent]              | Add CODEOWNERS to enforce review requirements        |
+| ...   | ...      | ...                       | ...            | ...      | ...                                                        | ...                                      | ...                                                  |
+
+### Gap Summary by TOGAF Domain
+
+| TOGAF Domain              | Critical | High | Medium | Low | Total |
+|---------------------------|----------|------|--------|-----|-------|
+| Business Architecture     | [N]      | [N]  | [N]    | [N] | [N]   |
+| Data Architecture         | [N]      | [N]  | [N]    | [N] | [N]   |
+| Application Architecture  | [N]      | [N]  | [N]    | [N] | [N]   |
+| Technology Architecture   | [N]      | [N]  | [N]    | [N] | [N]   |
+| **Total**                 | **[N]**  |**[N]**|**[N]**|**[N]**|**[N]**|
+```
+
+---
+
+## 💡 PART 9 — Prioritized Governance Recommendations
+
+### 9.1 — Recommendation Construction Rules
+
+```
+ONE RECOMMENDATION PER GAP — linked by G-ID → R-ID.
+ORDER: CRITICAL → HIGH → MEDIUM → LOW.
+
+EACH RECOMMENDATION MUST SPECIFY:
+  What:    Exact action (specific enough for a developer to act on immediately)
+  Where:   Exact file, class, pipeline stage, or K8s manifest
+  Why:     The governance or risk impact of NOT doing this
+  TOGAF:   Which TOGAF domain this improves
+  Effort:  S (< 1 day) / M (1–3 days) / L (> 3 days)
+  Lift:    Which maturity level this recommendation enables (+1 level, etc.)
+```
+
+### 9.2 — Recommendations Table
+
+```markdown
+## Part 9 — Prioritized Governance Recommendations
+
+| R-ID  | Priority | Gap Ref | TOGAF Domain             | What To Do                                                              | Where                                    | Why (Governance Impact)                                        | Effort | Maturity Lift             |
+|-------|----------|---------|--------------------------|-------------------------------------------------------------------------|------------------------------------------|----------------------------------------------------------------|--------|---------------------------|
+| R-001 | CRITICAL | G-001   | Technology Architecture  | [specific action]                                                       | [deployment.yaml / values.yaml]          | [production pods have no liveness/readiness probes]            | S      | Tech: Level 3 → 4         |
+| R-002 | HIGH     | G-002   | Technology Architecture  | Add OWASP Dependency-Check or Snyk step to CI pipeline                  | [pipeline file: after build stage]       | Unknown vulnerability exposure in 3rd-party dependencies       | M      | Tech: Level 3 → 4         |
+| R-003 | HIGH     | G-003   | Business Architecture    | [specific action]                                                       | [file]                                   | [impact]                                                       | S      | [domain]: Level N → N+1   |
+| ...   | ...      | ...     | ...                      | ...                                                                     | ...                                      | ...                                                            | ...    | ...                       |
+```
+
+---
+
+## 📊 PART 10 — Governance Scorecard & Statistics
+
+### 10.1 — Score Computation Rules
+
+```
+COMPUTE:
+
+  governance_structures_score:
+    (✅ count + 0.5 × ⚠️ count) / 15 × 100  [from Part 3]
+
+  compliance_controls_score:
+    (✅ count + 0.5 × ⚠️ count) / 14 × 100  [from Part 4]
+
+  togaf_maturity_average:
+    (Business + Data + Application + Technology) / 4  [from Part 7]
+
+  overall_governance_score:
+    Weighted average:
+      governance_structures × 0.25
+    + compliance_controls   × 0.25
+    + togaf_maturity / 5    × 0.30  (normalized to 0–100)
+    + (1 - critical_gaps/total_gaps) × 0.20
+
+  GRADING:
+    90–100 = A  (Governance-mature, production-ready)
+    75–89  = B  (Good governance, minor gaps)
+    60–74  = C  (Adequate, notable governance gaps)
+    40–59  = D  (Significant governance debt)
+    0–39   = F  (Critical governance deficiencies)
+```
+
+### 10.2 — Scorecard Output
+
+```markdown
+## Part 10 — Governance Scorecard & Statistics
+
+### 10A. Component Identity Summary
+
+| Field                          | [REPO-1]                          | [REPO-2]                          |
+|--------------------------------|-----------------------------------|-----------------------------------|
+| Component Name                 | [derived]                         | [derived]                         |
+| App ID                         | [derived]                         | [derived]                         |
+| Version                        | [derived]                         | [derived]                         |
+| Team Owner                     | [derived]                         | [derived]                         |
+| Architecture Style             | [from Part 2]                     | [from Part 2]                     |
+| Deployment Platform            | [from Part 2]                     | [from Part 2]                     |
+| Primary Framework              | [from Part 2]                     | [from Part 2]                     |
+
+### 10B. Governance Scores
+
+| Score Dimension                | [REPO-1]         | [REPO-2]         |
+|--------------------------------|------------------|------------------|
+| Governance Structures Score    | [X%] ([N]/15)    | [X%] ([N]/15)    |
+| Compliance Controls Score      | [X%] ([N]/14)    | [X%] ([N]/14)    |
+| TOGAF Maturity Average         | [X.X / 5.0]      | [X.X / 5.0]      |
+| Overall Governance Score       | [X%]             | [X%]             |
+| Governance Grade               | [A/B/C/D/F]      | [A/B/C/D/F]      |
+
+### 10C. TOGAF Domain Maturity Summary
+
+| Domain                    | [REPO-1] Level | [REPO-1] Label | [REPO-2] Level | [REPO-2] Label |
+|---------------------------|----------------|----------------|----------------|----------------|
+| Business Architecture     | [1–5]          | [label]        | [1–5]          | [label]        |
+| Data Architecture         | [1–5]          | [label]        | [1–5]          | [label]        |
+| Application Architecture  | [1–5]          | [label]        | [1–5]          | [label]        |
+| Technology Architecture   | [1–5]          | [label]        | [1–5]          | [label]        |
+| **Overall Average**       | **[X.X]**      |                | **[X.X]**      |                |
+
+### 10D. Gap Summary
+
+| Category               | Critical | High | Medium | Low | Total |
+|------------------------|----------|------|--------|-----|-------|
+| Observability          | [N]      | [N]  | [N]    | [N] | [N]   |
+| Security Governance    | [N]      | [N]  | [N]    | [N] | [N]   |
+| Governance Structures  | [N]      | [N]  | [N]    | [N] | [N]   |
+| Compliance             | [N]      | [N]  | [N]    | [N] | [N]   |
+| Resilience             | [N]      | [N]  | [N]    | [N] | [N]   |
+| Documentation          | [N]      | [N]  | [N]    | [N] | [N]   |
+| Infrastructure Hygiene | [N]      | [N]  | [N]    | [N] | [N]   |
+| **Total**              | **[N]**  |**[N]**|**[N]**|**[N]**|**[N]**|
+
+### 10E. Metrics Summary
+
+| Metric                               | [REPO-1]  | [REPO-2]  |
+|--------------------------------------|-----------|-----------|
+| API Endpoints                        | [N]       | [N]       |
+| Validation Levels                    | [N]       | [N]       |
+| Total Validators                     | [N]       | [N]       |
+| Registered Error Codes               | [N]       | [N]       |
+| Entity / Trade Types Supported       | [N]       | [N]       |
+| Regulatory Compliance Validations    | [N]       | [N]       |
+| Security Validations                 | [N]       | [N]       |
+| Total Governance Gaps Identified     | [N]       | [N]       |
+| Total Recommendations                | [N]       | [N]       |
+
+### 10F. Report Provenance
+
+| Field              | Value                               |
+|--------------------|-------------------------------------|
+| Analyzed At        | [ISO 8601 timestamp]                |
+| Generated By       | CodeMind AI Agent                   |
+| Playbook Version   | togaf-governance-risk-metrics v1.0.0|
+| Output File        | [filename]                          |
+```
+
+---
+
+## 📎 APPENDICES
+
+```markdown
+## Appendix A — Evidence Index
+
+All files read during analysis, grouped by group:
+
+### [REPO-1]
+Group A — Source:  [list of files]
+Group B — Config:  [list of files]
+Group C — CI/CD:   [list of files]
+Group D — Tests:   [list of files]
+Group E — Docs:    [list of files]
+Group F — Build:   [list of files]
+
+### [REPO-2]
+[same structure]
+
+---
+
+## Appendix B — TOGAF Reference Alignment Notes
+
+Notes on how this report's terminology maps to TOGAF ADM concepts:
+
+| This Report Section    | TOGAF ADM Phase / Concept              | Notes                               |
+|------------------------|----------------------------------------|-------------------------------------|
+| Part 2 (Current State) | Phase A: Architecture Vision /         | Baseline Architecture description   |
+|                        | Phase B–D: Domain Baselines            |                                     |
+| Part 3 (Governance)    | Phase G: Implementation Governance     | Governance framework assessment     |
+| Part 4 (Compliance)    | Phase H: Architecture Change Mgmt      | Compliance monitoring controls      |
+| Part 5 (Risk)          | Risk Management across all phases      | Risk register and mitigation        |
+| Part 7 (Assessment)    | Architecture Capability Framework      | Maturity model assessment           |
+| Part 8 (Gaps)          | Gap Analysis (all Domain phases)       | Delta between current and target    |
+| Part 9 (Recommendations)| Phase E: Opportunities & Solutions    | Governance improvement roadmap      |
+
+---
+
+## Appendix C — Analysis Limitations
+
+| Limitation                  | Part Affected | Reason                                             | Impact on Report         |
+|-----------------------------|---------------|----------------------------------------------------|--------------------------|
+| [limitation description]    | Part [N]      | [dynamic config / external system / generated code]| [what may be incomplete] |
+```
+
+---
+
+## 🔄 Agent Execution Checklist
+
+```
+PRE-FLIGHT:
+  [ ] Identify: 1 repo or 2 repos
+  [ ] If 2: label [REPO-1] and [REPO-2] throughout
+  [ ] Set report_timestamp = current ISO 8601 datetime
+  [ ] Locate all files per Groups A–F (Phase 1.2)
+
+PART 2 — Current State Architecture:
+  [ ] Derive all 18 rows of architecture table with evidence
+  [ ] Apply CD toolchain detection (Harness / ArgoCD / FluxCD)
+  [ ] Detect proprietary / internal frameworks
+
+PART 3 — Governance Structures:
+  [ ] Evaluate all 15 governance controls
+  [ ] Assign ✅ / ⚠️ / ⛔ with evidence per control
+  [ ] Compute governance structure score
+
+PART 4 — Compliance Monitoring:
+  [ ] Evaluate all 14 technical compliance controls
+  [ ] Scan for all regulatory keywords → build regulatory table
+  [ ] Classify each control with evidence
+
+PART 5 — Risk Identification:
+  [ ] 5.1 Map all error handling patterns
+  [ ] 5.2 Map all retry / fallback / resilience patterns
+  [ ] 5.3 Evaluate all 12 operational risk signals from K8s config
+  [ ] Flag CRITICAL risks immediately in risk signals table
+
+PART 6 — Metrics & KPIs:
+  [ ] 6.1 Derive all functional metrics from source
+  [ ] 6.2 Derive compliance metrics
+  [ ] 6.3 Derive risk metrics with risk level per metric
+
+PART 7 — TOGAF Assessment:
+  [ ] Assess all 4 TOGAF domains with maturity level
+  [ ] Write rationale paragraph per domain per repo
+  [ ] Cite specific files/classes for every level assignment
+
+PART 8 — Gap Analysis:
+  [ ] Run all 7 gap categories
+  [ ] Assign G-IDs, TOGAF domain, severity, evidence, action
+  [ ] Compute gap summary table by domain
+
+PART 9 — Recommendations:
+  [ ] Generate one R-ID per G-ID
+  [ ] Order by severity
+  [ ] Include TOGAF domain, effort, and maturity lift per recommendation
+
+PART 10 — Scorecard:
+  [ ] Compute governance score (%)
+  [ ] Compute compliance score (%)
+  [ ] Compute TOGAF maturity average
+  [ ] Compute overall governance grade
+  [ ] Populate all 6 scorecard tables
+  [ ] Verify all counts match earlier sections
+
+APPENDICES:
+  [ ] List all files analyzed grouped by type
+  [ ] List TOGAF reference alignment
+  [ ] List analysis limitations
+
+QUALITY GATES (must all pass before writing file):
+  [ ] Every Part 3 control has a status and evidence
+  [ ] Every Part 4 control has a status and evidence
+  [ ] Every Part 5 risk signal has a value, risk level, and evidence
+  [ ] Every Part 6 metric has a derived value and source
+  [ ] Every TOGAF domain has a maturity level with written rationale
+  [ ] Every G-ID has a matching R-ID
+  [ ] No table cell is blank — use "Not detected — [file scanned]"
+  [ ] All scorecard counts match actual findings in Parts 3–8
+  [ ] Report written to .codemind/reports/{filename}
+```
+
+---
+
+*TOGAF Governance & Risk Metrics Playbook v1.0.0*
+*Production-Grade | Dual-Repo Capable | Evidence-Only | No Hardcoding*
+*Covers: Current State Architecture · Governance Structures · Compliance ·*
+*Risk Signals · Metrics & KPIs · TOGAF Domain Maturity · Gap Analysis · Recommendations*
