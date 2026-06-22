@@ -1,0 +1,1512 @@
+# 🧭 Master Component Analysis Playbook — CodeMind IDE
+
+> **Purpose:** Instruct the CodeMind AI agent to analyze **one or two repositories simultaneously**
+> and produce a single, unified, richly-formatted Markdown report covering:
+> architectural taxonomy, functional use case inventory, data flow analysis,
+> CI/CD pipeline mapping, business rules, test coverage, traceability, and gaps.
+>
+> **Zero hardcoding. Every value derived from repository contents. Both repos analyzed
+> side-by-side when two are provided. One report file output.**
+
+---
+
+## 📋 Playbook Metadata
+
+```yaml
+playbook_id:        master-component-analysis
+playbook_version:   2.0.0
+target_tool:        CodeMind IDE
+report_type:        Unified Component Analysis (Taxonomy + Functional Inventory + Data Flow + CI/CD)
+applicable_to:      Any 1 or 2 software repositories — any language, any framework
+generated_by:       CodeMind AI Agent
+output_filename:    {component_name[s]}-master-analysis-{YYYYMMDD}.md
+output_location:    .codemind/reports/
+```
+
+---
+
+## 🗺️ Report Structure at a Glance
+
+```
+PART 0 ── Cover Page & Executive Summary
+PART 1 ── Repository Identity & Bootstrap
+PART 2 ── Architectural Taxonomy & Classification
+PART 3 ── Technology Profile
+PART 4 ── Data Flow Analysis  ◄── NEW
+PART 5 ── CI/CD Pipeline Analysis  ◄── NEW
+PART 6 ── Functional Capabilities Summary
+PART 7 ── Use Case Catalog
+PART 8 ── Acceptance Criteria Matrix
+PART 9 ── Test Coverage Mapping
+PART 10 ── Requirements Traceability
+PART 11 ── Validation & Business Rules
+PART 12 ── Code Quality & Maturity Scorecard
+PART 13 ── Gap Analysis
+PART 14 ── Prioritized Recommendations
+PART 15 ── Report Metadata & Statistics
+APPENDIX A ── Files Analyzed
+APPENDIX B ── Unresolvable References
+APPENDIX C ── Analysis Limitations
+```
+
+---
+
+## ⚙️ Non-Negotiable Agent Rules
+
+```
+RULE 1 — NO HARDCODING
+  Every value in the report must come from a file in the repository.
+  Never assume a framework, owner, rule, or actor not evidenced by code.
+
+RULE 2 — CITE EVERY CLAIM
+  Every row in every table must reference the exact source file(s)
+  that support it. Format: [FileName:MethodOrLineRef]
+
+RULE 3 — STATE ABSENCES EXPLICITLY
+  "No health endpoint detected" is better than silence.
+  Never leave a cell blank — use "Not detected" or "Absent" with note.
+
+RULE 4 — CONFIDENCE LEVELS ON ALL CLASSIFICATIONS
+  High   = 3+ independent signals agree
+  Medium = 2 signals agree, OR 1 strong unambiguous signal
+  Low    = 1 weak signal OR conflicting signals
+  Always explain Low confidence.
+
+RULE 5 — DISTINGUISH ABSENCE FROM UNKNOWN
+  ABSENT  = scanned and not found
+  UNKNOWN = could not be determined (e.g., dynamic dispatch, generated code)
+
+RULE 6 — NEVER EXPOSE SECRETS
+  Flag credential patterns by file and type. Never print values.
+
+RULE 7 — PRESERVE EXACT NAMES
+  Use exact class names, method names, endpoint paths, error code strings,
+  topic names, annotation values. Do not paraphrase or normalize.
+
+RULE 8 — DUAL-REPO MODE
+  When two repositories are provided, analyze each independently first,
+  then produce cross-repo comparison sections (taxonomy, data flow, CI/CD).
+  Label every repo-specific finding with [REPO-1] or [REPO-2].
+
+RULE 9 — QUALITY GATE BEFORE OUTPUT
+  Run the checklist in Phase 15 before writing the final file.
+  The report is not complete until all gates pass.
+```
+
+---
+
+## 🔍 PHASE 1 — Repository Bootstrap & Identity
+
+> Run this phase independently for each repository provided.
+> In dual-repo mode, produce one identity block per repo labeled [REPO-1] and [REPO-2].
+
+### 1.1 — Identity Extraction
+
+```
+SCAN IN PRIORITY ORDER:
+  1. README.md / README.rst / README.adoc      → name, description, purpose, owner
+  2. build.gradle / pom.xml                    → artifactId, group, version, description
+  3. package.json                              → name, version, description, author
+  4. pyproject.toml / setup.py / Cargo.toml / go.mod → name, version, authors
+  5. Kubernetes deployment.yaml               → metadata.labels.app, namespace, team
+  6. Helm Chart.yaml                          → name, description, appVersion
+  7. .github/CODEOWNERS                       → owning team per path
+  8. docker-compose.yml                       → service name
+  9. Root directory name                      → last-resort identifier
+
+COLLECT PER REPO:
+  component_name     ← canonical identifier
+  team_owner         ← team or person
+  description        ← one-line purpose
+  version            ← version string (or "Not found")
+  repository_url     ← git remote origin (if detectable)
+  primary_language   ← derived from Phase 1.3
+  primary_framework  ← derived from Phase 1.3
+  report_timestamp   ← ISO 8601 at time of analysis run
+```
+
+### 1.2 — File Tree Inventory
+
+```
+ENUMERATE AND CATEGORIZE ALL FILES:
+
+  Group A — Application Source
+    Controllers / Handlers / Routers
+    Services / Business Logic
+    Validators / Rules Engines
+    Repositories / DAOs / Data Access
+    Models / Entities / DTOs / Schemas
+    Constants / Enums / Error Codes
+    Exception / Error classes
+    Utilities / Helpers
+
+  Group B — Configuration
+    application.yml / application.properties / .env.example
+    logback.xml / log4j2.xml / logging.properties
+    Kubernetes manifests (deployment, service, configmap, secret, route, hpa)
+    Helm charts (Chart.yaml, values.yaml, templates/)
+    Docker (Dockerfile, docker-compose.yml, .dockerignore)
+    IaC (*.tf, cdk.json, pulumi.yaml, serverless.yml)
+
+  Group C — CI/CD Pipeline
+    .github/workflows/*.yml
+    .gitlab-ci.yml
+    Jenkinsfile / Jenkinsfile.*
+    azure-pipelines.yml
+    .circleci/config.yml
+    bitbucket-pipelines.yml
+    Makefile (if used as build/deploy driver)
+
+  Group D — Tests
+    Unit test files (*Test.java, *_test.py, *.test.ts, *Spec.*)
+    Integration test files (*IT.java, *Integration*, test_integration_*)
+    BDD / Feature files (*.feature, *.story)
+    Test configuration (application-test.yml, conftest.py, jest.config.*)
+    Test fixtures / data files (*.json, *.xml, *.csv under test/resources)
+
+  Group E — Documentation
+    README.md and all *.md files
+    OpenAPI / Swagger spec (openapi.yaml, swagger.json, api-docs.yaml)
+    Architecture decision records (docs/adr/)
+    CHANGELOG.md
+
+  Group F — Build & Dependency Management
+    build.gradle / build.gradle.kts / settings.gradle
+    pom.xml
+    package.json / package-lock.json / yarn.lock
+    requirements.txt / Pipfile / poetry.lock
+    go.sum / go.mod
+    Cargo.toml / Cargo.lock
+
+COMPUTE METRICS:
+  total_files             ← total count
+  source_file_count       ← Group A count
+  test_file_count         ← Group D count
+  config_file_count       ← Group B count
+  test_to_source_ratio    ← test_file_count / source_file_count (as percentage)
+  largest_files           ← top 5 by line count (name + line count)
+  directory_depth         ← max depth of directory tree
+```
+
+### 1.3 — Language & Framework Detection
+
+```
+LANGUAGE DETECTION:
+  Primary language  ← extension with highest source file count
+  Secondary languages ← other extensions present in Group A
+
+FRAMEWORK DETECTION — match dependency files:
+
+  ┌─────────────────┬──────────────────────────────────────────────────────┐
+  │ Signal File      │ Dependency Keywords to Scan For                     │
+  ├─────────────────┼──────────────────────────────────────────────────────┤
+  │ build.gradle /  │ spring-boot, spring-web, spring-data, spring-kafka,  │
+  │ pom.xml         │ spring-batch, spring-cloud, spring-security,         │
+  │                 │ spring-actuator, micrometer, resilience4j,           │
+  │                 │ hibernate, flyway, liquibase, quartz, camel          │
+  ├─────────────────┼──────────────────────────────────────────────────────┤
+  │ package.json    │ express, nest, next, react, vue, angular, fastify,   │
+  │                 │ hapi, koa, bull, kafkajs, typeorm, sequelize,        │
+  │                 │ mongoose, prisma, jest, mocha, cypress               │
+  ├─────────────────┼──────────────────────────────────────────────────────┤
+  │ requirements.   │ fastapi, flask, django, celery, sqlalchemy, pydantic,│
+  │ txt / Pipfile   │ airflow, prefect, luigi, kafka-python, boto3,        │
+  │                 │ pytest, httpx, alembic                               │
+  ├─────────────────┼──────────────────────────────────────────────────────┤
+  │ go.mod          │ gin, echo, fiber, chi, grpc-go, sarama, gorm,        │
+  │                 │ ent, viper, cobra, testify                           │
+  ├─────────────────┼──────────────────────────────────────────────────────┤
+  │ *.csproj        │ Microsoft.AspNetCore, EntityFramework, MassTransit,  │
+  │                 │ Dapper, AutoMapper, Serilog, xUnit, NUnit            │
+  └─────────────────┴──────────────────────────────────────────────────────┘
+
+  CROSS-LANGUAGE SIGNAL DETECTION:
+    Kafka         ← kafka in deps OR @KafkaListener OR consumer.subscribe()
+    RabbitMQ      ← rabbitmq OR @RabbitListener OR channel.consume()
+    SQS/SNS       ← aws-sqs OR @SqsListener OR SqsClient
+    Redis         ← redis OR @Cacheable OR RedisTemplate OR redis.get()
+    gRPC          ← .proto files present OR grpc in deps
+    GraphQL       ← .graphql files OR graphql in deps OR @GraphQLQuery
+    OpenAPI       ← openapi.yaml OR swagger.json OR springdoc in deps
+    Database      ← datasource.url OR DATABASE_URL OR connection string config
+    Observability ← @Timed OR prometheus_client OR micrometer OR otel
+```
+
+---
+
+## 🏷️ PART 2 — Architectural Taxonomy & Classification
+
+> Produce the taxonomy table first, then the rationale block.
+
+### Output: Taxonomy Table
+
+```markdown
+## Part 2 — Architectural Taxonomy
+
+### [REPO-1: component_name]
+
+| Dimension      | Classification                    | Confidence | Key Evidence |
+|----------------|-----------------------------------|------------|--------------|
+| Category       | [Custom / COTS / Hybrid / OSS]    | [H/M/L]    | [file:signal] |
+| Sub-Category   | [Web Service / Messaging / Batch  | [H/M/L]    | [file:signal] |
+|                |  / Data Pipeline / UI / Library / |            |              |
+|                |  CLI / IaC]                       |            |              |
+| Type           | [Microservice / Monolith /        | [H/M/L]    | [file:signal] |
+|                |  Serverless / Worker / Gateway /  |            |              |
+|                |  Sidecar / Monorepo]              |            |              |
+| Deployment     | [Container / Serverless / VM /    | [H/M/L]    | [file:signal] |
+|                |  Bare-metal / Unknown]            |            |              |
+| Orchestration  | [Kubernetes / OpenShift / ECS /   | [H/M/L]    | [file:signal] |
+|                |  Nomad / None]                    |            |              |
+```
+
+### Category Decision Rules
+
+```
+IF   no vendor license files, no vendor SDK jars, no proprietary configs
+→    CUSTOM
+
+ELIF primary code base is vendor product configuration / extension
+→    COTS  (e.g., Salesforce, ServiceNow, SAP)
+
+ELIF mix of in-house code wrapping a licensed SDK / platform
+→    HYBRID
+
+ELIF purely deploying an open-source product with zero custom source
+→    OPEN-SOURCE-DEPLOYMENT
+```
+
+### Sub-Category Decision Rules
+
+```
+Web Application / Service:
+  @RestController OR @GetMapping OR router.get() OR [HttpGet]
+  + HTTP framework in build deps
+  + Exposes HTTP port in config or Dockerfile
+
+Messaging / Event-Driven Service:
+  @KafkaListener OR @RabbitListener OR consumer.subscribe()
+  + No HTTP controller as PRIMARY interface
+
+Batch / Scheduled Processing:
+  @Scheduled OR @EnableBatchProcessing OR Spring Batch Step/Job config
+  + Cron expression dominant pattern
+
+Data Pipeline / ETL:
+  Extract → Transform → Load pattern in service layer
+  + Airflow DAGs / Prefect flows / Luigi tasks
+
+UI / Frontend Application:
+  Frontend framework in deps (React, Angular, Vue)
+  + public/ or static/ directory
+  + index.html entry point
+
+Library / SDK:
+  No main application entry point
+  + No Dockerfile or K8s manifests
+  + Published to artifact registry
+
+CLI Tool:
+  main() with argparse / cobra / click / picocli
+  + No server startup code
+
+Infrastructure / Platform:
+  Primarily *.tf / CDK / Helm chart-only repo
+  + No application source code
+```
+
+### Type Decision Rules
+
+```
+Microservice:
+  Single focused responsibility
+  + Own Dockerfile + K8s manifests
+  + Stateless (no local DB, no shared filesystem)
+
+Monolith:
+  Multiple distinct domains in one deployment unit
+  + Shared DB across layers
+  + May contain UI
+
+Worker / Consumer:
+  Subscribes to queue/topic as PRIMARY function
+  + Processes messages asynchronously
+
+Gateway / Proxy:
+  Routes, aggregates, or transforms requests
+  + Contains routing rules, filters, rate-limiting
+  + No direct business domain logic
+
+Serverless Function:
+  Single handler function
+  + Invoked by trigger (HTTP, event, schedule)
+  + No persistent server process
+
+Sidecar:
+  Injected alongside primary container
+  + Handles cross-cutting concern (logging, proxy, auth)
+```
+
+---
+
+## 💻 PART 3 — Technology Profile
+
+### Output: Technology Profile Table
+
+```markdown
+## Part 3 — Technology Profile
+
+### [REPO-1] | [REPO-2] Comparison
+
+| Dimension              | [REPO-1]                    | [REPO-2]                    |
+|------------------------|-----------------------------|-----------------------------|
+| Primary Language       | [derived]                   | [derived]                   |
+| Secondary Languages    | [derived]                   | [derived]                   |
+| Primary Framework      | [derived]                   | [derived]                   |
+| Secondary Frameworks   | [derived]                   | [derived]                   |
+| Build Tool             | [derived]                   | [derived]                   |
+| Runtime / JDK / Node   | [derived]                   | [derived]                   |
+| Package Manager        | [derived]                   | [derived]                   |
+| Test Frameworks        | [derived]                   | [derived]                   |
+| Containerized          | Yes / No + [Dockerfile ref] | Yes / No + [Dockerfile ref] |
+| Base Image             | [FROM line in Dockerfile]   | [FROM line]                 |
+| Orchestration Platform | [K8s/OpenShift/ECS/None]    | [derived]                   |
+| Service Mesh / Ingress | [detected or Absent]        | [detected or Absent]        |
+| Config Management      | [ConfigMap/Vault/Env/Props] | [derived]                   |
+| Secret Management      | [K8s Secret/Vault/Absent]   | [derived]                   |
+| Logging Framework      | [derived]                   | [derived]                   |
+| Metrics                | [Micrometer/Prometheus/None]| [derived]                   |
+| Tracing                | [OTel/Sleuth/Jaeger/None]   | [derived]                   |
+| Health Checks          | [endpoint path or Absent]   | [derived]                   |
+| Message Broker         | [Kafka/Rabbit/SQS/None]     | [derived]                   |
+| Database               | [type or None]              | [derived]                   |
+| Cache                  | [Redis/Memcached/None]      | [derived]                   |
+| API Style              | [REST/gRPC/GraphQL/None]    | [derived]                   |
+| API Documentation      | [OpenAPI/Swagger/None]      | [derived]                   |
+```
+
+> **Single-repo mode:** Render one column only. Remove comparison header.
+
+---
+
+## 🌊 PART 4 — Data Flow Analysis
+
+> Map every data movement in and out of the component — from source to sink.
+> This is the most critical new section. Trace actual code paths, not assumptions.
+
+### 4.1 — Data Source Discovery
+
+```
+SCAN FOR ALL DATA SOURCES (what feeds data INTO this component):
+
+  HTTP Inbound:
+    Scan all controller / handler classes
+    For each endpoint: capture path, method, request body type, request params
+    Source: [ClassName:methodName] → Request DTO class name
+
+  Message Queue / Topic Inbound:
+    @KafkaListener(topics="...") → topic name + message type
+    @RabbitListener(queues="...") → queue name + message type
+    @SqsListener → queue URL pattern + message type
+
+  Database Read:
+    repository.findBy*() / SELECT queries / JPA @Query
+    → table/entity name, query pattern, called from which service method
+
+  Cache Read:
+    @Cacheable / redisTemplate.get() / cache.get()
+    → cache name / key pattern, what data is cached
+
+  File / Object Storage Read:
+    File.read() / S3Client.getObject() / BlobServiceClient.downloadContent()
+    → file path pattern or bucket/container name
+
+  External HTTP Call (upstream):
+    RestTemplate / WebClient / Axios / requests / httpx calls
+    → target URL pattern, response type
+
+  Scheduled Data Injection:
+    @Scheduled method that reads data → what it reads, from where
+
+  Environment / Config Data:
+    @Value / process.env / os.environ / config.get()
+    → config key names (not values), source file
+```
+
+### 4.2 — Data Sink Discovery
+
+```
+SCAN FOR ALL DATA SINKS (where data LEAVES this component):
+
+  HTTP Response:
+    Return type of each controller method → response body DTO class
+    HTTP status codes set explicitly
+
+  Message Queue / Topic Outbound:
+    KafkaTemplate.send() → topic name, message type
+    RabbitTemplate.convertAndSend() → exchange/queue, message type
+    SqsClient.sendMessage() → queue URL pattern, message type
+
+  Database Write:
+    repository.save() / INSERT / UPDATE queries
+    → table/entity name, written by which service method
+
+  Cache Write:
+    @CachePut / @CacheEvict / redisTemplate.set()
+    → cache name / key pattern, TTL if specified
+
+  File / Object Storage Write:
+    File.write() / S3Client.putObject() / BlobServiceClient.uploadContent()
+    → path pattern or bucket/container name
+
+  External HTTP Call (fire-and-forget / downstream notification):
+    POST/PUT to external service with no response dependency
+
+  Event / Webhook Publish:
+    ApplicationEventPublisher.publishEvent()
+    → event class name
+
+  Log Output:
+    Structured logging sinks (Splunk, ELK, CloudWatch)
+    → derived from logback/log4j appender config or logging dependency
+```
+
+### 4.3 — Data Flow Table
+
+```markdown
+## Part 4 — Data Flow Analysis
+
+### 4A. Inbound Data Sources
+
+| ID    | Source Type  | Source Name / Path         | Data Format    | Receiving Class:Method       | Data Model Class  |
+|-------|-------------|----------------------------|----------------|------------------------------|-------------------|
+| DS-01 | HTTP POST   | [endpoint path]            | JSON / XML / ? | [Controller:method]          | [DTO class name]  |
+| DS-02 | Kafka Topic | [topic name]               | JSON / Avro /? | [Listener class:method]      | [Message class]   |
+| DS-03 | Database    | [table / entity name]      | JDBC / JPA     | [Repository:findBy*]         | [Entity class]    |
+| DS-04 | Cache       | [cache name / key pattern] | Serialized     | [Service:method]             | [Cached type]     |
+| DS-05 | Config      | [config key names]         | Scalar / YAML  | [@Value field / config class]| [type]            |
+| DS-06 | File/S3     | [path / bucket pattern]    | [format]       | [Class:method]               | [type]            |
+| ...   | ...         | ...                        | ...            | ...                          | ...               |
+```
+
+```markdown
+### 4B. Outbound Data Sinks
+
+| ID    | Sink Type    | Target Name / Path         | Data Format    | Publishing Class:Method      | Data Model Class  |
+|-------|-------------|----------------------------|----------------|------------------------------|-------------------|
+| SK-01 | HTTP Response| [endpoint path]            | JSON / XML / ? | [Controller:method]          | [DTO class name]  |
+| SK-02 | Kafka Topic | [topic name]               | JSON / Avro /? | [Producer class:method]      | [Message class]   |
+| SK-03 | Database    | [table / entity name]      | JDBC / JPA     | [Repository:save()]          | [Entity class]    |
+| SK-04 | Cache       | [cache name / key pattern] | Serialized     | [@CachePut / template.set()] | [Cached type]     |
+| SK-05 | Log Sink    | [appender/sink name]       | Structured JSON| [Logger usage across classes]| [Log fields]      |
+| SK-06 | Event       | [event class name]         | Java Object    | [Publisher:publishEvent()]   | [Event class]     |
+| ...   | ...         | ...                        | ...            | ...                          | ...               |
+```
+
+### 4.4 — End-to-End Data Flow Diagram (Text-Based)
+
+```
+GENERATE A TEXT FLOW DIAGRAM FOR EACH MAJOR USE CASE FLOW:
+
+FORMAT (Mermaid-compatible):
+
+```mermaid
+flowchart LR
+    A([External Actor / System]) -->|HTTP POST /path\nRequestDTO| B[Controller:method]
+    B -->|calls| C[ServiceLayer:method]
+    C -->|reads| D[(Cache: cacheName)]
+    D -->|miss| E[(Database: tableName)]
+    C -->|calls| F[ValidatorClass:validate]
+    F -->|invalid| G([ErrorResponse: errorCode])
+    C -->|publishes| H([Kafka Topic: topicName\nMessageDTO])
+    C -->|returns| I([HTTP Response: ResponseDTO])
+```
+
+RULES FOR DIAGRAM GENERATION:
+  - One diagram per major UC (UC-1, UC-2, etc.)
+  - Use exact class names and method names from source
+  - Show the complete path from entry to all outputs including error paths
+  - Label every arrow with the data type / DTO class being passed
+  - Use subgraph for grouping internal layers (Controller / Service / Data)
+  - If a flow cannot be fully traced, add a node: [UNKNOWN: reason]
+```
+
+### 4.5 — Data Model Inventory
+
+```markdown
+### 4C. Data Model Inventory
+
+| Model Class      | Role           | Fields (key ones)            | Used In (DS/SK IDs) | Source File          |
+|------------------|----------------|------------------------------|---------------------|----------------------|
+| [ClassName]      | Request DTO    | [field1, field2, ...]        | DS-01               | [file path]          |
+| [ClassName]      | Response DTO   | [field1, field2, ...]        | SK-01               | [file path]          |
+| [ClassName]      | Entity / Model | [field1, field2, ...]        | DS-03, SK-03        | [file path]          |
+| [ClassName]      | Message DTO    | [field1, field2, ...]        | DS-02, SK-02        | [file path]          |
+| [ClassName]      | Config DTO     | [field1, field2, ...]        | DS-05               | [file path]          |
+```
+
+```
+DERIVE THIS TABLE BY:
+  - Scanning all @RequestBody parameter types in controllers
+  - Scanning all ResponseEntity<T> generic types
+  - Scanning all @Entity / @Document / @Table classes
+  - Scanning all @KafkaListener method parameter types
+  - Scanning all KafkaTemplate.send(topic, T) type arguments
+  - Scanning all @ConfigurationProperties classes
+  For each: list the class name, its package, its key field names
+  (public fields, @JsonProperty fields, JPA @Column fields)
+```
+
+---
+
+## 🔄 PART 5 — CI/CD Pipeline Analysis
+
+> Analyze every CI/CD pipeline file found in Phase 1.2 Group C.
+> Map stages, environments, gates, and deployment targets.
+
+### 5.1 — Pipeline File Inventory
+
+```
+FOR EACH pipeline file found:
+  Identify tool: GitHub Actions / GitLab CI / Jenkins / Azure DevOps /
+                 CircleCI / Bitbucket Pipelines / Makefile-driven
+  Read all stages / jobs / steps defined
+  Extract: trigger conditions, environment targets, deploy commands,
+           test commands, quality gate commands, approval gates
+```
+
+### 5.2 — Pipeline Stage Table
+
+```markdown
+## Part 5 — CI/CD Pipeline Analysis
+
+### 5A. Pipeline Overview
+
+| Attribute          | [REPO-1]                         | [REPO-2]                         |
+|--------------------|----------------------------------|----------------------------------|
+| CI/CD Tool         | [derived]                        | [derived]                        |
+| Pipeline File(s)   | [file paths]                     | [file paths]                     |
+| Trigger: Push      | [branch names or Absent]         | [derived]                        |
+| Trigger: PR/MR     | [Yes + target branches or Absent]| [derived]                        |
+| Trigger: Schedule  | [cron or Absent]                 | [derived]                        |
+| Trigger: Manual    | [Yes / Absent]                   | [derived]                        |
+| Trigger: Tag       | [pattern or Absent]              | [derived]                        |
+| Environments       | [list: dev/qa/uat/prod or names] | [derived]                        |
+| Parallel Jobs      | [Yes/No + count]                 | [derived]                        |
+| Approval Gates     | [Yes/No + at which stage]        | [derived]                        |
+| Secrets Used       | [secret names only, not values]  | [derived]                        |
+| Total Stages/Jobs  | [N]                              | [N]                              |
+```
+
+### 5.3 — Per-Stage Detail Table
+
+```markdown
+### 5B. Stage / Job Detail
+
+| Stage # | Stage Name      | Trigger Condition    | Runner / Agent  | Key Commands / Actions                         | Outputs / Artifacts       | Gate Type   |
+|---------|-----------------|----------------------|-----------------|------------------------------------------------|---------------------------|-------------|
+| S-01    | [name]          | [push to branch X]   | [runner label]  | [mvn test / npm test / pytest / etc.]          | [test-results.xml / none] | Automated   |
+| S-02    | [name]          | [on S-01 success]    | [runner label]  | [docker build / mvn package]                   | [image tag / jar file]    | Automated   |
+| S-03    | [name]          | [on S-02 success]    | [runner label]  | [docker push / helm upgrade / kubectl apply]   | [deployment]              | Automated   |
+| S-04    | [name]          | [manual approval]    | [runner label]  | [helm upgrade --set image.tag=$TAG]            | [prod deployment]         | Manual Gate |
+| ...     | ...             | ...                  | ...             | ...                                            | ...                       | ...         |
+```
+
+```
+DERIVE EACH COLUMN:
+  Stage Name    ← jobs.[name] or stages: list entry or stage: block name
+  Trigger       ← on: / only: / when: conditions at job level
+  Runner        ← runs-on: / tags: / agent label
+  Commands      ← steps[*].run or steps[*].uses with key arguments
+  Outputs       ← artifacts: / cache: / produces: blocks
+  Gate Type     ← "Manual Gate" if environment.protection_rules or
+                  when: manual or input: is required
+                  Otherwise "Automated"
+```
+
+### 5.4 — Quality Gates Extracted from Pipeline
+
+```markdown
+### 5C. Quality Gates in Pipeline
+
+| Gate ID | Stage | Type                    | Tool / Command                      | Fail Condition                    | Blocks Deployment To |
+|---------|-------|-------------------------|-------------------------------------|-----------------------------------|----------------------|
+| QG-01   | S-01  | Unit Tests              | [mvn test / pytest / jest]          | Any test failure                  | All environments     |
+| QG-02   | S-01  | Code Coverage           | [jacoco / coverage.py / istanbul]   | Coverage < [threshold if found]   | All environments     |
+| QG-03   | S-02  | Static Analysis         | [sonar / checkstyle / pylint / eslint]| Quality gate failure             | All environments     |
+| QG-04   | S-02  | Dependency Scan         | [owasp / snyk / trivy]              | Critical CVE found                | All environments     |
+| QG-05   | S-03  | Integration Tests       | [karate / postman / testcontainers] | Any scenario failure              | UAT / Prod           |
+| QG-06   | S-04  | Manual Approval         | [person / team name if specified]   | Not approved                      | Production           |
+| ...     | ...   | ...                     | ...                                 | ...                               | ...                  |
+```
+
+### 5.5 — Deployment Target Map
+
+```markdown
+### 5D. Deployment Target Map
+
+| Environment | Deployment Method          | Target Platform           | Triggered By           | Image / Artifact Tag Strategy    |
+|-------------|----------------------------|---------------------------|------------------------|----------------------------------|
+| [dev]       | [helm upgrade / kubectl]   | [namespace / cluster]     | [push to dev branch]   | [commit SHA / latest / semver]   |
+| [qa]        | [derived]                  | [derived]                 | [derived]              | [derived]                        |
+| [uat]       | [derived]                  | [derived]                 | [manual / PR merge]    | [derived]                        |
+| [prod]      | [derived]                  | [derived]                 | [manual gate + tag]    | [derived]                        |
+```
+
+### 5.6 — Pipeline Data Flow Diagram
+
+```
+GENERATE FOR EACH REPO:
+
+```mermaid
+flowchart LR
+    subgraph TRIGGER
+        A([Push to branch]) 
+        B([PR / MR])
+        C([Git Tag])
+        D([Schedule])
+        E([Manual])
+    end
+    subgraph BUILD
+        F[Build & Compile]
+        G[Unit Tests]
+        H[Code Coverage]
+        I[Static Analysis]
+        J[Dependency Scan]
+    end
+    subgraph PACKAGE
+        K[Build Container Image]
+        L[Push to Registry]
+    end
+    subgraph DEPLOY_DEV
+        M[Deploy to DEV]
+    end
+    subgraph DEPLOY_QA
+        N[Integration Tests]
+        O[Deploy to QA]
+    end
+    subgraph DEPLOY_PROD
+        P{Manual Gate}
+        Q[Deploy to PROD]
+    end
+
+    A --> F
+    B --> F
+    C --> F
+    D --> F
+    E --> P
+    F --> G --> H --> I --> J
+    J -->|all gates pass| K --> L
+    L --> M
+    M -->|tests pass| O --> N
+    N -->|pass| P
+    P -->|approved| Q
+```
+
+NOTE: Replace stage names with EXACT stage names from the actual pipeline files.
+      Add or remove stages to match what's actually found.
+      If a stage is NOT found, do not include it in the diagram.
+```
+
+---
+
+## 🗂️ PART 6 — Functional Capabilities Summary
+
+### 6.1 — Entry Point Discovery Rules
+
+```
+SCAN FOR ALL ENTRY POINTS (these become FC rows):
+
+  HTTP / REST:
+    Java:   @GetMapping, @PostMapping, @PutMapping, @DeleteMapping,
+            @PatchMapping, @RequestMapping on @RestController classes
+    Python: @app.get(), @app.post(), @router.get(), @router.post()
+    Node:   router.get(), router.post(), app.get(), app.use()
+    Go:     r.GET(), r.POST(), group.POST()
+    .NET:   [HttpGet], [HttpPost], [Route] on [ApiController]
+    → Capture: HTTP method + path + handler class:method
+
+  Messaging:
+    @KafkaListener(topics=) → topic name, group ID, handler method
+    @RabbitListener(queues=) → queue name, handler method
+    @SqsListener, @StreamListener
+    → Capture: protocol + topic/queue name + handler class:method
+
+  Scheduled:
+    @Scheduled(cron=) or @Scheduled(fixedRate=) or @Scheduled(fixedDelay=)
+    → Capture: cron expression or interval + method name
+
+  Events:
+    @EventListener / ApplicationListener<EventClass>
+    → Capture: event class name + handler method
+
+  gRPC:
+    .proto service RPC definitions
+    → Capture: service name + RPC method names
+
+  GraphQL:
+    Query / Mutation / Subscription resolvers
+    → Capture: operation name + resolver class:method
+```
+
+### 6.2 — FC Table Output
+
+```markdown
+## Part 6 — Functional Capabilities Summary
+
+| FC-ID | Capability Name   | Entry Point                    | Type      | Description                        | Handler Class:Method       |
+|-------|-------------------|--------------------------------|-----------|------------------------------------|----------------------------|
+| FC-01 | [derived]         | POST /[path]                   | API       | [derived from method/doc]          | [ClassName:methodName]     |
+| FC-02 | [derived]         | GET /[path]                    | API       | [derived]                          | [ClassName:methodName]     |
+| FC-03 | [derived]         | TOPIC: [topic-name]            | CONSUMER  | [derived]                          | [ClassName:methodName]     |
+| FC-04 | [derived]         | @Scheduled([expr])             | SYSTEM    | [derived]                          | [ClassName:methodName]     |
+| FC-05 | [derived]         | [EventClass]                   | INTERNAL  | [derived]                          | [ClassName:methodName]     |
+| ...   | ...               | ...                            | ...       | ...                                | ...                        |
+```
+
+```
+TYPE VALUES:
+  API       → HTTP endpoint callable externally
+  CONSUMER  → Message queue / topic listener
+  SYSTEM    → Scheduled / automated, not externally callable
+  INTERNAL  → Called only from within same process
+  CLI       → Command-line invokable
+  GRPC      → gRPC service method
+  GRAPHQL   → GraphQL resolver operation
+```
+
+---
+
+## 📘 PART 7 — Use Case Catalog
+
+> One UC card per FC entry. If a single FC handles multiple distinct behavioral
+> variants (different input discriminators → different code paths), create
+> UC-[N]a, UC-[N]b, etc.
+
+### 7.1 — UC Card Construction Rules
+
+```
+FOR EACH FC ROW, derive the following UC attributes:
+
+  Actor:
+    DERIVE FROM (priority order):
+      1. OpenAPI @Operation(summary) or Swagger @Api(tags) on controller
+      2. @CrossOrigin allowed origins
+      3. Kafka consumer group ID → name of consuming service
+      4. Integration test setup: who/what is simulated as caller
+      5. README "Used By" or "Consumers" section
+      6. If none: "Undetermined — see [controller file]"
+
+  Precondition:
+    DERIVE FROM:
+      - @Valid / @Validated on request body → structural validity required
+      - Guard clauses at method start: if (x == null) throw / return error
+      - @PreAuthorize / security filter chain → auth requirement
+      - @RequestParam(required=true) → required query params
+      - Kafka: what state must exist before consumer processes message
+
+  Flow (trace execution chain):
+    STEP 1: Entry point (controller/handler receives input)
+    STEP 2: Input parsing (what DTO is bound / deserialized)
+    STEP 3: Validation layer (which validators are called, in what order)
+    STEP 4: Business logic (which service methods are called)
+    STEP 5: Data access (repository calls / cache reads / external HTTP)
+    STEP 6: Response construction (what is built and returned)
+
+    FORMAT: "[EntryClass:method] → [ValidatorClass:method] → [ServiceClass:method]
+             → [RepositoryClass:method] → [ResponseDTO class]"
+    Use + for parallel, → for sequential, branch with IF labels
+
+  Postcondition:
+    DERIVE FROM:
+      - Return type of handler method
+      - ResponseEntity<T> type argument
+      - @ResponseStatus annotation value
+      - What state is changed (cache updated, DB written, event published)
+      - Test assertion patterns (assertThat response...)
+
+  Error Paths:
+    DERIVE FROM:
+      - catch blocks in controller and service
+      - @ExceptionHandler methods in @ControllerAdvice / @RestControllerAdvice
+      - Custom exception class names and their HTTP mappings
+      - Error code constants / enums
+      - Failure scenario tests
+    FORMAT: "[Trigger condition] → [ExceptionClass / error code] → [HTTP status]"
+
+  Data In / Data Out:
+    Reference DS-IDs and SK-IDs from Part 4 tables
+    "[DS-01, DS-05] → processing → [SK-01, SK-02]"
+```
+
+### 7.2 — UC Card Output Format
+
+```markdown
+## Part 7 — Use Case Catalog
+
+---
+
+### UC-01: [Capability Name]
+
+| Attribute     | Value                                                                     |
+|---------------|---------------------------------------------------------------------------|
+| FC Reference  | FC-01                                                                     |
+| Actor         | [derived value]                                                           |
+| Precondition  | [derived value]                                                           |
+| Data In       | [DS-IDs] — [DTO class name] via [protocol]                               |
+| Flow          | [ExactClass:method] → [ExactClass:method] → [ExactClass:method]          |
+| Data Out      | [SK-IDs] — [DTO class name] via [protocol]                               |
+| Postcondition | [derived value]                                                           |
+| Error Paths   | [condition] → [error code / exception] → [HTTP status or behavior]       |
+| Source Files  | [file1, file2, file3]                                                     |
+
+---
+```
+
+---
+
+## ✅ PART 8 — Acceptance Criteria Matrix
+
+### 8.1 — Criteria Derivation Rules
+
+```
+FOR EACH UC, derive criteria from these sources IN ORDER:
+
+  PRIMARY — BDD Feature files (*.feature):
+    Extract each Scenario / Scenario Outline as one criterion row
+    Given = the Given: step(s)
+    When  = the When: step(s)
+    Then  = the Then: step(s)
+    Map to UC by: URL path in step, discriminator field value, scenario tag
+
+  SECONDARY — Unit / Integration test method names:
+    Java: @Test void should[Verb][Condition]()
+    Python: def test_[condition]_[expected]
+    JS: it("should [condition]", ...)
+    → Translate method name to Given/When/Then language
+
+  TERTIARY — Exception handlers + error codes (inferred):
+    If error code exists and no test covers it:
+    Given: [system in valid state]
+    When:  [condition that triggers the error]
+    Then:  [error code returned]
+    Source: INFERRED — [ExceptionClass:source]
+    Status: NOT COVERED
+```
+
+### 8.2 — Criteria Table Output
+
+```markdown
+## Part 8 — Acceptance Criteria Matrix
+
+| AC-ID  | UC    | Given                        | When                            | Then                                  | Source                        | Status      |
+|--------|-------|------------------------------|---------------------------------|---------------------------------------|-------------------------------|-------------|
+| AC-001 | UC-01 | [precondition / system state]| [action / input]                | [expected outcome]                    | [feature file / test method]  | COVERED     |
+| AC-002 | UC-01 | [state]                      | [action]                        | [outcome]                             | INFERRED — [ExceptionClass]   | NOT COVERED |
+| AC-003 | UC-02 | [state]                      | [action]                        | [outcome]                             | [test file:testMethodName]    | PARTIAL     |
+| ...    | ...   | ...                          | ...                             | ...                                   | ...                           | ...         |
+```
+
+```
+STATUS VALUES:
+  COVERED     = Criterion has a passing automated test
+  PARTIAL     = Test exists but covers only happy path, not all branches
+  NOT COVERED = No test found for this criterion
+  INFERRED    = Criterion derived from code but has no test at all
+```
+
+---
+
+## 🧪 PART 9 — Test Coverage Mapping
+
+### 9.1 — Test File Scan Rules
+
+```
+FOR EACH test file discovered in Phase 1.2 Group D:
+  Identify: framework (JUnit5 / pytest / Jest / Karate / Cucumber / etc.)
+  Count: test methods / scenarios
+  Classify: Unit / Integration / BDD / E2E / Contract
+  Map to UC: by inspecting which controller/service/endpoint is under test
+
+  MAPPING HEURISTICS:
+    Unit test class name = [TestedClass]Test → maps to UCs using that class
+    Integration test = calls HTTP endpoint path → maps to FC with that path
+    Feature file = step contains URL path or domain keyword → maps to that UC
+    If unmappable: mark as "Coverage Scope Undetermined"
+```
+
+### 9.2 — Coverage Table Output
+
+```markdown
+## Part 9 — Test Coverage Mapping
+
+### 9A. Test File Inventory
+
+| Test File (path)           | Framework   | Type        | Test Count | Maps To UCs    |
+|----------------------------|-------------|-------------|------------|----------------|
+| [path/to/file]             | JUnit 5     | Unit        | [N]        | UC-01, UC-02   |
+| [path/to/file]             | Karate      | BDD         | [N]        | UC-01          |
+| [path/to/file]             | Karate      | Integration | [N]        | UC-03, UC-04   |
+| [path/to/file]             | JUnit 5     | Unit        | [N]        | UC-05          |
+| ...                        | ...         | ...         | ...        | ...            |
+
+### 9B. UC Coverage Summary
+
+| UC-ID | UC Name         | Unit Test | Integration Test | BDD / Feature | Coverage Type       | Status        |
+|-------|-----------------|-----------|-----------------|---------------|---------------------|---------------|
+| UC-01 | [name]          | ✅ [N]    | ✅ [N]          | ✅ [N]        | Full Stack          | FULLY COVERED |
+| UC-02 | [name]          | ✅ [N]    | ⚠️ Absent       | ✅ [N]        | Unit + BDD only     | PARTIAL       |
+| UC-03 | [name]          | ⚠️ Absent | ⚠️ Absent       | ⚠️ Absent     | None                | ⛔ NOT COVERED|
+| ...   | ...             | ...       | ...             | ...           | ...                 | ...           |
+
+### 9C. Coverage Statistics
+
+| Metric                           | Value                            |
+|----------------------------------|----------------------------------|
+| Total UCs                        | [N]                              |
+| Fully Covered UCs                | [N] ([%])                        |
+| Partially Covered UCs            | [N] ([%])                        |
+| Not Covered UCs                  | [N] ([%])                        |
+| Weighted Coverage Score          | [computed: full=1, partial=0.5]  |
+| Total BDD Feature Files          | [N]                              |
+| Total BDD Scenarios              | [N]                              |
+| Total Unit Test Files            | [N]                              |
+| Total Unit Test Methods          | [N]                              |
+| Total Integration Test Files     | [N]                              |
+| Total Test Data Fixtures         | [N] ([names])                    |
+```
+
+---
+
+## 🔗 PART 10 — Requirements Traceability
+
+### 10.1 — Requirement Extraction Rules
+
+```
+SOURCES IN PRIORITY ORDER:
+  1. Explicit requirements section in README
+  2. Source code comments: //REQ:, //RULE:, //BIZ:, //JIRA-NNN
+  3. Validator class names → derive requirement statement
+  4. Error code constants → each represents an enforceable rule
+  5. BDD feature file names and Scenario titles
+  6. Acceptance test class names
+
+ASSIGNMENT:
+  REQ-001, REQ-002, ... (sequential)
+  If source has own ID (JIRA key, REQ-NNN comment), preserve it.
+
+CHAIN CONSTRUCTION PER REQUIREMENT:
+  REQ → UC(s) that exercise it
+       → Validator/Enforcer class:method that enforces it
+       → Error Code produced on violation
+       → BDD Feature / Test that covers it
+  
+CHAIN STATUS:
+  FULL    = all four links present
+  PARTIAL = 1–2 links missing
+  BROKEN  = validator present but never called from any UC, OR
+            test covers behavior that has no source code implementation
+```
+
+### 10.2 — Traceability Table Output
+
+```markdown
+## Part 10 — Requirements Traceability
+
+| REQ-ID  | Requirement Statement               | UC(s)       | Enforcer Class:Method          | Error Code(s)           | Test / Feature File              | Status  |
+|---------|-------------------------------------|-------------|--------------------------------|-------------------------|----------------------------------|---------|
+| REQ-001 | [derived requirement statement]     | UC-01..04   | [ValidatorClass:method]        | `[error.code]`          | [feature file name]              | FULL    |
+| REQ-002 | [derived]                           | UC-01..04   | [ValidatorClass:method]        | `[error.code]`          | —                                | PARTIAL |
+| REQ-003 | [derived]                           | UC-03       | [ValidatorClass:method]        | `[error.code]`          | [feature file]                   | FULL    |
+| REQ-004 | [derived]                           | —           | [ValidatorClass:method]        | `[error.code]`          | —                                | BROKEN  |
+| ...     | ...                                 | ...         | ...                            | ...                     | ...                              | ...     |
+
+### Traceability Summary
+
+| Status  | Count | Percentage |
+|---------|-------|------------|
+| FULL    | [N]   | [%]        |
+| PARTIAL | [N]   | [%]        |
+| BROKEN  | [N]   | [%]        |
+| Total   | [N]   | 100%       |
+```
+
+---
+
+## 📏 PART 11 — Validation & Business Rules
+
+### 11.1 — Rule Discovery Sources
+
+```
+SCAN THESE IN ORDER:
+
+  1. Classes named *Validator, *Rule, *Check, *Guard, *Policy, *Filter
+  2. Classes implementing Validator<T>, ConstraintValidator<A,T>
+  3. Bean validation annotations: @NotNull, @NotEmpty, @Size, @Min, @Max,
+     @Pattern, @Email, @Future, @Past, @AssertTrue — on which field / class
+  4. Service layer if/else branches with throw / error accumulation patterns
+  5. Constants / Enum files: *ErrorCode, *ValidationCode, *RuleCode, *MessageCode
+  6. i18n files: messages.properties, errors.properties, ValidationMessages.properties
+     → extract key=value pairs (key = error code, value = message)
+  7. Configuration-driven rules: rules loaded from external config / DB / cache
+     → identify config source, how it's applied, which class uses it
+
+ASSIGN: VR-001, VR-002, ... (preserve source-assigned IDs if present)
+```
+
+### 11.2 — Business Rules Table Output
+
+```markdown
+## Part 11 — Validation & Business Rules
+
+| VR-ID  | Rule Name                 | Trigger Condition           | Validation Logic                                  | Error Code           | HTTP Status | Source File:Class            |
+|--------|---------------------------|-----------------------------|---------------------------------------------------|----------------------|-------------|------------------------------|
+| VR-001 | [derived from class name] | [what triggers this check]  | [exact logic: field X must satisfy condition Y]   | `[error.code.string]`| [4xx/5xx]   | [file:ValidatorClass:method] |
+| VR-002 | [derived]                 | [trigger]                   | [logic]                                           | `[code]`             | [status]    | [file:class:method]          |
+| ...    | ...                       | ...                         | ...                                               | ...                  | ...         | ...                          |
+
+### Error Code Registry
+
+| Error Code                  | Human Message (from i18n)           | Produced By (VR-IDs) | Covered By Test |
+|-----------------------------|-------------------------------------|----------------------|-----------------|
+| `[error.code.string]`       | [message from messages.properties]  | VR-001               | ✅ / ⚠️ / ⛔    |
+| `[error.code.string]`       | [message or "NOT_MAPPED"]           | VR-002               | ✅ / ⚠️ / ⛔    |
+| ...                         | ...                                 | ...                  | ...             |
+```
+
+---
+
+## ⚕️ PART 12 — Code Quality & Maturity Scorecard
+
+### 12.1 — Signal Detection Rules
+
+```
+EVALUATE EACH SIGNAL:
+  ✅ Present and complete
+  ⚠️ Partial / present but incomplete
+  ⛔ Absent
+  ❓ Unknown (could not determine)
+```
+
+### 12.2 — Scorecard Output
+
+```markdown
+## Part 12 — Code Quality & Maturity Scorecard
+
+### 12A. Signal Matrix
+
+| Signal                     | [REPO-1] Status | [REPO-1] Detail                          | [REPO-2] Status | [REPO-2] Detail           | Points Each |
+|----------------------------|-----------------|------------------------------------------|-----------------|---------------------------|-------------|
+| Unit Tests Present         | ✅/⚠️/⛔        | [file count / note]                      | ✅/⚠️/⛔        | [note]                    | 1           |
+| Integration Tests Present  | ✅/⚠️/⛔        | [file count / note]                      | ✅/⚠️/⛔        | [note]                    | 1           |
+| BDD / Feature Tests        | ✅/⚠️/⛔        | [scenario count / note]                  | ✅/⚠️/⛔        | [note]                    | 1           |
+| Code Coverage Configured   | ✅/⚠️/⛔        | [tool: jacoco / coverage.py / istanbul]  | ✅/⚠️/⛔        | [note]                    | 1           |
+| README Quality             | ✅/⚠️/⛔        | [word count / sections present]          | ✅/⚠️/⛔        | [note]                    | 1           |
+| API Documentation          | ✅/⚠️/⛔        | [OpenAPI / Swagger / annotation-only]    | ✅/⚠️/⛔        | [note]                    | 1           |
+| Health Endpoint            | ✅/⚠️/⛔        | [endpoint path]                          | ✅/⚠️/⛔        | [note]                    | 1           |
+| Metrics Instrumentation    | ✅/⚠️/⛔        | [tool / annotation]                      | ✅/⚠️/⛔        | [note]                    | 1           |
+| Distributed Tracing        | ✅/⚠️/⛔        | [tool: OTel/Sleuth/Jaeger]               | ✅/⚠️/⛔        | [note]                    | 1           |
+| Structured Logging         | ✅/⚠️/⛔        | [logback JSON / log4j2 JSON / absent]    | ✅/⚠️/⛔        | [note]                    | 1           |
+| Config Externalized        | ✅/⚠️/⛔        | [no hardcoded URLs/IPs found]            | ✅/⚠️/⛔        | [note]                    | 1           |
+| Secrets Safe               | ✅/⚠️/⛔        | [no credential patterns in source]       | ✅/⚠️/⛔        | [note]                    | 1           |
+| Dependency Audit           | ✅/⚠️/⛔        | [OWASP / Snyk / Trivy in pipeline]       | ✅/⚠️/⛔        | [note]                    | 1           |
+| CI/CD Pipeline Present     | ✅/⚠️/⛔        | [tool name + file]                       | ✅/⚠️/⛔        | [note]                    | 1           |
+| Graceful Shutdown          | ✅/⚠️/⛔        | [PreDestroy / shutdown hook / signal]    | ✅/⚠️/⛔        | [note]                    | 1           |
+
+### 12B. Maturity Score
+
+| Repo       | Raw Score | Penalty (−1 per Critical Gap) | Final Score | Grade         |
+|------------|-----------|-------------------------------|-------------|---------------|
+| [REPO-1]   | [X / 15]  | [−N]                          | [Y / 15]    | [A/B/C/D/F]   |
+| [REPO-2]   | [X / 15]  | [−N]                          | [Y / 15]    | [A/B/C/D/F]   |
+```
+
+```
+GRADING SCALE:
+  13–15 = A  (Production-ready, high confidence)
+  10–12 = B  (Good, minor gaps)
+  7–9   = C  (Acceptable, notable gaps)
+  4–6   = D  (Significant gaps, deployment risk)
+  0–3   = F  (Critical gaps, not production-ready)
+```
+
+---
+
+## ⚠️ PART 13 — Gap Analysis
+
+### 13.1 — Gap Detection Rules by Category
+
+```
+RUN ALL CATEGORIES. For each gap found, assign a G-ID (G-001, G-002, ...).
+
+CAT-1: TEST COVERAGE GAPS
+  ⛔ UC has zero test coverage (any type)
+  ⚠️ UC has unit tests only — no integration or BDD
+  ⚠️ Error path has no test scenario covering it
+  ⚠️ Validator class has no test class
+
+CAT-2: DOCUMENTATION GAPS
+  ⛔ HTTP endpoint has no Javadoc/docstring AND no OpenAPI annotation
+  ⛔ No OpenAPI/Swagger spec for externally-consumed HTTP service
+  ⚠️ README absent or fewer than 100 words
+  ⚠️ Error code exists in source but has no i18n message
+  ⚠️ Request/response DTO has no field-level documentation
+
+CAT-3: ERROR HANDLING GAPS
+  ⛔ Exception thrown in service not caught by @ControllerAdvice
+  ⛔ Catch block that swallows exception silently
+  ⚠️ Error code constant defined but never used in any code path
+  ⚠️ Error code used in code but no matching constant (magic string)
+  ⚠️ No standardized error response body across endpoints
+
+CAT-4: BUSINESS RULE GAPS
+  ⛔ TODO / FIXME comment inside validator or service business logic
+  ⛔ Commented-out validation logic (security or compliance rule)
+  ⚠️ Partial rule implementation (method stub or empty body)
+  ⚠️ Error code in messages.properties not triggered by any code path
+  ⚠️ Rule referenced in test fixture not enforced in source code
+
+CAT-5: DATA FLOW GAPS
+  ⛔ Data source consumed but no validation / sanitization before use
+  ⛔ External HTTP call with no timeout / circuit breaker configuration
+  ⚠️ Response DTO leaks internal field names or stack traces
+  ⚠️ Cache used but no TTL or eviction policy found in config
+  ⚠️ Message consumer with no dead-letter queue configuration
+
+CAT-6: OBSERVABILITY GAPS
+  ⛔ HTTP endpoint with no request/response logging
+  ⛔ Error path with no log statement (silent failure)
+  ⚠️ No correlation / trace ID propagation in request handling
+  ⚠️ Business rule violation not emitted as metric or audit log
+  ⚠️ Health endpoint absent for container-deployed service
+
+CAT-7: CI/CD PIPELINE GAPS
+  ⛔ No CI/CD pipeline configuration found
+  ⛔ Pipeline has no test execution step
+  ⛔ Pipeline deploys to production with no manual gate
+  ⚠️ No dependency vulnerability scan in pipeline
+  ⚠️ No code coverage enforcement (threshold) in pipeline
+  ⚠️ Docker image built but not scanned for vulnerabilities
+  ⚠️ No artifact signing or SBOM generation
+
+CAT-8: TRACEABILITY GAPS
+  ⛔ Feature file test has no matching source implementation
+  ⚠️ Validator class exists but is not called from any entry point
+  ⚠️ Requirement implied by test but no code enforces it
+  ⚠️ Multiple UCs share a validator with no discriminator logic
+
+SEVERITY ASSIGNMENT:
+  CRITICAL = Production failure risk, security risk, or compliance risk
+  HIGH     = Reliability risk or significant functional gap
+  MEDIUM   = Quality or maintainability risk
+  LOW      = Minor improvement opportunity
+```
+
+### 13.2 — Gap Table Output
+
+```markdown
+## Part 13 — Gap Analysis
+
+| G-ID  | Repo     | Category   | Severity | Area / Component          | Finding                                          | Evidence (File:Class/Method)    | Recommended Action                       |
+|-------|----------|------------|----------|---------------------------|--------------------------------------------------|---------------------------------|------------------------------------------|
+| G-001 | [REPO-1] | CAT-3      | CRITICAL | [ExceptionClass]          | [exception thrown, not caught by ControllerAdvice]| [file:class:method]            | Add @ExceptionHandler in ControllerAdvice|
+| G-002 | [REPO-1] | CAT-1      | HIGH     | [UC-03]                   | [UC has zero test coverage]                      | [absence of test file]          | Add Karate / JUnit5 tests for UC-03      |
+| G-003 | [REPO-2] | CAT-7      | HIGH     | [Pipeline file]           | [no manual gate before prod deployment]          | [pipeline file:stage name]      | Add environment.protection_rules in GHA  |
+| ...   | ...      | ...        | ...      | ...                       | ...                                              | ...                             | ...                                      |
+
+### Gap Summary
+
+| Category              | Critical | High | Medium | Low | Total |
+|-----------------------|----------|------|--------|-----|-------|
+| CAT-1: Test Coverage  | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-2: Documentation  | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-3: Error Handling | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-4: Business Rules | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-5: Data Flow      | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-6: Observability  | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-7: CI/CD Pipeline | [N]      | [N]  | [N]    | [N] | [N]   |
+| CAT-8: Traceability   | [N]      | [N]  | [N]    | [N] | [N]   |
+| **TOTAL**             | **[N]**  |**[N]**|**[N]**|**[N]**|**[N]**|
+```
+
+---
+
+## 💡 PART 14 — Prioritized Recommendations
+
+### 14.1 — Recommendation Derivation Rules
+
+```
+GENERATE ONE RECOMMENDATION ROW PER GAP (G-001 → R-001, etc.)
+Order rows by: CRITICAL first, then HIGH, then MEDIUM, then LOW.
+Each recommendation must be specific enough that a developer knows
+WHAT to do, WHERE to do it, and WHY.
+
+FORMAT PER RECOMMENDATION:
+  What:   Exact action (e.g., "Add @ExceptionHandler for XyzException in GlobalExceptionHandler.java")
+  Where:  Specific file, class, or pipeline stage
+  Why:    Impact of not doing it (from gap finding)
+  Effort: S (< 1 day) / M (1–3 days) / L (> 3 days)
+```
+
+### 14.2 — Recommendations Table Output
+
+```markdown
+## Part 14 — Prioritized Recommendations
+
+| R-ID  | Priority | Gap Ref | What To Do                                                   | Where                            | Why (Impact)                              | Effort |
+|-------|----------|---------|--------------------------------------------------------------|----------------------------------|-------------------------------------------|--------|
+| R-001 | CRITICAL | G-001   | [specific action]                                            | [file / class / stage]           | [production impact if not done]           | S/M/L  |
+| R-002 | CRITICAL | G-002   | [specific action]                                            | [file / class / stage]           | [impact]                                  | S/M/L  |
+| R-003 | HIGH     | G-003   | [specific action]                                            | [file / class / stage]           | [impact]                                  | S/M/L  |
+| ...   | ...      | ...     | ...                                                          | ...                              | ...                                       | ...    |
+```
+
+---
+
+## 📊 PART 15 — Report Metadata & Statistics
+
+### 15.1 — Computed Metrics
+
+```
+COMPUTE ALL VALUES FROM EARLIER PHASES — NO ESTIMATES:
+
+Per Repo:
+  component_name, version, team_owner, primary_language, primary_framework
+  total_source_files, total_test_files, test_to_source_ratio
+  total_config_files, total_pipeline_files
+  pipeline_tools, pipeline_stage_count, environment_count
+  total_fc_rows, total_uc_cards, total_ac_criteria
+  total_requirements, total_validation_rules, total_error_codes
+  total_data_sources (DS count), total_data_sinks (SK count)
+  total_data_models
+  test_frameworks (list), bdd_feature_files, bdd_scenario_count
+  unit_test_files, unit_test_count
+  integration_test_files, test_fixture_files (names)
+  uc_fully_covered, uc_partially_covered, uc_not_covered, coverage_pct
+  req_full, req_partial, req_broken
+  gaps_critical, gaps_high, gaps_medium, gaps_low, gaps_total
+  maturity_score, maturity_grade
+  report_generated_at (ISO 8601)
+```
+
+### 15.2 — Metadata Table Output
+
+```markdown
+## Part 15 — Report Metadata & Statistics
+
+### 15A. Component Summary
+
+| Field                               | [REPO-1]                          | [REPO-2]                          |
+|-------------------------------------|-----------------------------------|-----------------------------------|
+| Component Name                      | [derived]                         | [derived]                         |
+| Version                             | [derived]                         | [derived]                         |
+| Team Owner                          | [derived]                         | [derived]                         |
+| Primary Language                    | [derived]                         | [derived]                         |
+| Primary Framework                   | [derived]                         | [derived]                         |
+| Architectural Type                  | [taxonomy result]                 | [taxonomy result]                 |
+| Maturity Score / Grade              | [X/15] — [Grade]                  | [X/15] — [Grade]                  |
+
+### 15B. Codebase Statistics
+
+| Metric                              | [REPO-1]  | [REPO-2]  |
+|-------------------------------------|-----------|-----------|
+| Total Source Files                  | [N]       | [N]       |
+| Total Test Files                    | [N]       | [N]       |
+| Test-to-Source Ratio                | [N%]      | [N%]      |
+| Total Config Files                  | [N]       | [N]       |
+| CI/CD Pipeline Files                | [N]       | [N]       |
+| Pipeline Stages                     | [N]       | [N]       |
+| Deployment Environments             | [N]       | [N]       |
+
+### 15C. Analysis Statistics
+
+| Metric                              | [REPO-1]  | [REPO-2]  |
+|-------------------------------------|-----------|-----------|
+| Functional Capabilities (FC)        | [N]       | [N]       |
+| Use Cases (UC)                      | [N]       | [N]       |
+| Acceptance Criteria (AC)            | [N]       | [N]       |
+| Validation / Business Rules (VR)    | [N]       | [N]       |
+| Distinct Error Codes                | [N]       | [N]       |
+| Requirements Traced (REQ)           | [N]       | [N]       |
+| Data Sources (DS)                   | [N]       | [N]       |
+| Data Sinks (SK)                     | [N]       | [N]       |
+| Data Models                         | [N]       | [N]       |
+
+### 15D. Test Coverage Statistics
+
+| Metric                              | [REPO-1]  | [REPO-2]  |
+|-------------------------------------|-----------|-----------|
+| BDD Feature Files                   | [N]       | [N]       |
+| BDD Scenarios                       | [N]       | [N]       |
+| Unit Test Files                     | [N]       | [N]       |
+| Unit Test Methods                   | [N]       | [N]       |
+| Integration Test Files              | [N]       | [N]       |
+| Test Fixture Files                  | [N names] | [N names] |
+| UCs: Fully Covered                  | [N] ([%]) | [N] ([%]) |
+| UCs: Partially Covered              | [N] ([%]) | [N] ([%]) |
+| UCs: Not Covered                    | [N] ([%]) | [N] ([%]) |
+| Weighted Coverage Score             | [%]       | [%]       |
+
+### 15E. Traceability & Gap Statistics
+
+| Metric                              | [REPO-1]  | [REPO-2]  |
+|-------------------------------------|-----------|-----------|
+| Requirements: FULL chain            | [N]       | [N]       |
+| Requirements: PARTIAL chain         | [N]       | [N]       |
+| Requirements: BROKEN chain          | [N]       | [N]       |
+| Gaps: CRITICAL                      | [N]       | [N]       |
+| Gaps: HIGH                          | [N]       | [N]       |
+| Gaps: MEDIUM                        | [N]       | [N]       |
+| Gaps: LOW                           | [N]       | [N]       |
+| Total Gaps                          | [N]       | [N]       |
+
+### 15F. Report Provenance
+
+| Field              | Value                            |
+|--------------------|----------------------------------|
+| Analyzed At        | [ISO 8601 timestamp]             |
+| Generated By       | CodeMind AI Agent                |
+| Playbook Version   | master-component-analysis v2.0.0 |
+| Output File        | [filename]                       |
+```
+
+---
+
+## 📎 APPENDICES
+
+```markdown
+## Appendix A — Files Analyzed
+
+### [REPO-1] Files Read
+Group A — Source: [list]
+Group B — Config: [list]
+Group C — CI/CD:  [list]
+Group D — Tests:  [list]
+Group E — Docs:   [list]
+Group F — Build:  [list]
+
+### [REPO-2] Files Read
+[same structure]
+
+---
+
+## Appendix B — Unresolvable References
+
+Files or classes referenced in code (imports, config values, K8s references)
+that could not be located in either repository:
+
+| Reference          | Referenced From          | Type               | Implication                    |
+|--------------------|-------------------------|--------------------|--------------------------------|
+| [ClassName/file]   | [file:line]             | [Import/Config/K8s]| [missing dep / external system]|
+
+---
+
+## Appendix C — Analysis Limitations
+
+Any phase where the analysis was constrained:
+
+| Limitation               | Phase Affected | Reason                                   | Impact on Report          |
+|--------------------------|---------------|------------------------------------------|---------------------------|
+| [limitation description] | Phase [N]     | [dynamic dispatch / generated code / etc]| [what may be incomplete]  |
+```
+
+---
+
+## 🔄 Agent Execution Checklist
+
+```
+PRE-FLIGHT:
+  [ ] Identify number of repos: 1 or 2
+  [ ] If 2: label them [REPO-1] and [REPO-2] from this point forward
+  [ ] Set report_timestamp = current ISO 8601 datetime
+
+PHASE 1 — Bootstrap (per repo):
+  [ ] 1.1  Extract component identity
+  [ ] 1.2  Build full file tree inventory, group A–F
+  [ ] 1.3  Detect language, frameworks, all tech signals
+
+PART 2 — Taxonomy (per repo, then compare):
+  [ ] Apply Category / Sub-Category / Type / Deployment / Orchestration
+      decision rules with confidence levels and evidence
+
+PART 3 — Technology Profile (per repo, side-by-side):
+  [ ] Populate all 20 rows of technology profile table
+
+PART 4 — Data Flow (per repo):
+  [ ] 4.1  Discover all data sources → DS table
+  [ ] 4.2  Discover all data sinks → SK table
+  [ ] 4.3  Build DS/SK cross-reference table
+  [ ] 4.4  Generate Mermaid flow diagram per major UC
+  [ ] 4.5  Build data model inventory table
+
+PART 5 — CI/CD Pipeline (per repo):
+  [ ] 5.1  Inventory all pipeline files
+  [ ] 5.2  Build pipeline overview table
+  [ ] 5.3  Build per-stage detail table
+  [ ] 5.4  Extract quality gates table
+  [ ] 5.5  Build deployment target map
+  [ ] 5.6  Generate Mermaid pipeline diagram
+
+PART 6 — Functional Capabilities:
+  [ ] Scan all entry points → assign FC-IDs → build FC table
+
+PART 7 — Use Case Catalog:
+  [ ] For each FC: derive Actor / Precondition / Flow / Postcondition
+      / Error Paths / Data In / Data Out → write UC card
+
+PART 8 — Acceptance Criteria:
+  [ ] Extract from BDD files, unit tests, inferred from error codes
+  [ ] Assign status per criterion
+
+PART 9 — Test Coverage:
+  [ ] 9.1  Inventory all test files → map to UCs
+  [ ] 9.2  Compute coverage statistics
+
+PART 10 — Requirements Traceability:
+  [ ] 10.1 Extract all requirements from all sources
+  [ ] 10.2 Build full traceability chain per requirement
+  [ ] 10.3 Classify chain status + compute summary
+
+PART 11 — Validation & Business Rules:
+  [ ] 11.1 Extract all rules from validators, annotations, service logic
+  [ ] 11.2 Build VR table + error code registry
+
+PART 12 — Quality Scorecard:
+  [ ] 12.1 Evaluate all 15 signals per repo
+  [ ] 12.2 Calculate maturity score + grade
+
+PART 13 — Gap Analysis:
+  [ ] Run all 8 gap categories
+  [ ] Assign G-IDs, severities, and evidence
+  [ ] Compute gap summary table
+
+PART 14 — Recommendations:
+  [ ] Generate one R-ID per G-ID, ordered by severity
+
+PART 15 — Metadata:
+  [ ] Compute all counts from earlier phases
+  [ ] Populate all 6 metadata tables
+
+APPENDICES:
+  [ ] List all files analyzed grouped by type
+  [ ] List all unresolvable references
+  [ ] List all analysis limitations
+
+QUALITY GATES (must all pass before writing file):
+  [ ] Every FC row has a UC card
+  [ ] Every UC card has ≥ 1 acceptance criterion
+  [ ] Every UC has a Data In and Data Out reference
+  [ ] Every error code found in source appears in VR Error Code Registry
+  [ ] Every test file is mapped to ≥ 1 UC (or noted as unmappable)
+  [ ] Every G-ID has a matching R-ID recommendation
+  [ ] No table cell is blank — use "Not detected" or "Absent" with note
+  [ ] All metadata counts match actual row counts in sections above
+  [ ] Mermaid diagrams use only exact names from source files
+  [ ] Report written to .codemind/reports/{filename}
+```
+
+---
+
+*Master Component Analysis Playbook v2.0.0*
+*Unified | Dual-Repo Capable | Evidence-Only | No Hardcoding*
+*Covers: Taxonomy · Functional Inventory · Data Flow · CI/CD · Business Rules · Traceability · Gaps*
