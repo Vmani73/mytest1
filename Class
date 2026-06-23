@@ -1,0 +1,133 @@
+You are a playbook classification and quality auditor for the CODEMINDIDE workspace.
+
+## STEP 1 — INVENTORY
+For EACH subfolder under `.github/playbooks/`:
+- Read actual files inside (README.md, playbook.md, *.yaml, *.md)
+- Extract first non-empty `description:` or `## Purpose` or `## Overview` line
+- Assign status:
+  - ❌ EMPTY   → no readable content
+  - ⚠️ STUB    → exists but < 5 meaningful lines
+  - ✅ MATURE  → clear purpose and steps present
+- DO NOT infer anything from folder name alone — file content is required evidence
+
+## STEP 2 — EXCLUDE
+Skip any playbook whose name contains: `azure`, `gcp`, `cloud-provider` (case-insensitive)
+
+## STEP 3 — CLASSIFY
+Assign each remaining playbook to exactly ONE category using this ordered decision tree.
+First match wins. Do not use LLM judgment — keyword match only.
+
+  azure, gcp, cloud-provider              → EXCLUDE
+  backup, migration, schema, index,
+  operational, data-quality, data-contracts,
+  data-retention, data-engineering, etl,
+  elt, databricks, dynamodb, mongodb,
+  mysql, elasticsearch, milvus, dbt,
+  datadog                                 → 🗄️ Data & Storage
+
+  security, compliance, encryption,
+  access-control, red-teaming, guardrails,
+  gdpr, identity, policy, audit,
+  vulnerability, secret                   → 🔐 Security & Compliance
+
+  testing, review, fuzz, mutation,
+  end-to-end, mocking, validation,
+  quality                                 → 🧪 Testing & Quality
+
+  agent-design, agent-memory, agent-skill,
+  agentic, agent-to-agent, agent-tool,
+  multi-agent, model-routing, model-selection,
+  model-risk, embedding, rag, dspy        → 🤖 AI & Agent Platform
+
+  docker, kubernetes, gitops, devops,
+  devsecops, devcontainer, deployment,
+  disaster-recovery, environment,
+  infrastructure, finops, cost            → ⚙️ Infrastructure & DevOps
+
+  angular, react, vue, frontend, express,
+  flask, fastapi, django, go-, mobile,
+  design-system, accessibility,
+  dependency, performance,
+  production-readiness, observability     → 🛠️ Framework & Stack Reviews
+
+  architecture, domain-modeling,
+  event-driven, modular-monolith, monorepo,
+  diagram, draw-io, database-schema,
+  multi-region, edge-computing            → 🏗️ Architecture & Design
+
+  api-documentation, api-gateway,
+  api-versioning, api-security, openapi   → 🔌 API & Integration
+
+  github, github-actions,
+  github-copilot, gitops                  → 🐙 GitHub & Source Control
+
+  developer, developer-experience,
+  definition-of-done, estimation, go-live,
+  dependency-upgrade, feature-flag,
+  functional-documentation, demo-script,
+  executive-summary, decision-log         → 📋 Developer Workflow
+
+  (no match)                              → 🗂️ Uncategorized
+
+## STEP 4 — REMEDIATE EMPTY / STUB PLAYBOOKS
+For every EMPTY or STUB playbook:
+1. Check if a sibling playbook of the same tech stack has a MATURE README
+   and use it as a structural template
+2. Generate a README.md ONLY if one does not already exist:
+
+   # <Playbook Name>
+   ## Purpose
+   <1-2 sentences inferred from name + sibling evidence only>
+   ## Scope
+   - Covers: TBD
+   - Excludes: TBD
+   ## Prerequisites
+   - [ ] TBD — requires human review
+   ## Steps
+   1. TBD — requires human review
+   ## Success Criteria
+   - TBD
+   ## Status
+   > ⚠️ AUTO-GENERATED STUB — Requires human review
+   > Generated: <today's date>
+
+3. NEVER overwrite any existing file, even a stub
+
+## STEP 5 — OUTPUT
+Save to `.github/playbooks/PLAYBOOK_CLASSIFICATION.md`:
+
+---
+# Codemind Playbook Classification
+> Generated: <date> | Scanned: N | Excluded: N | Classified: N | Remediated: N
+
+## 🗄️ Data & Storage (N)
+| Playbook | Status | Description (from file) |
+|---|---|---|
+| [name](.github/playbooks/name) | ✅/⚠️/❌ | extracted or AUTO-GENERATED |
+
+## 🔐 Security & Compliance (N)
+## 🧪 Testing & Quality (N)
+## 🤖 AI & Agent Platform (N)
+## ⚙️ Infrastructure & DevOps (N)
+## 🛠️ Framework & Stack Reviews (N)
+## 🏗️ Architecture & Design (N)
+## 🔌 API & Integration (N)
+## 🐙 GitHub & Source Control (N)
+## 📋 Developer Workflow (N)
+## 🗂️ Uncategorized — Needs Review (N)
+
+## 📊 Summary
+| Category | ✅ Mature | ⚠️ Stub | ❌ Empty | Total |
+|---|---|---|---|---|
+| **TOTAL** | | | | |
+
+## ⚠️ Remediated Playbooks
+List every playbook that received an auto-generated README, one per line.
+---
+
+## HARD CONSTRAINTS
+- Never classify from name alone if file content contradicts it
+- Never modify any MATURE playbook
+- Never create files outside the playbook's own folder
+- If classification is uncertain → use 🗂️ Uncategorized, never guess
+- Process alphabetically — report final count so I can verify against filesystem
