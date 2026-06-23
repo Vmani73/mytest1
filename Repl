@@ -1,0 +1,25 @@
+Subject: 
+
+Thank you for the kind words and the thoughtful questions — happy to address each one.
+
+1. Source of Playbooks
+The playbooks were built by combining technical guidance sourced from Confluence with coverage for new and emerging technologies identified by our team. Each playbook was crafted to address real-world Codemind use cases across development, testing, security, and architecture domains.
+
+2. Testing & Validation Status
+We have tested and validated several playbooks to date, including:
+- Developer and testing workflow playbooks
+- TOGAF Risk Matrix
+- Functional Inventory Analyzer
+- Security Review
+- Component Taxonomy
+- Component SBOM Generation
+
+Not all playbooks have been tested yet — our approach is pragmatic: we test and enhance each playbook when an actual use case or requirement arises, ensuring improvements are driven by real feedback rather than hypothetical scenarios.
+
+3. Enterprise Standard Storage
+For enterprise-standard playbooks, we follow the established Prompt L as the canonical store. Playbooks such as Testing, BlackDuck, and Checkmarx are already published there. The remaining playbooks are available via Git, where developers can download and use them directly — they are ready to use as-is.
+
+We will continue to expand coverage, validate more playbooks, and migrate mature ones to the Prompt Library progressively. Thank you for looping in Manish — we welcome any contributions or feedback from the broader team.
+
+Thanks & Regards,
+Vivek
