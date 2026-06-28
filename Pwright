@@ -1,0 +1,470 @@
+---
+name: playwright-nlp-automation
+version: 2.0.0
+description: >
+  Converts a target URL plus a natural-language test scenario into a runnable,
+  resilient Playwright test suite by orchestrating Microsoft's first-party
+  Playwright Test Agents (Planner → Generator → Healer) against a LIVE browser.
+  Every locator written to disk is grounded in an element observed during live
+  execution — no guessed selectors. Produces an auditable evidence report.
+triggers:
+  - "write a playwright test for <url>"
+  - "test this flow: <natural language scenario>"
+  - "generate e2e tests for <url>"
+  - "automate <scenario> on <url>"
+  - "heal the failing playwright tests"
+audience: developers, SDETs, QA engineers
+runtime: GitHub Copilot (agent mode, VS Code) — primary; Claude Code / Cursor — secondary
+inputs:
+  - target_url        # required, a live, reachable URL
+  - nl_scenario       # required, plain-English description of what to test
+  - auth_context      # optional, for gated flows (see Part 6)
+output:
+  - tests/*.spec.ts                 # generated, live-grounded test files
+  - specs/*.md                      # human-readable test plans
+  - playwright-report/              # HTML report + traces
+  - codemind-playwright-report.md   # evidence + traceability report (Part 11)
+dependencies:
+  - "@playwright/test >= 1.56"
+  - "@playwright/cli (preferred) OR @playwright/mcp"
+  - "VS Code >= 1.105 with Copilot agent mode enabled"
+non_goals:
+  - High-volume regression execution (use plain compiled specs in CI instead)
+  - Load/performance testing (out of scope — that is the JMeter→k6 lane)
+  - Pixel/vision-based testing (this playbook is accessibility-tree grounded)
+---
+
+# Playwright NLP Automation Playbook — v2.0.0
+
+> **What this playbook actually does (plain English):**
+> You give the AI agent a live URL and describe a flow in everyday language
+> ("log in, add the cheapest item to the cart, and confirm the badge shows 1").
+> The agent opens a *real* browser, walks the flow itself, writes a Playwright
+> test whose every locator was *seen working live*, runs it, and auto-repairs it
+> if it breaks. It then hands you an evidence report mapping each plan step to
+> the test code and the artifact that proves it ran.
+>
+> **What it does NOT do:** It does not invent selectors, does not assume page
+> structure, and does not claim a test passed without a trace/screenshot to
+> prove it. Absence is reported explicitly, never silently.
+
+---
+
+## Part 0 — Core Contract (Non-Negotiable Rules)
+
+These rules bind every phase below. If a rule cannot be satisfied, the agent
+**stops and reports**, it does not improvise.
+
+1. **Live-grounding rule (the prime directive).** Every locator written into a
+   `.spec.ts` file MUST correspond to an element the agent actually resolved
+   against the live DOM/accessibility tree during execution. No locator may be
+   authored from memory, assumption, or static HTML inspection alone.
+2. **Resilient-locator hierarchy.** Locators are chosen in this strict priority
+   order; the agent only descends a rung when the rung above is genuinely
+   unavailable, and it records *why* (see Part 4).
+3. **Evidence-only reporting.** Every claim of "pass" must be backed by a trace,
+   screenshot, or runner exit code. Every claim of "could not test X" must name
+   what was attempted and what was observed — `Not detected — [what was scanned]`.
+4. **Zero hardcoding.** No hardcoded waits (`waitForTimeout`), no hardcoded
+   ports, no hardcoded credentials, no environment-specific absolute paths. All
+   such values come from inputs, fixtures, or config.
+5. **Determinism over speed.** Web-first assertions and auto-waiting only. A test
+   that flakes is not "done" (see Part 9, the stability gate).
+6. **Human-in-the-loop on ambiguity.** When the Planner's understanding of the
+   scenario diverges from observed app behavior, or the Healer cannot fix a test
+   within the iteration cap, the agent escalates rather than guessing.
+7. **Safety boundary.** The browser tool surface is restricted to the minimum
+   capability set and an origin allow-list scoped to `target_url`. The
+   code-execution / `evaluate` / "unsafe" tool is **never** enabled against an
+   untrusted target.
+
+---
+
+## Part 1 — Why v2 Exists (Architecture Decision Record)
+
+**v1** instructed the agent to drive the Playwright **MCP server** and emit a
+single plain `.js` script, with the live-grounding rule enforced by hand.
+
+**v2** changes the *engine*, not the *philosophy*. Since v1 was authored,
+Microsoft shipped first-party **Playwright Test Agents** (Planner / Generator /
+Healer, v1.56+) and the **`@playwright/cli`** companion. v2 orchestrates these
+official agents instead of re-implementing generation logic.
+
+| Concern | v1 approach | v2 approach | Why it is more robust |
+|---|---|---|---|
+| Generation engine | Hand-rolled prompt over MCP | Official Planner→Generator→Healer loop | First-party, maintained, upstream-aligned with each Playwright release |
+| Locator grounding | Enforced by prompt rule | Enforced by rule **and** by agents operating on a live browser | Agents emit role/text locators because they resolve against the real DOM |
+| Self-repair | None | Healer auto-repairs drifted locators with an iteration cap | Drift from a renamed button no longer fails the suite silently |
+| Token cost (Copilot) | MCP (~114k tokens/task) | CLI (~27k tokens/task) where filesystem access exists | ~4× cheaper; Copilot has filesystem access |
+| Output format | plain `.js` | `.spec.ts` (default) — see decision below | Type-safety, fixtures, parallel isolation, native report/trace |
+
+> **Decision point left to the maintainer (Vivek):** v2 defaults to `.spec.ts`
+> because the official agents and the entire 2026 tooling surface (traces,
+> fixtures, ARIA snapshots, parallel isolation) assume Playwright Test format.
+> If CodeMind has a hard requirement for plain `.js`, see **Part 10, Mode B**,
+> which keeps the orchestration but emits a compiled plain-JS artifact. This is
+> a deliberate divergence from v1 and is flagged here rather than buried.
+
+---
+
+## Part 2 — Runtime Selection (CLI vs MCP)
+
+The agent picks its browser-driving channel before doing anything else, because
+it determines cost and capability.
+
+```
+Does the runtime have filesystem access?  (Copilot agent mode / Claude Code / Cursor → YES)
+│
+├── YES → use @playwright/cli           # ~4x more token-efficient; snapshots/screenshots saved to disk
+│         The agent reasons over files, not over a streamed accessibility tree.
+│
+└── NO  → use @playwright/mcp           # streams structured accessibility snapshots into context
+          Required when the agent cannot read artifacts from disk.
+```
+
+**Primary path (Copilot in VS Code):** CLI-first.
+**When deep, iterative page exploration of an unfamiliar UI is needed:** MCP is
+acceptable for the Planner phase only, then hand back to CLI for generation.
+
+Restricted capability profile for either channel:
+
+```
+core, navigation, interaction, snapshot, screenshot
+# --isolated  (fresh, ephemeral profile per run — no leaked state)
+# --allowed-origins <scheme://host of target_url>
+# NEVER enable: evaluate / run_code_unsafe / file (unless target is fully trusted AND task requires it)
+```
+
+---
+
+## Part 3 — Phase Pipeline (The Orchestration Loop)
+
+```mermaid
+flowchart TD
+    A[Inputs: target_url + nl_scenario + optional auth] --> B[Part 5: Preflight gate]
+    B -->|pass| C[Part 6: Establish session / storageState]
+    B -->|fail| Z[STOP - report missing prerequisites]
+    C --> D[Planner: explore LIVE app -> specs/plan.md]
+    D --> E{Human checkpoint:\nplan matches observed behavior?}
+    E -->|no| D
+    E -->|yes| F[Generator: replay live -> tests/*.spec.ts]
+    F --> G[Execute: npx playwright test]
+    G --> H{All pass?}
+    H -->|yes| I[Part 9: Stability gate --repeat-each]
+    H -->|no| J[Healer: re-inspect live, repair, re-run]
+    J --> K{Fixed within iteration cap?}
+    K -->|yes| I
+    K -->|no| Y[ESCALATE - human review, mark skipped, log reasoning]
+    I -->|stable| L[Part 11: Evidence report]
+    I -->|flaky| J
+    L --> M[Done]
+```
+
+The three official agents map to phases as follows:
+- **Planner** — explores the live app and writes a numbered Markdown plan to
+  `specs/`. Writes **no code**. Needs a reachable, stable app (and a session for
+  gated flows).
+- **Generator** — reads one plan scenario (referenced **by number**, not name),
+  replays it in a live browser, and writes a `.spec.ts` whose locators and
+  assertions are derived from what it observed.
+- **Healer** — runs the suite; on failure it replays the failing steps,
+  distinguishes a real regression from a drifted locator, and repairs the test
+  (or marks it skipped if the feature itself appears broken).
+
+Bootstrap command (run once per repo, regenerate when Playwright updates):
+
+```bash
+npx playwright init-agents --loop=copilot   # or --loop=vscode | claude | opencode
+```
+
+---
+
+## Part 4 — Resilient Locator Policy (Enforced)
+
+The Generator and Healer must select locators in this order. Descend only when
+the current rung cannot uniquely identify the element, and record the reason in
+the report's "Locator Provenance" table (Part 11).
+
+| Rung | Locator | Use when | Example |
+|---|---|---|---|
+| 1 | `getByRole(role, { name })` | Default for all interactive/semantic elements | `getByRole('button', { name: /add to cart/i })` |
+| 2 | `getByLabel(text)` | Form fields tied to a `<label>` | `getByLabel('Email')` |
+| 3 | `getByPlaceholder` / `getByText` | Visible text with no role/label anchor | `getByText('Order confirmed')` |
+| 4 | `getByTestId(id)` | App exposes an explicit `data-testid` contract | `getByTestId('checkout-cta')` |
+| 5 | CSS (last resort) | No semantic, label, text, or test-id anchor exists | flagged + reason logged |
+
+**Hard prohibitions:**
+- No deep CSS/XPath chains tied to DOM structure or styling classes.
+- The removed `_react=` / `_vue=` engines and the `:light` suffix must not appear
+  (deprecated/removed in current Playwright). Use `getByRole(...).filter({ hasText })`.
+- No `nth(n)` positional selection unless preceded by a `filter()` that makes the
+  match semantically unambiguous, with the reason recorded.
+
+**Structural assertion:** Where the scenario asserts page *shape* (a heading
+exists, a list rendered, a labeled button is present), prefer a page-level ARIA
+snapshot over a chain of individual checks:
+
+```ts
+await expect(page).toMatchAriaSnapshot(`
+  - heading "Your cart" [level=1]
+  - list:
+    - listitem: /Standing desk/
+  - button "Checkout"
+`);
+```
+
+This locks in what a user and a screen reader perceive while ignoring cosmetic
+markup churn — and it is itself live-grounded (generated from the real tree).
+
+---
+
+## Part 5 — Preflight Gate (Fail Fast, Report Explicitly)
+
+Before any browser launches, verify and **report each line as PASS / FAIL**.
+A single FAIL on a required item halts the run with an explicit reason.
+
+```
+[ ] Playwright >= 1.56 installed            (npx playwright --version)
+[ ] Browser binaries present                (npx playwright install chromium)
+[ ] VS Code >= 1.105 + Copilot agent mode   (required for the agentic loop)
+[ ] Agent definitions exist                 (./.github/ or ./.claude/agents/ or ./agents/)
+[ ] target_url is reachable and returns 2xx/3xx
+[ ] target_url renders to a stable state    (no perpetual spinners on load)
+[ ] If auth required: auth_context provided  (else gated steps are out of scope)
+[ ] Channel selected per Part 2              (CLI vs MCP)
+[ ] Capability + origin restrictions applied per Part 2
+```
+
+If a prerequisite is missing, the report states exactly which one and the exact
+remediation command — it never proceeds on assumptions.
+
+---
+
+## Part 6 — Authenticated & Gated Flows
+
+The Planner **cannot navigate past a login wall on its own.** For any gated
+scenario, a session must be established first and reused via `storageState`.
+
+```
+Is the target flow behind auth?
+│
+├── NO  → proceed; Planner explores anonymously.
+│
+└── YES → establish session ONCE, persist it, reuse it:
+          1. Perform/confirm a login that yields a storageState file
+             (a dedicated auth setup project, or a provided auth.json).
+          2. Generated tests load it:  test.use({ storageState: 'auth.json' })
+          3. Credentials come from env/secret, NEVER hardcoded (Part 0, rule 4).
+          4. If no session can be established → gated steps are reported
+             "Not tested — no authenticated session available", and only the
+             public portion of the scenario is covered.
+```
+
+Secrets never enter the browser tool prompt, the plan, the test code, or the
+report. They are referenced by variable name only.
+
+---
+
+## Part 7 — Planner Phase (Intent → Plan)
+
+Prompt shape (the agent fills the braces from inputs):
+
+```
+Use the Playwright Planner agent.
+Target: {target_url}
+Scenario (natural language): {nl_scenario}
+Existing tests (avoid duplication): {globbed list or "none"}
+Seed/auth: {seed spec path or "anonymous"}
+Produce a numbered Markdown plan in specs/ with: actor, preconditions,
+numbered steps, expected outcomes, and the evidence to capture per step.
+```
+
+**Output:** `specs/<scenario-slug>.md` — human-readable, numbered, precise.
+
+**Mandatory human checkpoint.** The agent presents the plan and asks the
+maintainer to confirm it matches *observed* app behavior. The Planner explores
+live but can still misread an ambiguous flow. Plan steps that the app did not
+actually exhibit are removed or flagged — they are never carried forward as if
+real (Part 0, rule 6).
+
+---
+
+## Part 8 — Generator Phase (Plan → Live-Grounded Code)
+
+```
+Use the Playwright Generator agent.
+Plan: specs/<scenario-slug>.md
+Generate scenario 1.1   ← reference by NUMBER; names risk picking the wrong scenario
+Enforce the Part 4 locator hierarchy. Web-first assertions only.
+One test = one isolated context. No hardcoded waits or ports.
+```
+
+Generation requirements:
+- The Generator **replays each step in a live browser** and writes locators from
+  what resolves — satisfying the prime directive structurally.
+- Tests are isolated (one context per test) for safe parallelism.
+- Assertions are web-first (`await expect(locator).toBeVisible()`), never
+  `waitForTimeout` + manual check.
+- Output mirrors the plan **1:1** where feasible (scenario 1.1 → one test),
+  enabling the traceability matrix in Part 11.
+
+---
+
+## Part 9 — Execution & Stability Gate
+
+Run the suite:
+
+```bash
+npx playwright test --reporter=html
+# trace policy: capture on first retry only (not 'on') to keep runs lean
+#   in playwright.config: use: { trace: 'on-first-retry' }
+```
+
+A green first run is **necessary but not sufficient.** Before declaring success,
+the agent runs the **anti-flake gate**:
+
+```bash
+npx playwright test <generated spec> --repeat-each=10
+```
+
+- **All 10 pass →** test is stable; proceed to report.
+- **Any intermittent failure →** the test is flaky and **not done**. Route to the
+  Healer with the flake diagnosis (timing vs locator vs missing seed). A flaky
+  test is treated as a failing deliverable, not a passing one.
+
+---
+
+## Part 10 — Healer Phase & Output Modes
+
+### Healer loop (bounded)
+
+```
+Use the Playwright Healer agent on the failing/flaky spec (narrow scope = better fixes).
+For each iteration (cap = 3):
+  - replay failing steps in a live browser
+  - classify: drifted locator | timing | real regression
+  - if locator/timing → repair using Part 4 hierarchy, re-run
+  - if real regression → DO NOT fudge a pass; mark test skipped with a reason
+After cap reached without a pass → ESCALATE:
+  - stop, surface the agent's reasoning and the trace
+  - request human review (never loop indefinitely; Part 0, rule 6)
+```
+
+The Healer's repairs are themselves live-grounded: substitute locators come from
+re-inspecting the running UI, not from guessing.
+
+### Mode A (default) — Playwright Test format
+Emit `.spec.ts` into `tests/`. This is the recommended, fully-supported path.
+
+### Mode B (compatibility) — plain JS emission
+If CodeMind requires a plain `.js` artifact (v1 parity): keep the entire
+Planner→Generator→Healer orchestration and the live-grounding guarantee, then
+emit a standalone runnable `.js` to `./playwright-tests/` as the final artifact.
+**Tradeoff to state honestly in the report:** plain-JS mode forfeits native
+fixtures, parallel test isolation, the HTML reporter, and trace integration —
+so the evidence in Part 11 is thinner. Default to Mode A unless told otherwise.
+
+---
+
+## Part 11 — Evidence Report (`codemind-playwright-report.md`)
+
+The deliverable that makes this a CodeMind playbook rather than a script runner.
+Every section is evidence-backed; absence is explicit.
+
+### 11.1 Run Summary
+| Field | Value |
+|---|---|
+| Target URL | … |
+| Scenario (NL) | … |
+| Channel | CLI / MCP |
+| Playwright version | … |
+| Auth | anonymous / storageState |
+| Result | PASS / PASS-WITH-SKIPS / ESCALATED |
+
+### 11.2 Plan → Test Traceability Matrix
+| Plan step | Test file:case | Status | Evidence artifact | Confidence |
+|---|---|---|---|---|
+| 1.1 Add item to cart | `cart.spec.ts › adds item` | ✅ pass | `trace-1.1.zip` | High |
+| 1.2 Apply coupon | `cart.spec.ts › coupon` | ⏭️ skipped | healer note | — |
+| 1.3 Gated checkout | — | 🚫 not tested | no session | — |
+
+### 11.3 Locator Provenance
+| Element (user-facing) | Locator emitted | Rung | Live-grounded? | Reason if rung > 1 |
+|---|---|---|---|---|
+| "Add to cart" button | `getByRole('button', {name:/add to cart/i})` | 1 | yes | — |
+| price field | `getByTestId('unit-price')` | 4 | yes | no role/label/text anchor present |
+
+### 11.4 Stability
+| Spec | `--repeat-each` | Passes | Verdict |
+|---|---|---|---|
+| `cart.spec.ts` | 10 | 10/10 | Stable |
+
+### 11.5 Explicit Absences & Escalations
+- `Not tested — [gated checkout]: no authenticated session available.`
+- `Escalated — [scenario 2.3]: Healer hit iteration cap; suspected real
+  regression. Trace: …`
+
+### 11.6 Confidence Statement
+A one-paragraph, honest assessment: what is genuinely verified by evidence, what
+is assumed, and what a human still needs to review. No green-washing.
+
+---
+
+## Part 12 — Dual-Target Support (Side-by-Side)
+
+CodeMind's dual-repository pattern adapts here as **dual-target**: run the same
+`nl_scenario` against two URLs (e.g., staging vs production, or v1 vs v2 of a UI)
+and produce a comparison.
+
+| Step | Target A result | Target B result | Divergence |
+|---|---|---|---|
+| 1.1 Add to cart | ✅ pass | ✅ pass | none |
+| 1.2 Apply coupon | ✅ pass | ❌ fail | coupon field absent on B |
+
+Divergences are reported as observed facts with artifacts, never as inferred
+causes.
+
+---
+
+## Part 13 — Known Limits (Stated Up Front)
+
+- **Live app required.** The Planner cannot explore a URL that will not load or
+  render to a stable state.
+- **Auth is a prerequisite, not a feature.** Gated flows need a pre-established
+  session; otherwise only public portions are covered.
+- **AI selector choice is not infallible.** Even live-grounded, the agents can
+  occasionally pick a sub-optimal locator — Part 11.3 surfaces every choice for
+  human review precisely because of this.
+- **Not for high-volume regression.** For large, stable matrices, run the
+  generated specs as ordinary compiled tests in CI; the agentic loop is for
+  authoring and healing, not bulk execution.
+- **Stability gate is probabilistic.** `--repeat-each=10` reduces but cannot
+  fully eliminate the chance of latent flake.
+
+---
+
+## Part 14 — Quick Reference
+
+```bash
+# 0. one-time scaffold (regenerate after each Playwright upgrade)
+npx playwright init-agents --loop=copilot
+
+# 1. preflight
+npx playwright --version && npx playwright install chromium
+
+# 2. plan (Planner agent)  → specs/<slug>.md   [then human checkpoint]
+# 3. generate (Generator)  → tests/<slug>.spec.ts   [reference scenario by number]
+# 4. execute
+npx playwright test --reporter=html
+
+# 5. stability gate
+npx playwright test tests/<slug>.spec.ts --repeat-each=10
+
+# 6. heal failures (Healer, cap=3) → escalate if unfixed
+# 7. write codemind-playwright-report.md
+```
+
+---
+
+*End of playbook. This file is fully standalone and shares no content with other
+CodeMind playbooks.*
