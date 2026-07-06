@@ -1,0 +1,991 @@
+---
+name: excel-calculation-engine-playbook
+description: >
+  Production playbook enabling an AI agent (GitHub Copilot agent mode) to understand,
+  document, and SAFELY MODIFY complex multi-sheet Excel calculation workbooks (.xlsx/.xlsm)
+  with deep inter-sheet dependencies, named ranges, shared/array formulas, and VBA macros.
+  Use whenever the user asks to explain a calculation workbook, trace where a figure comes
+  from, update business logic in a spreadsheet, change a formula, or verify that a
+  spreadsheet change broke nothing. Every modification is gated by a dependency-graph
+  blast-radius prediction, an Excel-recalculated golden-master baseline, and a
+  tolerance-aware regression diff. No edit ships without passing the diff gate.
+triggers:
+  - "explain this Excel workbook / calculator"
+  - "where is <figure> calculated"
+  - "update the business logic / formula in <workbook>"
+  - "change <assumption> and verify nothing else changed"
+  - "document the calculation flow of <workbook>"
+  - "is it safe to change <cell / named range>"
+audience: developers, tech leads, and business-logic owners of calculation workbooks
+runtime: >
+  GitHub Copilot agent mode (VS Code) on Windows with desktop Excel installed
+  (required for .xlsm recalculation and modification). Python 3.8+ stdlib only —
+  no pip installs. PowerShell 5.1+ for Excel COM automation. Analysis-only phases
+  (1–3, 6) run on any OS; modification phases (4–5) require Windows + Excel.
+output: >
+  workbook inventory (JSON), cell-level dependency graph (JSON), sheet-level Mermaid
+  flow diagram, VBA source export (.bas/.cls/.frm), golden-master baseline (JSON),
+  blast-radius reports, regression diff verdicts, calculation specification document,
+  weighted A–F scorecard, Fidelity Ledger
+version: 1.0.0
+---
+
+# Excel Calculation-Engine Playbook
+
+## Mission
+
+Turn opaque, business-critical Excel calculation workbooks into artifacts an AI agent can
+**understand** (dependency graph + calculation spec), **modify** (COM-driven edits), and
+**verify** (golden-master regression gate) — with the same rigor applied to production code.
+
+The core contract: **no change is accepted unless the post-change diff, computed against an
+Excel-recalculated baseline, contains zero unexplained differences outside the predicted
+blast radius.**
+
+## Non-Negotiable Principles
+
+1. **Excel is the only calculation authority.** All recalculation happens inside desktop
+   Excel via COM. Reimplementing formula evaluation (Python, JS, LibreOffice) is
+   **prohibited** — see Fidelity Ledger.
+2. **Cached values are never trusted as a baseline.** A file saved without recalculation
+   carries stale values. Baselines come only from `CalculateFullRebuild` executed by this
+   playbook (Phase 4).
+3. **Blast radius before edit, diff gate after edit.** Prediction and verification are
+   independent mechanisms; both must pass.
+4. **Evidence-only findings.** Every claim cites `Sheet!Cell`, a defined name, a VBA
+   module/procedure, or a script output. Absence is stated explicitly:
+   `Not detected — [artifacts scanned]`.
+5. **Automatic backup before every mutation.** Timestamped copy created before the
+   workbook is opened for writing. A failed gate triggers restore from backup.
+6. **Zero dependency installation.** Python stdlib + PowerShell + already-installed Excel.
+   Nothing is downloaded or pip-installed.
+7. **Macros: events off, UDFs on.** Workbooks are opened with
+   `Application.EnableEvents = $false` (blocks `Workbook_Open` auto-run mutation) but
+   macro security set to *enable* so VBA user-defined functions used in worksheet formulas
+   recalculate correctly. Rationale: these are the user's own internal workbooks; blocking
+   UDFs would corrupt the baseline with `#NAME?` errors. Do not run this playbook on
+   untrusted third-party workbooks.
+
+---
+
+## Phase 0 — Environment & Harness Certification (HARD GATE)
+
+Nothing else runs until this phase reports **PASS**. Two independent certifications:
+
+### 0.1 Excel COM smoke test (Windows only; required for Phases 4–5)
+
+Save as `scripts/CertifyEnvironment.ps1` and run:
+
+```powershell
+# CertifyEnvironment.ps1 — proves Excel COM can create, calculate, and read back.
+$ErrorActionPreference = "Stop"
+$excel = $null
+try {
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false; $excel.DisplayAlerts = $false
+    $wb = $excel.Workbooks.Add()
+    $ws = $wb.Worksheets.Item(1)
+    $ws.Range("A1").Value2 = 2
+    $ws.Range("B1").Formula = "=A1*3"
+    $excel.CalculateFullRebuild()
+    while ($excel.CalculationState -ne 0) { Start-Sleep -Milliseconds 100 }  # 0 = xlDone
+    $result = $ws.Range("B1").Value2
+    $wb.Close($false)
+    if ($result -eq 6) { Write-Output "CERT-COM: PASS (2*3=$result)" }
+    else { Write-Output "CERT-COM: FAIL (expected 6, got $result)"; exit 1 }
+}
+catch { Write-Output "CERT-COM: FAIL ($($_.Exception.Message))"; exit 1 }
+finally {
+    if ($excel) { $excel.Quit()
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+}
+```
+
+**FAIL ⇒ abort Phases 4–5.** Phases 1–3 and 6 (read-only analysis) may still proceed.
+
+### 0.2 Parser harness certification (all OS; required for everything)
+
+Generate a trap-laden test workbook via stdlib and run 9 checks against the engine. This
+proves the parser survives the constructs that silently break naive tooling: **shared
+formulas** (formula physically stored only in the master cell — a naive parser reports
+thousands of formula cells as empty), **cross-sheet references**, **named ranges inside
+formulas**, **volatile functions**, **string literals that look like references**
+(`"Sheet3!Z9"` inside an `IF` must not become a graph edge), and **array formulas**.
+
+Save the generator as `scripts/make_cert_wb.py` and checks as `scripts/certify.py`
+(both provided in **Appendix B**), then:
+
+```bash
+python scripts/make_cert_wb.py && python scripts/certify.py
+```
+
+Required output (verified in authoring environment, 2026-07):
+
+```
+PASS  sheet enumeration
+PASS  defined name TaxRate
+PASS  shared formula expansion
+PASS  cross-sheet edge
+PASS  named range edge
+PASS  volatile detection
+PASS  string-literal trap
+PASS  blast radius transitive
+PASS  diff gate + volatile exclusion
+
+9/9 certification checks passed
+```
+
+**< 9/9 ⇒ abort the entire playbook.** Do not proceed with a partially working parser.
+
+---
+
+## Phase 1 — Workbook Inventory
+
+Run against the real workbook (engine source in **Appendix A**, save as
+`scripts/xl_engine.py`):
+
+```bash
+python scripts/xl_engine.py inventory path/to/workbook.xlsm > out/inventory.json
+```
+
+The inventory reports, with exact locations:
+
+| Field | Why it matters |
+|---|---|
+| `sheets` (incl. hidden/veryHidden state) | Hidden sheets frequently hold the real calculation core |
+| `defined_names` | The semantic vocabulary of the workbook; graph edges resolve through these |
+| `vba_present` | Routes Phase 2; `.xlsm` forces COM-only modification path |
+| `external_links`, `external_ref_cells` | Boundary nodes — values frozen at baseline, flagged in every blast radius |
+| `calc_settings.iterate` | Iterative calculation ON means intentional circular references exist; diff tolerance policy must widen (see Phase 4) |
+| `formula_cells / shared / array` | Scale estimate + parser sanity check |
+| `nondeterministic_cells` (`NOW/TODAY/RAND*`) | Mandatory diff exclusion list — without it every regression check false-positives |
+| `opaque_ref_cells` (`INDIRECT/OFFSET`) | **Graph blind spots.** Static analysis cannot resolve these references — see the containment downgrade rule in Phase 5 |
+
+**Evidence rule:** if `opaque_ref_cells` is non-empty, the report must list every one and
+state: *"Dependency edges through these cells are not statically resolvable. Blast-radius
+prediction is advisory for any change reaching these sheets; the diff gate is the
+authoritative guard."*
+
+---
+
+## Phase 2 — VBA Extraction & Macro-Mutated Cell Census (.xlsm only)
+
+### 2.1 Export VBA source
+
+Requires the Excel Trust Center setting **"Trust access to the VBA project object
+model"**. If the export throws, report the exact setting path
+(File → Options → Trust Center → Trust Center Settings → Macro Settings) and stop this
+sub-phase — do not guess at module contents.
+
+```powershell
+# ExportVBA.ps1 -Workbook <path> -OutDir <dir>
+param([Parameter(Mandatory)][string]$Workbook,
+      [Parameter(Mandatory)][string]$OutDir)
+$ErrorActionPreference = "Stop"
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false; $excel.DisplayAlerts = $false
+$excel.EnableEvents = $false                       # block Workbook_Open
+try {
+    $wb = $excel.Workbooks.Open((Resolve-Path $Workbook).Path, 0, $true)  # read-only
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    foreach ($comp in $wb.VBProject.VBComponents) {
+        $ext = switch ($comp.Type) { 1 {".bas"} 2 {".cls"} 3 {".frm"} default {".cls"} }
+        $comp.Export((Join-Path (Resolve-Path $OutDir).Path ($comp.Name + $ext)))
+        Write-Output "exported: $($comp.Name)$ext"
+    }
+    $wb.Close($false)
+}
+finally { $excel.Quit()
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+```
+
+Exported `.bas/.cls/.frm` files go under version control next to the workbook. This is
+what lets Copilot read business logic that lives in code, and what makes VBA changes
+diffable in PRs.
+
+### 2.2 Macro-mutated cell census
+
+Scan exported source for worksheet writes — these cells hold values **no formula
+explains**, and a pure formula graph silently lies about them:
+
+```
+Patterns: Range("...").Value / .Value2 / .Formula =,  Cells(r,c) =,
+          [A1] =,  .Offset(...).Value =,  Named-range writes
+```
+
+Produce `out/macro_mutated_cells.md`: a table of `Module.Procedure → target
+(sheet/range/named range) → static or computed target`. Computed targets (variables in
+`Range(var)`) are reported as **unresolvable macro writes** and treated like opaque refs.
+Also census **UDFs** (`Public Function` used in any worksheet formula — cross-reference
+against Phase 3 graph): these require macros enabled during recalc (Principle 7).
+
+---
+
+## Phase 3 — Dependency Graph & Blast Radius
+
+```bash
+python scripts/xl_engine.py graph   workbook.xlsm --out out/graph.json
+python scripts/xl_engine.py mermaid workbook.xlsm > out/flow.mermaid
+python scripts/xl_engine.py blast   workbook.xlsm "Assumptions!B14"
+```
+
+- **`graph.json`** — cell-level `precedents` and `dependents` adjacency. Named ranges are
+  resolved through to their underlying cells; ranges expand up to 10,000 cells (beyond
+  that, a single range-node preserves correctness without exploding memory).
+- **`flow.mermaid`** — sheet-level aggregation (`Assumptions -->|4 refs| Calc`) for the
+  human-readable overview.
+- **`blast`** — transitive dependents of one or more seed cells/names. This is the answer
+  to *"what happens if I change this?"* — e.g.
+  `{"seeds": ["Assumptions!B2"], "count": 6, "affected": ["Calc!A1", ...]}`.
+
+Cells flagged in Phase 2.2 as macro-mutated are annotated in graph output consumers:
+any blast radius touching a macro-mutated cell must carry the warning
+*"downstream values partially produced by VBA — formula graph incomplete here."*
+
+---
+
+## Phase 4 — Golden-Master Baseline
+
+The baseline is the reference truth every future change is diffed against. It is valid
+**only** if produced by this procedure:
+
+```powershell
+# GoldenMaster.ps1 -Workbook <path> -Out <snapshot.json>
+param([Parameter(Mandatory)][string]$Workbook,
+      [Parameter(Mandatory)][string]$Out)
+$ErrorActionPreference = "Stop"
+function ColName([int]$n){ $s=""; while($n){ $n--; $s=[char](65+($n%26))+$s; $n=[int][math]::Floor($n/26)}; $s }
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false; $excel.DisplayAlerts = $false
+$excel.EnableEvents = $false                    # block auto-run events
+$excel.AutomationSecurity = 1                   # msoAutomationSecurityLow: UDFs must work (Principle 7)
+try {
+    $wb = $excel.Workbooks.Open((Resolve-Path $Workbook).Path, 0, $true)   # no link update, read-only
+    $excel.CalculateFullRebuild()
+    while ($excel.CalculationState -ne 0) { Start-Sleep -Milliseconds 200 }
+    $snap = [ordered]@{}; $errCount = 0
+    foreach ($ws in $wb.Worksheets) {
+        $used = $ws.UsedRange
+        if ($null -eq $used) { continue }
+        # Two bulk COM calls per sheet — never iterate cells over COM (orders of magnitude slower)
+        $vals = $used.Value2; $fmls = $used.Formula
+        $r0 = $used.Row; $c0 = $used.Column
+        $nr = $used.Rows.Count; $nc = $used.Columns.Count
+        try { $errCount += $used.SpecialCells(-4123, 16).Count } catch { }  # formulas -> errors
+        for ($r = 1; $r -le $nr; $r++) {
+            for ($c = 1; $c -le $nc; $c++) {
+                if ($nr -eq 1 -and $nc -eq 1) { $v = $vals; $f = $fmls }
+                else { $v = $vals[$r, $c]; $f = $fmls[$r, $c] }
+                $isF = ($f -is [string] -and $f.StartsWith("="))
+                if ($null -eq $v -and -not $isF) { continue }
+                $key = "$($ws.Name)!$(ColName ($c0+$c-1))$($r0+$r-1)"
+                $snap[$key] = @{ f = $(if ($isF) { $f.Substring(1) } else { $null })   # strip '=' to match XML form
+                                 v = $(if ($null -ne $v) { "$v" } else { $null }) }
+            }
+        }
+    }
+    @{ meta = @{ source = "CalculateFullRebuild"; workbook = (Split-Path $Workbook -Leaf)
+                 timestamp = (Get-Date -Format o); error_cells = $errCount }
+       cells = $snap } | ConvertTo-Json -Depth 4 -Compress | Set-Content $Out -Encoding UTF8
+    Write-Output "baseline: $($snap.Count) cells, $errCount error cells -> $Out"
+    $wb.Close($false)
+}
+finally { $excel.Quit()
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+```
+
+Baseline rules:
+
+- **Staleness detection:** independently run `xl_engine.py snapshot` (raw cached values)
+  and diff against the COM baseline. Non-trivial differences prove the file was saved
+  stale — record this in the report; it is itself a finding about the workbook's hygiene.
+- **`meta.error_cells`** is the error floor. Any change that increases it fails the gate.
+- **Iterative calculation ON** (`calcPr.iterate="1"`): circular models may not converge
+  to bit-identical values. Run the baseline **twice**; the observed baseline-to-baseline
+  drift defines the minimum diff tolerance, recorded in the report. If drift exceeds the
+  business-acceptable tolerance, escalate to the user before any modification.
+- **Designated entry-point macros:** if the user names macros that populate results
+  (e.g. `RunModel`), a second baseline variant is captured post-macro-run
+  (`$excel.Run("RunModel")` before snapshotting). Never auto-discover and run macros.
+
+---
+
+## Phase 5 — Change Protocol (the core loop)
+
+Every modification — formula edit, assumption update, business-logic change — follows
+these steps **in order**. No skipping.
+
+```
+1. DECLARE   Change intent: cells/names to modify, expected value deltas (if known)
+2. PREDICT   blast <seeds>  ->  predicted blast radius R  (report count + sheets touched)
+3. BACKUP    Copy-Item workbook.xlsm workbook.backup-<yyyyMMdd-HHmmss>.xlsm
+4. BASELINE  GoldenMaster.ps1 -> before.json   (skip only if a current certified baseline exists)
+5. APPLY     ApplyChange.ps1  (COM edit — never raw XML surgery on .xlsm)
+6. RECALC+   GoldenMaster.ps1 -> after.json    (against the modified file)
+7. DIFF      xl_engine.py diff before.json after.json --exclude <nondeterministic_cells>
+8. GATE      Evaluate (below)
+9. VERDICT   Accept (report) or REVERT from backup (report why)
+```
+
+```powershell
+# ApplyChange.ps1 -Workbook <path> -Changes <changes.json>
+# changes.json: [ { "cell": "Assumptions!B14", "formula": "=B12*1.07" },
+#                 { "cell": "Assumptions!B2",  "value": 250 } ]
+param([Parameter(Mandatory)][string]$Workbook,
+      [Parameter(Mandatory)][string]$Changes)
+$ErrorActionPreference = "Stop"
+$list = Get-Content $Changes -Raw | ConvertFrom-Json
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false; $excel.DisplayAlerts = $false
+$excel.EnableEvents = $false; $excel.AutomationSecurity = 1
+try {
+    $wb = $excel.Workbooks.Open((Resolve-Path $Workbook).Path, 0, $false)
+    foreach ($ch in $list) {
+        $sheet, $addr = $ch.cell -split "!", 2
+        $rng = $wb.Worksheets.Item($sheet).Range($addr)
+        if ($null -ne $ch.formula) { $rng.Formula = $ch.formula }
+        elseif ($null -ne $ch.value) { $rng.Value2 = $ch.value }
+        Write-Output "applied: $($ch.cell)"
+    }
+    $excel.CalculateFullRebuild()
+    while ($excel.CalculationState -ne 0) { Start-Sleep -Milliseconds 200 }
+    $wb.Save(); $wb.Close($true)
+}
+finally { $excel.Quit()
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+```
+
+### The gate (step 8)
+
+| Check | Rule | On failure |
+|---|---|---|
+| **Intended edits present** | Every declared change appears in the diff exactly as intended | REVERT |
+| **Containment** | Every *other* diff entry ∈ predicted blast radius R | REVERT + report escapees with formulas |
+| **Error floor** | `after.meta.error_cells ≤ before.meta.error_cells` | REVERT |
+| **Tolerance** | Numeric diffs use `rel_tol=1e-9, abs_tol=1e-12` (or the iterative-calc drift floor from Phase 4) | flag, human decides |
+| **Nondeterministic exclusion** | `NOW/TODAY/RAND*` cells excluded via `--exclude` | n/a (mandatory setup) |
+
+**Containment downgrade rule:** if Phase 1 found `opaque_ref_cells > 0` on any sheet the
+diff touches, the containment check is downgraded to **advisory** (static graphs cannot
+see through `INDIRECT`/`OFFSET`). The verdict then rests on: intended edits + error floor
++ human review of each out-of-radius diff entry, presented with before/after formulas
+and values. State this downgrade explicitly in the verdict — never present advisory
+containment as a hard guarantee.
+
+### Verdict format (evidence-only)
+
+```
+CHANGE VERDICT: ACCEPTED
+Intent:      Assumptions!B14  =B12*1.05 -> =B12*1.07
+Predicted:   47 dependents across [Calc, Summary, Dashboard]
+Observed:    31 value diffs, all ∈ predicted radius; 0 formula diffs beyond intent
+Error floor: 0 -> 0
+Excluded:    Calc!C1 (NOW), Dashboard!F2 (TODAY)
+Backup:      workbook.backup-20260706-143012.xlsm (retained)
+```
+
+---
+
+## Phase 6 — Calculation Specification (semantic layer)
+
+This is what makes the workbook *understandable* rather than merely *safe*. Generate
+`out/calculation-spec.md`:
+
+1. **Named-range dictionary** — every defined name, its target, its business meaning
+   (inferred from adjacent row/column labels; confidence-annotated: `HIGH` = explicit
+   label cell, `MEDIUM` = header inference, `LOW` = name-only inference).
+2. **Calculation chains** — for each output/summary sheet cell, the precedent chain back
+   to input cells, rendered as: `Summary!C4 ← SUM(Calc!A2:A9) ← Assumptions!{B1 TaxRate, B2}`.
+3. **Sheet-level Mermaid flow** (from Phase 3) embedded.
+4. **VBA logic summaries** — per exported module: procedures, what cells they read/write
+   (from Phase 2.2 census), plain-language description of each UDF used in formulas.
+5. **Blind-spot register** — opaque refs, unresolvable macro writes, external links.
+
+Label inference rule: a cell's business name is taken from the nearest non-empty text
+cell to its left in the same row, or above in the same column — cited as evidence
+(`"Discount Rate" per Assumptions!A14`). Never invent business terminology.
+
+---
+
+## Scorecard (weighted A–F)
+
+| Category | Weight | A | C | F |
+|---|---|---|---|---|
+| Parse & graph fidelity | 25% | Cert 9/9; opaque cells < 1% of formulas | opaque 1–10% | cert failed / opaque > 10% |
+| Baseline integrity | 20% | COM-recalc baseline; staleness measured; drift floor recorded | baseline present, staleness unmeasured | cached values used as baseline |
+| Blast-radius containment | 20% | hard containment held on last 5 changes | advisory only (opaque downgrade) | escapees accepted without review |
+| Regression verification | 25% | diff gate passed, error floor held | tolerance flags human-resolved | gate skipped or reverts unlogged |
+| VBA coverage | 10% | all modules exported + census complete | export blocked by trust setting (documented) | macros present, unanalyzed, unmentioned |
+
+Grade = weighted average; **any single F caps the overall grade at D**, because each
+category is a load-bearing safety mechanism, not a style point.
+
+---
+
+## Fidelity Ledger
+
+| Decision | Status | Rationale |
+|---|---|---|
+| Python/JS formula re-evaluation | **REJECTED** | No implementation reaches full Excel semantics (dates, precision, implicit intersection, dynamic arrays). Partial fidelity is worse than none for "must not go wrong" workloads. |
+| LibreOffice headless recalc | **REJECTED** for .xlsm | Function-level result divergences; known risk of VBA project damage on save. |
+| Raw XML surgery on .xlsm | **REJECTED** for writes | Shared-formula tables, calc chain part, and VBA-adjacent parts make hand-edits corruption-prone. Reads via XML are fine; writes go through COM only. |
+| Static resolution of `INDIRECT`/`OFFSET` | **NOT POSSIBLE** | Runtime-computed references. Mitigated by containment downgrade rule + diff gate. |
+| VBA runtime behavior verification | **PARTIAL** | Structural census only, plus baselines for user-designated entry macros. Arbitrary macro behavior is not exercised. |
+| Nondeterministic functions in diffs | **EXCLUDED** | `NOW/TODAY/RAND*` diffs carry no regression signal. Exclusion list is auto-derived (Phase 1), never hand-maintained. |
+| External link values | **FROZEN** | Opened with no link update; boundary values are those cached at baseline time. Refresh is an explicit, user-approved operation. |
+| Excel COM scripts | **RUNTIME-CERTIFIED** | Authored on Linux without Excel; Phase 0.1 smoke test certifies them on the target machine before first use. The Python engine (Appendix A) is live-verified 9/9 in the authoring environment. |
+
+---
+
+## Hard Aborts
+
+- Phase 0.2 < 9/9 → **stop everything**
+- Phase 0.1 fails → analysis-only mode; refuse modification requests with the reason
+- `CalculationState` never reaches done within timeout (default 10 min) → kill Excel
+  process, report; suspect runaway iterative calc or external-link stall
+- Diff gate containment failure → **automatic revert from backup**, then report
+- Workbook is password-protected / opened by another process → stop, ask user
+- User requests a change to a cell inside an unresolvable macro-write target → refuse
+  the automated path; require the VBA change route (edit exported module, human review,
+  re-import) instead
+
+---
+
+## Appendix A — `scripts/xl_engine.py` (live-verified, 9/9)
+
+```python
+#!/usr/bin/env python3
+"""xl_engine.py — stdlib-only Excel calculation-engine analyzer.
+
+Subcommands:
+  inventory <wb>                       Workbook census (sheets, names, VBA, externals, volatiles, calc settings)
+  graph     <wb> [--out graph.json]    Build full cell-level dependency graph
+  blast     <wb> <Sheet!Cell> [...]    Transitive dependents (blast radius) of one or more cells
+  snapshot  <wb> [--out snap.json]     Dump cached values+formulas (STALE-RISK: baseline must come from COM recalc)
+  diff      <a.json> <b.json>          Compare two snapshots with tolerance + volatile exclusion
+
+Zero dependencies. Python 3.8+. Reads .xlsx and .xlsm (ignores vbaProject.bin content; reports its presence).
+"""
+import sys, json, re, zipfile, argparse, math
+import xml.etree.ElementTree as ET
+
+NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+NONDETERMINISTIC = {"NOW", "TODAY", "RAND", "RANDBETWEEN", "RANDARRAY"}
+OPAQUE_REF_FUNCS = {"INDIRECT", "OFFSET"}  # references not statically resolvable
+RANGE_EXPANSION_CAP = 10000  # cells; beyond this a single range-node is used
+
+# ---------------------------------------------------------------- utilities
+def col_to_idx(col):
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+def idx_to_col(n):
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def split_ref(ref):
+    """'$B$12' -> (colAbs, 'B', rowAbs, 12)"""
+    m = re.fullmatch(r"(\$?)([A-Z]{1,3})(\$?)(\d{1,7})", ref)
+    return (m.group(1) == "$", m.group(2), m.group(3) == "$", int(m.group(4)))
+
+STRING_LIT = re.compile(r'"(?:[^"]|"")*"')
+# sheet-qualified or bare cell/range ref; suffix guards reject function names like LOG10(
+CELL_REF = re.compile(
+    r"(?:((?:'(?:[^']|'')+')|[A-Za-z_\u00A1-\uFFFF][\w.\u00A1-\uFFFF]*)!)?"
+    r"(\$?[A-Z]{1,3}\$?\d{1,7}(?::\$?[A-Z]{1,3}\$?\d{1,7})?)"
+    r"(?![\w(:])"
+)
+IDENT = re.compile(r"(?<![\w.!'])([A-Za-z_\\][\w.\\]*)(?!\s*\()(?![\w.!])")
+FUNC = re.compile(r"([A-Za-z_][\w.]*)\s*\(")
+
+def strip_strings(formula):
+    return STRING_LIT.sub('""', formula)
+
+def norm_sheet(s):
+    if s and s.startswith("'"):
+        return s[1:-1].replace("''", "'")
+    return s
+
+# ---------------------------------------------------------------- load
+def load_workbook(path):
+    z = zipfile.ZipFile(path)
+    names = set(z.namelist())
+    wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
+    rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    rel_map = {r.get("Id"): r.get("Target") for r in rels.iter(f"{PKG_REL_NS}Relationship")}
+    sheets = []
+    for sh in wb_xml.iter(f"{NS}sheet"):
+        target = rel_map.get(sh.get(f"{R_NS}id"), "")
+        if not target.startswith("/"):
+            target = "xl/" + target
+        else:
+            target = target.lstrip("/")
+        sheets.append({"name": sh.get("name"), "path": target,
+                       "state": sh.get("state", "visible")})
+    defined = {}
+    for dn in wb_xml.iter(f"{NS}definedName"):
+        if dn.text:
+            defined[dn.get("name")] = dn.text.strip()
+    calc = wb_xml.find(f"{NS}calcPr")
+    calc_pr = dict(calc.attrib) if calc is not None else {}
+    return z, names, sheets, defined, calc_pr
+
+def iter_cells(z, sheet_path):
+    """Yield (ref, formula_elem_attrs, formula_text, cached_value, cell_type)."""
+    root = ET.fromstring(z.read(sheet_path))
+    for c in root.iter(f"{NS}c"):
+        f = c.find(f"{NS}f")
+        v = c.find(f"{NS}v")
+        yield (c.get("r"),
+               dict(f.attrib) if f is not None else None,
+               (f.text or "") if f is not None else None,
+               v.text if v is not None else None,
+               c.get("t", "n"))
+
+# ------------------------------------------------- shared formula expansion
+def translate_formula(formula, drow, dcol):
+    """Shift relative refs in a shared-formula master by (drow, dcol)."""
+    stripped_positions = []
+    def _shift(m):
+        sheet, ref = m.group(1), m.group(2)
+        parts = ref.split(":")
+        out = []
+        for p in parts:
+            ca, col, ra, row = split_ref(p)
+            ncol = col if ca else idx_to_col(col_to_idx(col) + dcol)
+            nrow = row if ra else row + drow
+            out.append(f"{'$' if ca else ''}{ncol}{'$' if ra else ''}{nrow}")
+        pref = (m.group(1) + "!") if m.group(1) else ""
+        return pref + ":".join(out)
+    # protect string literals, shift, restore
+    lits = []
+    def _stash(m):
+        lits.append(m.group(0))
+        return f"\x00{len(lits)-1}\x00"
+    tmp = STRING_LIT.sub(_stash, formula)
+    tmp = CELL_REF.sub(_shift, tmp)
+    return re.sub(r"\x00(\d+)\x00", lambda m: lits[int(m.group(1))], tmp)
+
+def expand_shared(cells_by_sheet):
+    """cells_by_sheet: {sheet: {ref: cell_dict}} — fill in slave shared formulas."""
+    for sheet, cells in cells_by_sheet.items():
+        masters = {}
+        for ref, c in cells.items():
+            fa = c.get("f_attrs")
+            if fa and fa.get("t") == "shared" and c.get("formula"):
+                masters[fa.get("si")] = (ref, c["formula"])
+        for ref, c in cells.items():
+            fa = c.get("f_attrs")
+            if fa and fa.get("t") == "shared" and not c.get("formula"):
+                si = fa.get("si")
+                if si in masters:
+                    mref, mformula = masters[si]
+                    _, mc, _, mr = split_ref(mref)
+                    _, cc, _, cr = split_ref(ref)
+                    c["formula"] = translate_formula(
+                        mformula, cr - mr, col_to_idx(cc) - col_to_idx(mc))
+                    c["shared_expanded"] = True
+
+# ---------------------------------------------------------------- inventory
+def build_model(path):
+    z, names, sheets, defined, calc_pr = load_workbook(path)
+    cells_by_sheet = {}
+    for sh in sheets:
+        cells = {}
+        for ref, f_attrs, formula, value, ctype in iter_cells(z, sh["path"]):
+            cells[ref] = {"f_attrs": f_attrs, "formula": formula,
+                          "value": value, "type": ctype}
+        cells_by_sheet[sh["name"]] = cells
+    expand_shared(cells_by_sheet)
+    return {"zip_names": names, "sheets": sheets, "defined": defined,
+            "calc_pr": calc_pr, "cells": cells_by_sheet}
+
+def inventory(path):
+    m = build_model(path)
+    vol, opaque, ext = [], [], []
+    n_formulas = n_shared = n_array = 0
+    for sheet, cells in m["cells"].items():
+        for ref, c in cells.items():
+            f = c.get("formula")
+            if not f:
+                continue
+            n_formulas += 1
+            fa = c.get("f_attrs") or {}
+            if fa.get("t") == "shared":
+                n_shared += 1
+            if fa.get("t") == "array":
+                n_array += 1
+            funcs = set(x.upper() for x in FUNC.findall(strip_strings(f)))
+            if funcs & NONDETERMINISTIC:
+                vol.append(f"{sheet}!{ref}")
+            if funcs & OPAQUE_REF_FUNCS:
+                opaque.append(f"{sheet}!{ref}")
+            if "[" in strip_strings(f) and re.search(r"\[\d+\]", f):
+                ext.append(f"{sheet}!{ref}")
+    report = {
+        "sheets": [{"name": s["name"], "state": s["state"]} for s in m["sheets"]],
+        "defined_names": m["defined"],
+        "vba_present": "xl/vbaProject.bin" in m["zip_names"],
+        "external_links": sorted(n for n in m["zip_names"]
+                                 if n.startswith("xl/externalLinks/")),
+        "external_ref_cells": ext,
+        "calc_settings": m["calc_pr"],
+        "iterative_calc": m["calc_pr"].get("iterate") == "1",
+        "formula_cells": n_formulas,
+        "shared_formula_cells": n_shared,
+        "array_formula_cells": n_array,
+        "nondeterministic_cells": vol,
+        "opaque_ref_cells (INDIRECT/OFFSET — graph blind spots)": opaque,
+    }
+    return report, m
+
+# ---------------------------------------------------------------- graph
+def refs_in_formula(formula, defined, sheets, current_sheet):
+    """Return set of precedent node ids ('Sheet!A1' or 'Sheet!A1:B9' or 'NAME')."""
+    sheet_names = {s["name"] for s in sheets}
+    clean = strip_strings(formula)
+    out = set()
+    spans = []
+    for mm in CELL_REF.finditer(clean):
+        spans.append(mm.span())
+        sheet = norm_sheet(mm.group(1)) or current_sheet
+        if mm.group(1) and norm_sheet(mm.group(1)) not in sheet_names:
+            out.add(f"EXTERNAL::{norm_sheet(mm.group(1))}!{mm.group(2)}")
+            continue
+        out.add(f"{sheet}!{mm.group(2).replace('$', '')}")
+    for mm in IDENT.finditer(clean):
+        if any(a <= mm.start(1) < b for a, b in spans):
+            continue
+        name = mm.group(1)
+        if name.upper() in ("TRUE", "FALSE"):
+            continue
+        if name in defined:
+            out.add(f"NAME::{name}")
+    return out
+
+def expand_node(node, defined, sheets, depth=0):
+    """Expand range-nodes/named-range-nodes to individual cell ids (capped)."""
+    if node.startswith("NAME::") and depth < 4:
+        target = defined.get(node[6:], "")
+        cells = set()
+        clean = strip_strings(target)
+        for mm in CELL_REF.finditer(clean):
+            sheet = norm_sheet(mm.group(1)) or ""
+            cells |= expand_node(f"{sheet}!{mm.group(2).replace('$','')}",
+                                 defined, sheets, depth + 1)
+        return cells or {node}
+    if "!" in node and ":" in node:
+        sheet, rng = node.split("!", 1)
+        a, b = rng.split(":")
+        _, c1, _, r1 = split_ref(a)
+        _, c2, _, r2 = split_ref(b)
+        ci1, ci2 = sorted((col_to_idx(c1), col_to_idx(c2)))
+        r1, r2 = sorted((r1, r2))
+        if (ci2 - ci1 + 1) * (r2 - r1 + 1) > RANGE_EXPANSION_CAP:
+            return {node}  # keep as a range-node
+        return {f"{sheet}!{idx_to_col(c)}{r}"
+                for c in range(ci1, ci2 + 1) for r in range(r1, r2 + 1)}
+    return {node}
+
+def build_graph(path):
+    report, m = inventory(path)
+    precedents = {}   # node -> set of precedent nodes (expanded to cells)
+    for sheet, cells in m["cells"].items():
+        for ref, c in cells.items():
+            if not c.get("formula"):
+                continue
+            node = f"{sheet}!{ref}"
+            precs = set()
+            for p in refs_in_formula(c["formula"], m["defined"], m["sheets"], sheet):
+                precs |= expand_node(p, m["defined"], m["sheets"])
+            precedents[node] = precs
+    dependents = {}
+    for node, precs in precedents.items():
+        for p in precs:
+            dependents.setdefault(p, set()).add(node)
+    return report, m, precedents, dependents
+
+def blast_radius(dependents, seeds):
+    seen, frontier = set(), list(seeds)
+    while frontier:
+        n = frontier.pop()
+        for d in dependents.get(n, ()):
+            if d not in seen:
+                seen.add(d)
+                frontier.append(d)
+    return seen
+
+# ---------------------------------------------------------------- snapshot/diff
+def snapshot(path):
+    _, m = inventory(path)
+    snap = {}
+    for sheet, cells in m["cells"].items():
+        for ref, c in cells.items():
+            if c.get("formula") is None and c.get("value") is None:
+                continue
+            snap[f"{sheet}!{ref}"] = {"f": c.get("formula"),
+                                      "v": c.get("value"), "t": c.get("type")}
+    return snap
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+def diff(a, b, rel_tol=1e-9, abs_tol=1e-12, exclude=()):
+    changes = []
+    keys = set(a) | set(b)
+    for k in sorted(keys):
+        if any(k == e or k.startswith(e) for e in exclude):
+            continue
+        ca, cb = a.get(k), b.get(k)
+        if ca is None or cb is None:
+            changes.append({"cell": k, "kind": "added" if ca is None else "removed"})
+            continue
+        if (ca.get("f") or "") != (cb.get("f") or ""):
+            changes.append({"cell": k, "kind": "formula",
+                            "before": ca.get("f"), "after": cb.get("f")})
+        na, nb = _num(ca.get("v")), _num(cb.get("v"))
+        if na is not None and nb is not None:
+            if not math.isclose(na, nb, rel_tol=rel_tol, abs_tol=abs_tol):
+                changes.append({"cell": k, "kind": "value",
+                                "before": ca.get("v"), "after": cb.get("v")})
+        elif (ca.get("v") or "") != (cb.get("v") or ""):
+            changes.append({"cell": k, "kind": "value",
+                            "before": ca.get("v"), "after": cb.get("v")})
+    return changes
+
+# ---------------------------------------------------------------- mermaid
+def sheet_mermaid(precedents):
+    agg = {}
+    for node, precs in precedents.items():
+        dst = node.split("!")[0]
+        for p in precs:
+            if p.startswith("EXTERNAL::"):
+                src = "EXTERNAL"
+            elif "!" in p:
+                src = p.split("!")[0]
+            else:
+                continue
+            if src != dst:
+                agg[(src, dst)] = agg.get((src, dst), 0) + 1
+    lines = ["flowchart LR"]
+    for (src, dst), n in sorted(agg.items()):
+        lines.append(f'    {re.sub(r"[^A-Za-z0-9_]", "_", src)}'
+                     f'["{src}"] -->|{n} refs| '
+                     f'{re.sub(r"[^A-Za-z0-9_]", "_", dst)}["{dst}"]')
+    return "\n".join(lines)
+
+# ---------------------------------------------------------------- CLI
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("inventory"); p.add_argument("wb")
+    p = sub.add_parser("graph"); p.add_argument("wb"); p.add_argument("--out")
+    p = sub.add_parser("blast"); p.add_argument("wb"); p.add_argument("cells", nargs="+")
+    p = sub.add_parser("snapshot"); p.add_argument("wb"); p.add_argument("--out")
+    p = sub.add_parser("mermaid"); p.add_argument("wb")
+    p = sub.add_parser("diff"); p.add_argument("a"); p.add_argument("b")
+    p.add_argument("--exclude", nargs="*", default=[])
+    args = ap.parse_args()
+
+    if args.cmd == "inventory":
+        print(json.dumps(inventory(args.wb)[0], indent=2))
+    elif args.cmd == "graph":
+        _, _, precedents, dependents = build_graph(args.wb)
+        out = {"precedents": {k: sorted(v) for k, v in precedents.items()},
+               "dependents": {k: sorted(v) for k, v in dependents.items()}}
+        if args.out:
+            json.dump(out, open(args.out, "w"), indent=1)
+            print(f"graph written: {args.out} "
+                  f"({len(precedents)} formula nodes)")
+        else:
+            print(json.dumps(out, indent=2))
+    elif args.cmd == "mermaid":
+        _, _, precedents, _ = build_graph(args.wb)
+        print(sheet_mermaid(precedents))
+    elif args.cmd == "blast":
+        _, _, _, dependents = build_graph(args.wb)
+        hit = blast_radius(dependents, args.cells)
+        print(json.dumps({"seeds": args.cells, "affected": sorted(hit),
+                          "count": len(hit)}, indent=2))
+    elif args.cmd == "snapshot":
+        s = snapshot(args.wb)
+        if args.out:
+            json.dump(s, open(args.out, "w"), indent=1)
+            print(f"snapshot written: {args.out} ({len(s)} cells)")
+        else:
+            print(json.dumps(s, indent=2))
+    elif args.cmd == "diff":
+        a = json.load(open(args.a)); b = json.load(open(args.b))
+        changes = diff(a, b, exclude=tuple(args.exclude))
+        print(json.dumps(changes, indent=2))
+        sys.exit(1 if changes else 0)
+
+if __name__ == "__main__":
+    main()
+```
+
+## Appendix B — Certification harness
+
+### `scripts/make_cert_wb.py`
+
+```python
+"""Generate a test workbook via pure stdlib (zipfile + hand-built XML).
+
+Contains the traps a naive parser fails on:
+- shared formulas (formula stored only in master cell)
+- cross-sheet references
+- named ranges used inside formulas
+- volatile function (NOW)
+- string literal containing something that LOOKS like a sheet reference
+- array formula
+"""
+import zipfile
+
+CT = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"""
+
+RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+
+WB = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets>
+<sheet name="Assumptions" sheetId="1" r:id="rId1"/>
+<sheet name="Calc" sheetId="2" r:id="rId2"/>
+</sheets>
+<definedNames>
+<definedName name="TaxRate">Assumptions!$B$1</definedName>
+</definedNames>
+<calcPr calcId="191029" iterate="0"/>
+</workbook>"""
+
+WB_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+</Relationships>"""
+
+SHEET1 = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="B1"><v>0.05</v></c></row>
+<row r="2"><c r="B2"><v>100</v></c></row>
+</sheetData>
+</worksheet>"""
+
+# Calc sheet:
+# A1 = Assumptions!B2*2               (cross-sheet)
+# A2 = A1*TaxRate  (shared master, ref A2:A4)   -> A3 = A2*TaxRate, A4 = A3*TaxRate after expansion
+# B1 = {SUM(A2:A4)}                   (array formula)
+# C1 = NOW()                          (volatile)
+# D1 = IF(A1&gt;0,"Sheet3!Z9",A1)     (string-literal trap; Sheet3!Z9 must NOT become an edge)
+SHEET2 = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1">
+<c r="A1"><f>Assumptions!B2*2</f><v>200</v></c>
+<c r="B1"><f t="array" ref="B1:B1">SUM(A2:A4)</f><v>10.5262</v></c>
+<c r="C1"><f>NOW()</f><v>45000.5</v></c>
+<c r="D1" t="str"><f>IF(A1&gt;0,"Sheet3!Z9",A1)</f><v>Sheet3!Z9</v></c>
+</row>
+<row r="2"><c r="A2"><f t="shared" ref="A2:A4" si="0">A1*TaxRate</f><v>10</v></c></row>
+<row r="3"><c r="A3"><f t="shared" si="0"/><v>0.5</v></c></row>
+<row r="4"><c r="A4"><f t="shared" si="0"/><v>0.025</v></c></row>
+</sheetData>
+</worksheet>"""
+
+with zipfile.ZipFile("test_wb.xlsx", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml", CT)
+    z.writestr("_rels/.rels", RELS)
+    z.writestr("xl/workbook.xml", WB)
+    z.writestr("xl/_rels/workbook.xml.rels", WB_RELS)
+    z.writestr("xl/worksheets/sheet1.xml", SHEET1)
+    z.writestr("xl/worksheets/sheet2.xml", SHEET2)
+
+print("test_wb.xlsx written")
+```
+
+### `scripts/certify.py`
+
+```python
+"""Harness certification for xl_engine.py against test_wb.xlsx (9 checks)."""
+import json, sys
+sys.path.insert(0, "scripts")
+from xl_engine import inventory, build_graph, blast_radius, snapshot, diff
+
+WB = "test_wb.xlsx"
+results = []
+def check(name, cond, detail=""):
+    results.append((name, bool(cond), detail))
+
+rep, m = inventory(WB)
+report, model, precedents, dependents = build_graph(WB)
+
+# 1. Sheet enumeration
+check("sheet enumeration", [s["name"] for s in rep["sheets"]] == ["Assumptions", "Calc"])
+
+# 2. Defined name resolution
+check("defined name TaxRate", rep["defined_names"].get("TaxRate") == "Assumptions!$B$1")
+
+# 3. Shared formula expansion with relative-ref translation
+a3 = model["cells"]["Calc"]["A3"]["formula"]
+a4 = model["cells"]["Calc"]["A4"]["formula"]
+check("shared formula expansion", a3 == "A2*TaxRate" and a4 == "A3*TaxRate",
+      f"A3={a3!r} A4={a4!r}")
+
+# 4. Cross-sheet edge: Calc!A1 <- Assumptions!B2
+check("cross-sheet edge", "Assumptions!B2" in precedents.get("Calc!A1", set()),
+      str(precedents.get("Calc!A1")))
+
+# 5. Named-range edge resolves through to Assumptions!B1
+check("named range edge", "Assumptions!B1" in precedents.get("Calc!A2", set()),
+      str(precedents.get("Calc!A2")))
+
+# 6. Volatile detection
+check("volatile detection", rep["nondeterministic_cells"] == ["Calc!C1"],
+      str(rep["nondeterministic_cells"]))
+
+# 7. String-literal trap: no edge to Sheet3!Z9 from Calc!D1
+d1 = precedents.get("Calc!D1", set())
+check("string-literal trap", not any("Sheet3" in p for p in d1), str(d1))
+
+# 8. Blast radius: change Assumptions!B2 -> A1, A2, A3, A4, B1 on Calc (5 cells)
+hit = blast_radius(dependents, ["Assumptions!B2"])
+expect = {"Calc!A1", "Calc!A2", "Calc!A3", "Calc!A4", "Calc!B1", "Calc!D1"}
+check("blast radius transitive", hit == expect, str(sorted(hit)))
+
+# 9. Diff gate: perturb one value beyond tolerance, exclude volatile
+base = snapshot(WB)
+mod = json.loads(json.dumps(base))
+mod["Calc!A1"]["v"] = "200.001"          # real change
+mod["Calc!C1"]["v"] = "45999.9"          # volatile churn -> must be excluded
+changes = diff(base, mod, exclude=("Calc!C1",))
+check("diff gate + volatile exclusion",
+      len(changes) == 1 and changes[0]["cell"] == "Calc!A1"
+      and changes[0]["kind"] == "value", str(changes))
+
+passed = sum(1 for _, ok, _ in results if ok)
+for name, ok, detail in results:
+    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"   [{detail}]" if not ok else ""))
+print(f"\n{passed}/{len(results)} certification checks passed")
+sys.exit(0 if passed == len(results) else 1)
+```
