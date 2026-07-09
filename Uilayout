@@ -1,0 +1,59 @@
+Enhance an existing React chat/run screen in this codebase. The screen
+currently lets a user select task modules, pick a repository, type a prompt,
+and execute an AI agent run. Today it shows a flat activity log, an empty
+"waiting for output" result panel, and duplicate "RUNNING" status badges
+scattered across several cards. Do not add new backend calls — reuse the
+existing state, props, and websocket/polling data the screen already
+receives. Refactor the presentation only, keeping all current functionality
+(module selection, repo field, prompt input, execute action, log display,
+result display) intact.
+
+Restructure the screen as follows:
+
+1. Consolidate status: remove all duplicate "RUNNING" badges. Add ONE
+   telemetry strip below the page header with stat cells: run status
+   (pulsing live dot + run ID), elapsed time (ticking), total tokens
+   in/out if available, steps complete (e.g. 3/5), and retry count.
+   Monospace font, tabular numerals. If a metric isn't available in
+   existing state, render the cell with a "—" placeholder.
+
+2. Move the existing configuration controls (module checkboxes, repository
+   field, prompt textarea, execute button) into a collapsible left rail
+   (~270px, collapses to a thin strip). While a run is active, show the
+   execute button as disabled with "run in progress".
+
+3. Replace the flat activity log with an execution trace: a waterfall/
+   Gantt view on a shared time axis. One row per pipeline step: status
+   dot (done / running / pending), step name, a time-span bar positioned
+   by start time and duration, duration + token count right-aligned.
+   Derive rows from the existing log/step events; if start/end timestamps
+   exist, position bars proportionally, otherwise fall back to equal-width
+   segments. The running step's bar grows over time with a subtle animated
+   gradient; done bars are muted; pending steps show dashed ghost bars.
+   Show an amber "retry N" badge on any step with more than one attempt.
+   Rows are clickable to select.
+
+4. Below the trace, add a split pane: left = live log tail for the
+   selected step (timestamped lines, amber highlight for timeout/retry
+   lines, blinking cursor on the last line while running); right = the
+   result panel upgraded with tabs (Report / Artifacts / Raw JSON).
+   While the run is incomplete, show any partial output already produced
+   plus a note that the final result is pending — never a bare empty state.
+
+5. Add a slim status footer: connection status, environment name, and
+   keyboard hints in small monospace text.
+
+Visual direction: dark mission-control aesthetic. Very dark desaturated
+green-black background (#0B100E), warm off-white text (#E4EBE6), 1px
+hairline borders (#1F2B25). One luminous jade (#3BE39B) reserved ONLY for
+live/running activity; completed = muted jade, pending = dim outline.
+Amber (#F0B45B) for warnings/retries, soft red for the abort action.
+Grotesque sans (e.g. Archivo) for UI labels, JetBrains Mono for all data,
+IDs, timestamps, and logs. Uppercase 10px letter-spaced eyebrow labels
+for section headers. Animations limited to: pulsing live dot, gradient
+sweep on the active bar, blinking log cursor — respect
+prefers-reduced-motion. Keep all controls keyboard-focusable with visible
+focus rings.
+
+Preserve existing routing, API calls, and state management. Ship this as
+a presentational refactor of the current screen's components.
