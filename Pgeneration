@@ -1,0 +1,103 @@
+# Copilot Agent Mode Prompt — Playbook Production Refactor (Final)
+
+Copy everything below the line into Copilot Agent Mode. Fill the two placeholders at the top.
+
+---
+
+You are refactoring the agent playbooks in this repository to production standard and migrating them to the native Agent Skills format. Playbooks currently live in `<PLAYBOOKS_DIR>`. Target harness: `<HARNESS>` (e.g., GitHub Copilot Agent Mode / coding agent).
+
+## Non-negotiable rules
+
+1. **Zero stubs.** Every edit must be complete and immediately usable. No `TODO`, no placeholders, no "example only." If a section cannot be completed from repository evidence, flag it in the final report — do not invent content.
+2. **Do not change playbook intent.** Preserve every domain-specific step, threshold, and constraint exactly. You are restructuring and removing waste, not redesigning workflows.
+3. **One commit-ready result per playbook.** No alternative versions.
+4. **Token economy is a first-class requirement** (Phase 3). Every retained line must earn its context cost.
+
+## Phase 1 — Inventory (read-only)
+
+Enumerate every playbook file. For each, record file path, line count, declared purpose, and classify every section into exactly one of:
+
+- **WORKFLOW** — domain steps the agent must perform
+- **VERIFICATION** — gates, checks, acceptance criteria, done-conditions
+- **OUTPUT CONTRACT** — required output files, formats, schemas, naming
+- **REPO CONVENTION** — build commands, naming rules, stack facts, coding standards that apply repo-wide (not task-specific)
+- **RUNTIME BOILERPLATE** — agent loops, ReAct descriptions, retry/backoff policies, circuit breakers, memory-management instructions, prompt-injection "safety" prose, generic resilience text
+- **DEAD WEIGHT** — duplicates, motivational filler, restated harness defaults, sections never referenced by any step
+
+Produce this inventory as a table before editing anything.
+
+## Phase 2 — Refactor content (apply to every playbook)
+
+### Delete
+- All RUNTIME BOILERPLATE. The harness owns looping, retries, and context management. Replace any retry section with at most one line: "On failure, read the error, fix the root cause, and re-run. Never blind-retry an identical command."
+- All DEAD WEIGHT.
+- Any instruction telling the agent how to think, plan, or manage its own memory.
+
+### Hoist
+- Move every REPO CONVENTION section into a single root `AGENTS.md` (create it if absent; merge without duplication if present). Playbooks must not restate anything that lives in `AGENTS.md`. If a playbook needs a convention, it relies on the always-on layer — no copies.
+
+### Keep and strengthen
+- **Verification gates.** Every playbook must end with a mechanically checkable done-condition (a command that must exit 0, a file that must exist with a specific structure, a test suite that must pass). If absent, write one from the playbook's stated purpose and mark it `[INFERRED]`.
+- **Output contract.** Every playbook must state exactly what artifacts it produces, where, and in what format. If missing, derive it and mark `[INFERRED]`.
+- **Failure semantics.** One short section: what constitutes failure and what must be reported on failure. Never silent partial success.
+
+### Restructure
+Enforce this exact structure in every playbook body:
+1. `## Preconditions` — required tools, files, environment
+2. `## Workflow` — numbered domain steps
+3. `## Verification` — gates and done-condition
+4. `## Output Contract` — artifacts, paths, formats
+5. `## Failure Handling` — one short section
+
+Replace every vague instruction ("handle appropriately", "as needed", "robustly") with a concrete rule or delete it. Resolve conflicts between playbooks in favor of the newer/stricter rule and record the decision.
+
+## Phase 3 — Token economy pass
+
+Apply these rules to every playbook after Phase 2. Goal: minimum context cost per invocation with zero loss of instruction fidelity.
+
+1. **Body budget.** Target ≤150 lines per SKILL.md body; hard ceiling 500. Anything beyond the budget that is genuinely needed moves to `references/<topic>.md` with an explicit load instruction ("Read `references/x.md` before step N — skip otherwise"). Never split a file already under ~150 lines; indirection has its own cost.
+2. **Scripts over prose.** Any deterministic multi-step procedure (parsing, scaffolding, validation, data transforms) becomes an executable script in `scripts/`, invoked by one workflow line. Scripts execute without being loaded into context — this is the single largest token win. Scripts must be complete and runnable, not sketches.
+3. **Conditional references.** Every `references/` file must state in the pointer *when* to read it. No unconditional "read all references first" instructions.
+4. **No inline dumps.** Delete embedded logs, long example outputs, and full file listings from playbook bodies. If an example is essential, keep one minimal example; move extended examples to references.
+5. **Compression without loss.** Convert paragraph instructions into terse numbered steps. Remove hedging words, restated context, and courtesy language. Every sentence must change agent behavior; delete any that don't.
+6. **Frugal-agent instructions.** Where a workflow has the agent reading repository files, require targeted reads: search/grep for the relevant symbol before opening files, read only needed line ranges, never dump entire directories or large files into context, and summarize command output instead of pasting it into reports.
+7. **Description discipline.** Descriptions do triggering only — what the skill does plus concrete trigger phrases/situations. No workflow content in the description. Max 1024 characters.
+8. **Report the savings.** Record per playbook: body line count before/after, lines moved to references, procedures converted to scripts.
+
+## Phase 4 — Migrate to Agent Skills format
+
+Convert every refactored playbook into a native skill:
+
+1. Create `.github/skills/<skill-name>/SKILL.md` for each playbook. Directory name = skill name.
+2. Frontmatter, spec-compliant:
+   - `name`: lowercase, hyphens, ≤64 chars, matching the directory
+   - `description`: ≤1024 chars, trigger-optimized — state what the skill does AND the specific user phrases/situations that should trigger it. Err on the side of explicit trigger phrases; agents under-trigger on vague descriptions.
+   - `argument-hint`: add where the skill takes an obvious input (file path, module name)
+   - `disable-model-invocation: true` for any skill that is destructive, migratory, or expensive (deletes/rewrites code at scale, runs long jobs). These must be manual-invoke only. All others may keep auto-invocation.
+3. Move supporting material into `references/` and `scripts/` subfolders per skill, per the Phase 3 rules.
+4. Do not delete the original playbook files in this pass — leave them in place and list them in the report under "safe to remove after validation."
+
+## Phase 5 — Cross-skill consistency
+
+- Unify terminology, section names, and output file naming across all skills.
+- Deduplicate: if the same procedure appears in 2+ skills, extract to `.github/skills/_shared/references/<name>.md` and point both at it.
+- Build/refresh `PLAYBOOK_INDEX.md`: one row per skill — name, one-line purpose, trigger phrases, invocation mode (auto/manual), primary output.
+
+## Phase 6 — Verify your own work
+
+Before finishing:
+1. Re-read every SKILL.md end-to-end: zero stubs, zero boilerplate, mandatory structure present, frontmatter within spec limits.
+2. Confirm every skill has a mechanically checkable done-condition.
+3. Diff each skill's Workflow section against the Phase 1 inventory — confirm no domain step was lost.
+4. Confirm no playbook restates content now living in `AGENTS.md`.
+5. If the `gh` CLI (≥2.90) is available, run the Agent Skills spec validation in dry-run mode against the skills directory and fix any reported metadata issues. If unavailable, note it in the report and validate frontmatter limits manually.
+
+## Final report (required)
+
+Output `REFACTOR_REPORT.md` containing:
+- Per skill: before/after body line counts, sections deleted (with category), content hoisted to `AGENTS.md`, lines moved to references, procedures converted to scripts, anything marked `[INFERRED]`, invocation mode chosen and why
+- Cross-skill decisions (conflicts resolved, shared procedures extracted)
+- Original playbook files safe to remove after validation
+- Open items unresolvable from repository evidence — listed explicitly, never silently skipped
+
+Do not declare completion until all six phases are done and `REFACTOR_REPORT.md` exists.
