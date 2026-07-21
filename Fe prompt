@@ -1,0 +1,81 @@
+# Copilot Agent Mode — DA landing UI (Catalog Search + Intelligent DA)
+
+Frontend-only task. Backend API already exists — integrate it, do not build it. Follow every rule. Stop and report if any rule cannot be met.
+
+## Rules (non-negotiable)
+- Product name, UI copy, and routes: use **DA** only — never its long form. Gateway and marketplace: use **Tach** only — never its long form. Applies to code, copy, and identifiers.
+- Sources are exactly: `IDP`, `Tach Agent Marketplace`, `Enterprise Git`.
+- Light theme only. Use existing design tokens/components. Do not add UI frameworks.
+- No hardcoded API base URLs, tokens, or secrets. Read from existing config/env.
+- Preserve existing auth/session handling. Keep diffs small and typed.
+
+## Stack
+React + Vite + TypeScript. Data fetching via the repo's existing query/cache layer.
+
+## API it consumes (already live — client + types only)
+- `GET /api/da/search` → `{ items: Entity[], total, facetCounts }` — params `q, type, source[], lifecycle[], owner, sort, page, pageSize`.
+- `GET /api/da/entities/{id}` → entity + resolved `dependsOn` + reverse `usedBy`.
+- `GET /api/da/stats` → KPI counters + 7-day sparkline series.
+- `POST /api/da/ask` → `{ summary, matches: Entity[], sources, estimatedSavingsDays, grounded }`.
+
+`Entity`:
+```ts
+type Entity = {
+  id: string;
+  type: "component" | "prompt" | "repo" | "api" | "agent";
+  source: "Enterprise Git" | "Tach Agent Marketplace" | "IDP";
+  lifecycle: "production" | "beta" | "experimental";
+  owner: string;
+  language: string;
+  description: string;
+  tags: string[];
+  reuseCount: number;
+  growth7d: number;
+  updatedAt: string;
+  dependsOn: string[];
+  install: string;
+  sparkline: number[];
+};
+```
+
+## App shell
+- Left sidebar: brand + `UAT` badge; `⌘K` trigger; nav "Browse" (All, Components, Prompts, Repositories, APIs, Agents — each with a live count) + "Saved views" (Trending now, Most reused, My components) + "Workspace" (Playbook Store, Insights); user pinned bottom.
+- Top bar: breadcrumb `Catalog / <view>`, `Export`, `Register`.
+- Sidebar → drawer under 960px. Table → stacked rows under 680px.
+
+## Mode switch (top of content, required)
+- Segmented control: `🔍 Catalog Search` (default) and `✨ Intelligent DA`.
+- A query typed in Catalog carries into Intelligent DA and auto-asks via the `✨ AI` affordance.
+- Any sidebar nav/saved view returns to Catalog Search.
+
+## Catalog Search
+- KPI strip with sparklines from `GET /api/da/stats`.
+- Toolbar: search (180ms debounce, subsequence fuzzy + match highlight); Source and Lifecycle facets; Sort (`trending|reuse|recent|az`); Table/Cards toggle.
+- Removable active-filter pills + Clear all.
+- Table columns: Name (icon+id+desc), Type, Owner (avatar), Source, Lifecycle, Reuse (+sparkline), Trend (▲%), Updated, row actions (`Copy`, `Reuse`). Sortable headers. Cards view alternative.
+- Row/card → right slide-over: description; actions `Reuse` / `Open in IDE` / `View source` / `Add to project`; copyable install command; metadata grid; navigable `Depends on` + `Used by`.
+
+## Intelligent DA
+- Centered ask input + `Ask` + 3–4 example prompts.
+- On ask: skeleton → answer from `POST /api/da/ask`: summary, "reuse instead of build — est. N dev-days saved" callout, "grounded in N matches · <sources>" line, matched entity cards (first = `Best match`). Cards open the slide-over.
+- `grounded: false`: state it was logged to the gap backlog; offer to draft a spec.
+
+## Command palette (`⌘K` / `Ctrl+K`)
+- Fuzzy search over entities + commands (switch mode, filter by type, sort trending, reset, export). Keyboard nav ↑/↓/↵/esc, grouped, highlighted, empty state. `/` focuses catalog search.
+
+## Cross-cutting
+- Every async surface: loading (skeleton), empty, and error states.
+- Dialogs (palette, slide-over) get roles + focus management; visible focus rings; respect `prefers-reduced-motion`.
+- Add component tests for: mode switch + context carry-over, fuzzy filter/highlight, facet + sort behavior, slide-over dependency navigation, palette keyboard nav.
+
+## Acceptance gate (all must pass)
+- [ ] Landing shows Catalog Search + Intelligent DA; Catalog default; context carries between them.
+- [ ] Sidebar shell with live counts + responsive drawer.
+- [ ] Catalog: fuzzy search + highlight, facets, sort, Table/Cards, filter pills, slide-over with navigable deps.
+- [ ] Intelligent DA: renders grounded answer + best-match cards; `grounded:false` → gap-backlog message.
+- [ ] `⌘K` palette: entities + commands, full keyboard nav.
+- [ ] Loading/empty/error + a11y on every async surface; tests green.
+- [ ] New code and copy use only **DA** and **Tach** — no long-form name appears anywhere.
+
+## Do not
+No dark theme. No new UI framework. No backend/API changes. No new auth. No renaming unrelated modules. No committed secrets.
