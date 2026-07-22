@@ -1,0 +1,189 @@
+---
+name: perf_analyze_thread_dump
+version: 1.0
+description: >
+  Deterministic JVM thread dump triage playbook. Parses one or more thread
+  dumps (jstack, jcmd Thread.print, kill -3, or JFR jdk.ThreadDump events),
+  classifies thread states, detects deadlocks and blocked-chains, correlates
+  against historical incident signatures in MongoDB and LanceDB, and emits a
+  ranked, schema-validated root-cause report. Trigger whenever the user
+  mentions: thread dump, stuck/hung pods, high CPU with low throughput,
+  thread pool exhaustion, deadlock, stack trace triage, or pastes raw
+  "Full thread dump" / "com.sun.management" output.
+owner: 
+runtime_scope: jvm (java 8-21), ocp-hosted spring/gradle services
+mongo_collections: [thread_dump_incidents, tabr_decisions, ccc_references, pool_config_baselines]
+lancedb_tables: [stack_signature_embeddings]
+determinism: required (temperature=0, sorted-key JSON, SHA-256 dedup)
+---
+
+# perf_analyze_thread_dump — JVM Thread Dump Triage Playbook
+
+## 1. Scope & Trigger Conditions
+
+**Use this playbook when:**
+- One or more raw thread dumps are provided or fetchable (jstack, `jcmd <pid> Thread.print`, `kill -3`, JFR `jdk.ThreadDump`).
+- Symptom pattern is: request pile-up, latency spike with flat/low CPU, apparent hang, `HikariCP` / `Tomcat` / custom executor pool at 100% utilization, or a suspected deadlock.
+- Multiple dumps (2-5, taken 10-30s apart) are available for delta analysis — strongly prefer this over a single snapshot.
+
+**Do NOT use this playbook for:**
+- Heap OOM / memory leak triage → route to a heap-dump / GC-log playbook instead.
+- Pure CPU-bound hot-path profiling with no blocking symptoms → recommend async-profiler flame graph instead of thread dump triage.
+- Native crash (`hs_err_pid*.log`) → different artifact, different playbook.
+
+**Preconditions the agent must verify before proceeding:**
+1. At least one complete dump is present (contains `"Full thread dump"` header or JFR event boundary). Reject truncated/partial pastes — ask for re-capture rather than analyzing a fragment.
+2. If only one dump exists and the symptom is "possible deadlock," proceed but flag `single_snapshot_limitation: true` in the output (see §4) — deadlock detection is reliable from one dump; contention/leak-trend detection is not.
+
+---
+
+## 2. Context Retrieval Protocol (mandatory, before analysis)
+
+Do not synthesize a root cause from the dump in isolation. Fetch context first, in this order, and fail loudly (not silently) if a fetch errors — do not substitute a guess for a failed fetch.
+
+1. **MongoDB `pool_config_baselines`** — fetch the service's declared executor/pool config (thread pool max size, HikariCP `maximumPoolSize`, connect/query timeout) keyed by `service_name` + `source_commit`. This is the ground truth for "is N blocked threads on this pool expected or saturating."
+2. **MongoDB `thread_dump_incidents`** — fetch prior incidents for this service (or same stack signature) in the last 180 days. Prior RCA + fix + recurrence count changes confidence weighting in §4.
+3. **MongoDB `tabr_decisions`** — fetch any TABR entries referencing this service's concurrency/pool tuning, so the agent doesn't re-recommend a change that was already tried and rejected.
+4. **LanceDB `stack_signature_embeddings`** — vector search the normalized top-frame signatures (see §3.1) against historical embeddings. Top-k=5, similarity threshold ≥0.82. Surface matches as candidate root causes, not confirmed ones.
+5. **Repo fetch (via graphifyy index)** — pull the actual executor/pool declaration source (e.g. `@Bean ThreadPoolTaskExecutor`, `application.yml` HikariCP block) for the commit the dump was captured against, if `source_commit` is known. Config-in-repo beats config-in-Mongo if they disagree; flag the drift.
+
+If MongoDB/LanceDB are unreachable, proceed with dump-only analysis but set `context_enrichment: "unavailable"` and lower every finding's `confidence` by one tier (see §4.3) — never silently report full confidence on dump-only analysis.
+
+---
+
+## 3. Deterministic Analysis Procedure
+
+Run these steps in strict order. Do not skip steps to save tokens — token economy is handled in §5, not by skipping analysis stages.
+
+### 3.1 Parse & Normalize
+- Split dump into per-thread blocks: name, id, tid/nid, priority, OS priority, state (`java.lang.Thread.State`), and full stack trace.
+- Normalize each stack trace to a **signature**: top 5 frames with line numbers stripped, package-collapsed for known noise (`java.util.concurrent.*`, `sun.nio.*`). This signature is the dedup and LanceDB lookup key.
+- Compute a SHA-256 of each normalized signature. Threads sharing a signature are grouped — report as `{signature, count, sample_thread_ids}`, never as N duplicate blocks (this is your `tool_dedup.py` pattern applied to thread grouping — same savings mechanism, same rationale).
+
+### 3.2 Thread State Histogram
+Tally: `RUNNABLE`, `BLOCKED`, `WAITING`, `TIMED_WAITING`, `NEW`, `TERMINATED`. A healthy dump is RUNNABLE-dominant. `BLOCKED` count > 5% of total threads is an automatic escalation trigger regardless of other findings.
+
+### 3.3 Deadlock Detection (mandatory, cannot be skipped)
+- Build a directed graph: thread → lock it's waiting on (`waiting to lock <0x...>`) → owning thread (`locked <0x...>` in another thread's frame).
+- Run cycle detection (DFS with recursion stack, or Tarjan's SCC) over this graph.
+- If the JVM's own dump already contains a `"Found one Java-level deadlock"` section, cross-validate the agent's independently-computed cycle against it — they must match. Mismatch = parser bug, not a finding; halt and report the discrepancy rather than emitting a root cause.
+- Any confirmed cycle → `severity: critical`, `confidence: 0.99`, regardless of anything else in the dump.
+
+### 3.4 Blocked-Chain Analysis
+For every `BLOCKED` thread not part of a deadlock cycle:
+- Walk to the thread holding the lock it's waiting on.
+- If that holder is itself `RUNNABLE`/executing normal work → likely transient contention, low severity.
+- If that holder is itself `BLOCKED` or `WAITING` on an external resource (DB call, HTTP call, `synchronized` I/O) → this is the **root blocker**. Rank root blockers by number of threads transitively blocked behind them (chain depth × count). The root blocker with the largest blocked population is the primary finding, not just the first one found.
+
+### 3.5 Pattern Classifiers
+Apply in order, first match wins per thread group (a thread can only be classified once to keep counts sane):
+
+| Pattern | Signal |
+|---|---|
+| Thread pool exhaustion | All N threads in a fixed pool are `RUNNABLE`/`WAITING` inside the same executor's worker-run frame, pool size == configured max from §2.1, and a growing task queue is implied by request-latency symptom. |
+| Connection pool starvation | Multiple threads `WAITING`/`TIMED_WAITING` inside `HikariPool.getConnection` / `DriverManager`, count approaching `maximumPoolSize` from baseline. |
+| Downstream call stall | Threads blocked inside HTTP client / gRPC stub frames (`SocketInputStream.read`, `okhttp3.*`, `RestTemplate`), no local lock involved — root cause is external, not this JVM. |
+| GC-induced pause correlation | If a GC log excerpt is provided alongside the dump: check for a STW pause window overlapping the dump's `TERMINATED`-state absence / sudden RUNNABLE spike immediately after capture. Only claim this correlation if GC log evidence is actually present — never infer GC pauses from the thread dump alone. |
+| Synchronized hotspot | Many threads `BLOCKED` on the same monitor (`waiting to lock` on same address), holder is short-lived/legitimate work → classic `synchronized` bottleneck, recommend narrowing critical section, not more threads. |
+| Poison loop / stuck native call | Single thread `RUNNABLE` indefinitely across multiple dumps (delta analysis) with unchanging stack, no lock contention downstream → infinite loop or blocked native call, not a pool problem. |
+
+### 3.6 Delta Analysis (if ≥2 dumps provided)
+- Diff thread state per thread id across dumps.
+- A thread `RUNNABLE` with an **identical** stack signature across all dumps is the strongest possible signal of an infinite loop or stuck native call — flag `identical_across_n_dumps: N`.
+- A `BLOCKED`/`WAITING` count that is monotonically increasing across dumps confirms an unresolved (not transient) contention — raises severity one tier vs. a single-snapshot finding of the same shape.
+
+---
+
+## 4. Output Schema (schema-validated, deterministic)
+
+Emit exactly this shape. Field order and key sorting must be stable across runs on identical input (Litmus behavioral-equivalence check depends on this).
+
+```json
+{
+  "schema_version": "1.0",
+  "source_commit": "<git sha or null>",
+  "service_name": "<string or null>",
+  "dumps_analyzed": 1,
+  "single_snapshot_limitation": false,
+  "context_enrichment": "available | unavailable",
+  "thread_state_histogram": {
+    "RUNNABLE": 0, "BLOCKED": 0, "WAITING": 0, "TIMED_WAITING": 0, "NEW": 0, "TERMINATED": 0
+  },
+  "deadlock": {
+    "detected": false,
+    "cycle": [],
+    "jvm_reported_match": null
+  },
+  "findings": [
+    {
+      "finding_id": "sha256-of-signature",
+      "pattern": "thread_pool_exhaustion | connection_pool_starvation | downstream_call_stall | gc_correlation | synchronized_hotspot | poison_loop | deadlock",
+      "severity": "critical | high | medium | low",
+      "confidence": 0.0,
+      "affected_thread_count": 0,
+      "sample_thread_ids": [],
+      "root_blocker_signature": "string or null",
+      "evidence": "concise factual description, no speculation beyond what the dump/GC-log/config shows",
+      "historical_match": {
+        "lancedb_similarity": 0.0,
+        "prior_incident_id": "string or null",
+        "prior_resolution_recurred": false
+      }
+    }
+  ],
+  "root_cause_ranking": ["finding_id in descending severity*confidence*affected_count order"],
+  "recommended_actions": ["specific, config-referenced, not generic 'increase thread pool size' without a number derived from §2.1 baseline"],
+  "quality_score": 0.0,
+  "determinism_hash": "sha256 of the full finding set, excluding this field"
+}
+```
+
+### 4.1 Severity Assignment Rules (fixed, not model-discretion)
+- `critical`: confirmed deadlock, OR blocked-thread% > 25% with monotonically increasing trend across dumps.
+- `high`: root blocker chain affecting >10 threads or >30% of a bounded pool, single snapshot only.
+- `medium`: contention pattern present but transient (not confirmed across delta) or affecting <10% of pool.
+- `low`: isolated single-thread anomaly (e.g. one poison loop) with no downstream fan-out.
+
+### 4.2 Confidence Scoring (fixed formula, not free-text estimate)
+`confidence = base_pattern_confidence × context_multiplier`
+- `base_pattern_confidence`: deadlock=0.99, blocked-chain-with-clear-holder=0.9, classifier-match=0.75, GC-correlation-without-log=disallowed (do not emit), historical-signature-match-only=0.6.
+- `context_multiplier`: 1.0 if MongoDB+LanceDB context both available and config baseline confirms pool sizing; 0.85 if only partial context; 0.7 if `context_enrichment: "unavailable"`.
+
+### 4.3 Quality Gate
+`quality_score` = weighted average of: dump completeness (parseable, non-truncated), context enrichment availability, delta-analysis availability (bonus if ≥2 dumps), and absence of parser/deadlock-cross-validation mismatches. Below `0.5` → the agent must say so explicitly and recommend re-capture rather than presenting the finding as production-grade.
+
+---
+
+## 5. Token Economy & Determinism Controls
+
+- **Dedup before synthesis, not after.** Group threads by signature hash (§3.1) before ever constructing an LLM prompt — never send 200 near-identical stack blocks to Tachyon; send the deduped signature table with counts. This is the same SHA-256 dedup lever validated for tool-output savings; it applies directly here since thread dumps are the most repetition-heavy artifact type this playbook family handles.
+- **narrowdown pass** on any dump >2MB or >500 threads: truncate to (a) all `BLOCKED`/deadlock-involved threads in full, (b) one representative per signature group for `RUNNABLE`/`WAITING`, (c) explicit count-only summary for the rest. Never silently drop the deadlock-relevant threads to save tokens.
+- **Temperature 0 / deterministic decoding** for the synthesis call to Tachyon (Gemini 2.5 Pro). Lean on Gemini's implicit caching by keeping the system/context-retrieval preamble byte-identical across repeated runs on the same dump — only the dump content should vary in the prompt tail.
+- **Litmus check**: re-running this playbook on an identical dump + identical Mongo/LanceDB context must produce an identical `determinism_hash`. If it doesn't, that's a playbook defect (non-deterministic prompt ordering, unstable dict iteration, etc.) — treat as a P1 bug in the playbook itself, not acceptable variance.
+
+---
+
+## 6. Validation, Escalation & Versioning
+
+**Escalation triggers (route to human, don't just report and stop):**
+- `BLOCKED` thread ratio > 5% of total (see §3.2).
+- Any confirmed deadlock.
+- `quality_score < 0.5`.
+- Historical match shows `prior_resolution_recurred: true` (i.e., this was "fixed" before and is back) — this is a signal the prior fix was incomplete, escalate rather than re-recommending the same action silently.
+
+**Cross-validation:** deadlock cycle computed in §3.3 must match the JVM's self-reported deadlock section when present — mismatch halts output (§3.3).
+
+**Changelog discipline:** bump `version` and record a one-line changelog entry in `thread_dump_incidents` for any change to severity thresholds (§4.1), confidence formula (§4.2), or classifier order (§3.5) — these are the parts most likely to silently drift and break determinism-across-runs guarantees for existing dashboards/alerts built on this playbook's output.
+
+**Capture commands reference (for the agent to suggest when no dump exists yet):**
+```bash
+# OCP pod, preferred (no restart, includes lock owner info)
+oc exec <pod> -- jcmd 1 Thread.print -l > dump_$(date +%s).txt
+
+# fallback if jcmd unavailable
+oc exec <pod> -- kill -3 1   # writes to stdout/stderr, capture via oc logs
+
+# JFR (if flight recording already running)
+oc exec <pod> -- jcmd 1 JFR.dump filename=/tmp/dump.jfr
+```
+Always request 2-3 dumps at 15-20s intervals over a single snapshot — §3.6 delta analysis is materially more reliable than single-snapshot classification for anything except confirmed deadlocks.
