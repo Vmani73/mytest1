@@ -1,0 +1,869 @@
+"""
+grafana_metrics_util.py
+
+Production-grade async utility to discover and fetch EVERY Prometheus metric
+exposed via a Grafana-proxied (or direct) Prometheus HTTP API, scoped to a
+given app_id / component / cluster / env, over an explicit epoch time range.
+
+--------------------------------------------------------------------------
+ASSUMPTIONS (read before using -- these are the load-bearing design choices)
+--------------------------------------------------------------------------
+1. Label names: this util filters on Prometheus label keys `app_id`,
+   `component`, `cluster`, `env`. If your metrics use different label keys
+   (e.g. `application`, `svc`), change the LABEL_* constants below -- they
+   are the single source of truth, nothing else needs to change.
+
+2. grafana_url must be the BASE of a Prometheus-API-compatible endpoint,
+   i.e. `/api/v1/...` can be appended directly. That means either:
+     - a raw Prometheus URL, e.g. https://prometheus.internal:9090
+     - a Grafana datasource proxy base, e.g.
+       https://grafana.internal/api/datasources/proxy/uid/<datasource-uid>
+   The Grafana *UI* URL (https://grafana.internal/d/...) will NOT work.
+
+3. "All possible metrics" is implemented as: discover every metric name that
+   has at least one series matching your label selector in the time window
+   (via /api/v1/series), then fetch each one individually (via
+   /api/v1/query_range). This is the only correct way to get this with the
+   Prometheus HTTP API -- there is no single call that returns "all metrics
+   + all data" for a label set.
+
+4. cluster is restricted to {"man07", "gar07"} and env to {"nonprod"} per
+   your environment. Both are simple allow-lists (ALLOWED_CLUSTERS /
+   ALLOWED_ENVS) -- extend them in one place when you add clusters/envs.
+
+--------------------------------------------------------------------------
+ROBUSTNESS CONTRACT
+--------------------------------------------------------------------------
+- fetch_all_metrics() never raises for operational failures (auth, network,
+  timeouts, bad PromQL, empty results, etc). It always returns a
+  FetchAllMetricsResult with a `status` of "success" | "partial_success" |
+  "error", plus structured error_code/message detail wherever something
+  went wrong -- at the top level (validation_error / discovery_error) or
+  per-metric (metrics[i].error).
+- Only a genuine programming error (e.g. asyncio.CancelledError, a bug)
+  will propagate as a Python exception.
+- Transient failures (429, 5xx, timeouts, connection errors) are retried
+  with jittered exponential backoff. Non-transient failures (401, 403, 404,
+  malformed PromQL) are not retried.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import math
+import random
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
+from typing import Any, Optional
+
+import httpx
+
+logger = logging.getLogger("grafana_metrics_util")
+
+# --------------------------------------------------------------------------
+# Configuration constants
+# --------------------------------------------------------------------------
+
+ALLOWED_CLUSTERS = {"man07", "gar07"}
+ALLOWED_ENVS = {"nonprod"}
+
+# Prometheus label keys used to scope every query. Change these if your
+# metrics use different label names -- nothing else in this file needs to
+# change.
+LABEL_APP_ID = "app_id"
+LABEL_COMPONENT = "component"
+LABEL_CLUSTER = "cluster"
+LABEL_ENV = "env"
+
+DEFAULT_MAX_DATAPOINTS_PER_SERIES = 1000
+DEFAULT_MIN_STEP_SECONDS = 15
+DEFAULT_CONCURRENCY = 8
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 60.0
+DEFAULT_MAX_RETRIES = 4
+DEFAULT_BACKOFF_BASE = 0.5
+DEFAULT_BACKOFF_MAX = 20.0
+
+# Overall wall-clock budget for one fetch_all_metrics() call. Once exceeded,
+# in-flight and not-yet-started requests fail fast with DEADLINE_EXCEEDED
+# instead of continuing to retry/queue -- already-completed metrics keep
+# their results.
+DEFAULT_OVERALL_TIMEOUT_SECONDS = 300.0
+
+# A server can tell us to back off for an arbitrarily long time via
+# Retry-After; we honor it but never wait longer than this for a single
+# retry, so one slow metric can't quietly eat the whole deadline budget.
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
+
+# Many enterprise Grafana/Prometheus proxies cap response size or duration
+# per single query_range call regardless of `step`. Windows longer than this
+# are split into sequential, non-overlapping sub-ranges fetched concurrently
+# and merged back together per series.
+DEFAULT_MAX_CHUNK_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Circuit breaker: after this many consecutive request failures (across all
+# metrics, shared per fetch_all_metrics call), stop attempting new requests
+# for `reset_after_seconds` so a downed backend doesn't get hammered by
+# every remaining metric retrying independently.
+DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 10
+DEFAULT_CIRCUIT_BREAKER_RESET_SECONDS = 30.0
+
+
+# --------------------------------------------------------------------------
+# Error taxonomy
+# --------------------------------------------------------------------------
+
+class ErrorCode(str, Enum):
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    AUTH_ERROR = "AUTH_ERROR"
+    FORBIDDEN = "FORBIDDEN"
+    NOT_FOUND = "NOT_FOUND"
+    RATE_LIMITED = "RATE_LIMITED"
+    SERVER_ERROR = "SERVER_ERROR"
+    TIMEOUT = "TIMEOUT"
+    CONNECTION_ERROR = "CONNECTION_ERROR"
+    INVALID_RESPONSE = "INVALID_RESPONSE"
+    PROMQL_ERROR = "PROMQL_ERROR"
+    NO_METRICS_FOUND = "NO_METRICS_FOUND"
+    DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
+    CIRCUIT_OPEN = "CIRCUIT_OPEN"
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+
+class GrafanaMetricsError(Exception):
+    """Base exception. Carries a stable error_code + retryability + details
+    so every failure can be serialized identically, whether it surfaces via
+    CLI, MCP tool, or LangGraph tool."""
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.UNKNOWN_ERROR,
+        status_code: Optional[int] = None,
+        retryable: bool = False,
+        details: Optional[dict] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+        self.status_code = status_code
+        self.retryable = retryable
+        self.details = details or {}
+
+    def to_dict(self) -> dict:
+        return {
+            "error_code": self.error_code.value,
+            "message": self.message,
+            "status_code": self.status_code,
+            "retryable": self.retryable,
+            "details": self.details,
+        }
+
+
+class ValidationError(GrafanaMetricsError):
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.VALIDATION_ERROR, retryable=False, details=details)
+
+
+class AuthError(GrafanaMetricsError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message, ErrorCode.AUTH_ERROR, status_code=status_code, retryable=False, details=details)
+
+
+class ForbiddenError(GrafanaMetricsError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message, ErrorCode.FORBIDDEN, status_code=status_code, retryable=False, details=details)
+
+
+class NotFoundErrorX(GrafanaMetricsError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message, ErrorCode.NOT_FOUND, status_code=status_code, retryable=False, details=details)
+
+
+class RateLimitErrorX(GrafanaMetricsError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message, ErrorCode.RATE_LIMITED, status_code=status_code, retryable=True, details=details)
+
+
+class ServerErrorX(GrafanaMetricsError):
+    def __init__(self, message, status_code=None, details=None):
+        super().__init__(message, ErrorCode.SERVER_ERROR, status_code=status_code, retryable=True, details=details)
+
+
+class TimeoutErrorX(GrafanaMetricsError):
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.TIMEOUT, retryable=True, details=details)
+
+
+class ConnectionErrorX(GrafanaMetricsError):
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.CONNECTION_ERROR, retryable=True, details=details)
+
+
+class InvalidResponseError(GrafanaMetricsError):
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.INVALID_RESPONSE, retryable=False, details=details)
+
+
+class PromQLError(GrafanaMetricsError):
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.PROMQL_ERROR, retryable=False, details=details)
+
+
+class DeadlineExceededError(GrafanaMetricsError):
+    """The overall per-call time budget ran out. Not retried -- if we're
+    out of budget, retrying just burns more of a budget that's already gone."""
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.DEADLINE_EXCEEDED, retryable=False, details=details)
+
+
+class CircuitOpenError(GrafanaMetricsError):
+    """Too many consecutive failures against this backend recently; failing
+    fast without a network call until the reset window elapses."""
+    def __init__(self, message, details=None):
+        super().__init__(message, ErrorCode.CIRCUIT_OPEN, retryable=False, details=details)
+
+
+# --------------------------------------------------------------------------
+# Result models
+# --------------------------------------------------------------------------
+
+@dataclass
+class MetricSeriesResult:
+    labels: dict
+    values: list  # list of [timestamp: float, value: str]
+
+
+@dataclass
+class MetricFetchResult:
+    metric_name: str
+    status: str  # "success" | "empty" | "error"
+    error: Optional[dict] = None
+    series: list = field(default_factory=list)
+    series_count: int = 0
+    point_count: int = 0
+
+
+@dataclass
+class FetchAllMetricsResult:
+    status: str  # "success" | "partial_success" | "error"
+    app_id: str
+    component: str
+    cluster: str
+    env: str
+    start_epoch: int
+    end_epoch: int
+    step_seconds: int
+    discovered_metric_count: int
+    succeeded_count: int
+    failed_count: int
+    empty_count: int
+    duration_seconds: float
+    deadline_exceeded_count: int = 0
+    circuit_open_count: int = 0
+    validation_error: Optional[dict] = None
+    discovery_error: Optional[dict] = None
+    metrics: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def _validate_inputs(grafana_url, token, app_id, component, cluster, env, start_epoch, end_epoch) -> None:
+    errors = []
+    if not grafana_url or not isinstance(grafana_url, str) or not grafana_url.startswith(("http://", "https://")):
+        errors.append("grafana_url must be a non-empty http(s) URL")
+    if not token or not isinstance(token, str):
+        errors.append("token must be a non-empty string")
+    if not app_id or not isinstance(app_id, str):
+        errors.append("app_id must be a non-empty string")
+    if not component or not isinstance(component, str):
+        errors.append("component must be a non-empty string")
+    if cluster not in ALLOWED_CLUSTERS:
+        errors.append(f"cluster must be one of {sorted(ALLOWED_CLUSTERS)}, got {cluster!r}")
+    if env not in ALLOWED_ENVS:
+        errors.append(f"env must be one of {sorted(ALLOWED_ENVS)}, got {env!r}")
+
+    parsed_start = parsed_end = None
+    try:
+        parsed_start = int(start_epoch)
+        parsed_end = int(end_epoch)
+    except (TypeError, ValueError):
+        errors.append("start_epoch/end_epoch must be integers (unix epoch seconds)")
+
+    if parsed_start is not None and parsed_end is not None:
+        if parsed_start < 0 or parsed_end < 0:
+            errors.append("start_epoch/end_epoch must be non-negative")
+        if parsed_start >= parsed_end:
+            errors.append("start_epoch must be strictly less than end_epoch")
+        now = int(time.time())
+        if parsed_end > now + 300:
+            errors.append("end_epoch is more than 5 minutes in the future")
+
+    if errors:
+        raise ValidationError("; ".join(errors), details={"errors": errors})
+
+
+def _compute_step_seconds(start_epoch: int, end_epoch: int, max_points: int, min_step: int) -> int:
+    span = max(1, end_epoch - start_epoch)
+    return max(min_step, math.ceil(span / max_points))
+
+
+def _build_label_selector(app_id: str, component: str, cluster: str, env: str) -> str:
+    def esc(v: str) -> str:
+        return v.replace("\\", "\\\\").replace('"', '\\"')
+
+    return (
+        f'{{{LABEL_APP_ID}="{esc(app_id)}",'
+        f'{LABEL_COMPONENT}="{esc(component)}",'
+        f'{LABEL_CLUSTER}="{esc(cluster)}",'
+        f'{LABEL_ENV}="{esc(env)}"}}'
+    )
+
+
+def _raise_if_promql_error(payload: Any, path: str) -> None:
+    if not isinstance(payload, dict):
+        raise InvalidResponseError(f"Response from {path} was not a JSON object")
+    if payload.get("status") != "success":
+        err_type = payload.get("errorType", "unknown")
+        err_msg = payload.get("error", "unknown error")
+        raise PromQLError(
+            f"Prometheus/Grafana returned an error for {path}: [{err_type}] {err_msg}",
+            details={"errorType": err_type, "error": err_msg},
+        )
+
+
+def _parse_retry_after(resp: httpx.Response) -> Optional[float]:
+    """Parse a Retry-After header (seconds, or an HTTP-date) into seconds
+    from now. Returns None if absent or unparseable."""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _build_chunks(start_epoch: int, end_epoch: int, max_chunk_seconds: int, step_seconds: int) -> list:
+    """Split [start_epoch, end_epoch] into sequential, non-overlapping
+    sub-ranges of at most max_chunk_seconds, so no single query_range call
+    spans more than that -- protects against proxy-side response size/
+    duration caps that apply regardless of `step`."""
+    if max_chunk_seconds <= 0 or (end_epoch - start_epoch) <= max_chunk_seconds:
+        return [(start_epoch, end_epoch)]
+    chunks = []
+    cur = start_epoch
+    while cur < end_epoch:
+        chunk_end = min(cur + max_chunk_seconds, end_epoch)
+        chunks.append((cur, chunk_end))
+        # advance by one step past chunk_end so consecutive chunks don't both
+        # include the boundary timestamp
+        cur = chunk_end + max(step_seconds, 1)
+    return chunks
+
+
+class _CircuitBreaker:
+    """Minimal shared-per-client circuit breaker. Not a general-purpose
+    library implementation -- just enough to stop a batch of concurrent
+    metric fetches from all independently hammering a backend that's
+    already down."""
+
+    def __init__(self, failure_threshold: int, reset_after_seconds: float):
+        self.failure_threshold = failure_threshold
+        self.reset_after_seconds = reset_after_seconds
+        self._consecutive_failures = 0
+        self._open_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def check(self) -> None:
+        if time.monotonic() < self._open_until:
+            remaining = self._open_until - time.monotonic()
+            raise CircuitOpenError(
+                f"Circuit open after {self.failure_threshold} consecutive failures; "
+                f"failing fast for {remaining:.1f}s more before retrying.",
+                details={"reopen_in_seconds": round(remaining, 1)},
+            )
+
+    async def record_success(self) -> None:
+        async with self._lock:
+            self._consecutive_failures = 0
+
+    async def record_failure(self) -> None:
+        async with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.failure_threshold:
+                self._open_until = time.monotonic() + self.reset_after_seconds
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
+class GrafanaPrometheusClient:
+    """Async context-managed client. One instance per fetch_all_metrics call."""
+
+    def __init__(
+        self,
+        grafana_url: str,
+        token: str,
+        *,
+        verify_ssl: bool = True,
+        ca_bundle_path: Optional[str] = None,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        read_timeout: float = DEFAULT_READ_TIMEOUT,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        backoff_base: float = DEFAULT_BACKOFF_BASE,
+        backoff_max: float = DEFAULT_BACKOFF_MAX,
+        overall_timeout_seconds: float = DEFAULT_OVERALL_TIMEOUT_SECONDS,
+        max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
+        circuit_breaker_threshold: int = DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+        circuit_breaker_reset_seconds: float = DEFAULT_CIRCUIT_BREAKER_RESET_SECONDS,
+    ):
+        self.base_url = grafana_url.rstrip("/")
+        self.token = token
+        self._verify = ca_bundle_path if ca_bundle_path else verify_ssl
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self.backoff_max = backoff_max
+        self.overall_timeout_seconds = overall_timeout_seconds
+        self.max_retry_after_seconds = max_retry_after_seconds
+        self._breaker = _CircuitBreaker(circuit_breaker_threshold, circuit_breaker_reset_seconds)
+        self._deadline = 0.0  # set in __aenter__
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self) -> "GrafanaPrometheusClient":
+        timeout = httpx.Timeout(
+            connect=self._connect_timeout,
+            read=self._read_timeout,
+            write=self._read_timeout,
+            pool=self._connect_timeout,
+        )
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
+            timeout=timeout,
+            verify=self._verify,
+        )
+        self._deadline = time.monotonic() + self.overall_timeout_seconds
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+
+    def _classify_response(self, resp: httpx.Response, path: str) -> Optional[GrafanaMetricsError]:
+        sc = resp.status_code
+        if 200 <= sc < 300:
+            return None
+        snippet = resp.text[:500] if resp.text else ""
+        retry_after = _parse_retry_after(resp)
+        details = {"retry_after": retry_after} if retry_after is not None else {}
+        if sc == 401:
+            return AuthError(f"Authentication failed (401) calling {path}: {snippet}", status_code=sc)
+        if sc == 403:
+            return ForbiddenError(f"Authorization failed (403) calling {path}: {snippet}", status_code=sc)
+        if sc == 404:
+            return NotFoundErrorX(f"Endpoint not found (404) calling {path}: {snippet}", status_code=sc)
+        if sc == 429:
+            return RateLimitErrorX(f"Rate limited (429) calling {path}: {snippet}", status_code=sc, details=details)
+        if 500 <= sc < 600:
+            return ServerErrorX(f"Server error ({sc}) calling {path}: {snippet}", status_code=sc, details=details)
+        return GrafanaMetricsError(
+            f"Unexpected status {sc} calling {path}: {snippet}",
+            ErrorCode.UNKNOWN_ERROR,
+            status_code=sc,
+            retryable=False,
+        )
+
+    def _remaining_budget(self) -> float:
+        return self._deadline - time.monotonic()
+
+    async def _request_with_retry(self, method: str, path: str, params: dict) -> httpx.Response:
+        assert self._client is not None, "Client used outside 'async with' context"
+        attempt = 0
+        while True:
+            remaining = self._remaining_budget()
+            if remaining <= 0:
+                raise DeadlineExceededError(
+                    f"Overall time budget exhausted before calling {path}",
+                    details={"path": path},
+                )
+
+            await self._breaker.check()  # raises CircuitOpenError if open
+
+            per_request_timeout = httpx.Timeout(
+                connect=min(self._connect_timeout, remaining),
+                read=min(self._read_timeout, remaining),
+                write=min(self._read_timeout, remaining),
+                pool=min(self._connect_timeout, remaining),
+            )
+
+            exc: Optional[GrafanaMetricsError] = None
+            try:
+                async with self._semaphore:
+                    resp = await self._client.request(method, path, params=params, timeout=per_request_timeout)
+            except httpx.ConnectTimeout as e:
+                exc = TimeoutErrorX(f"Connect timeout calling {path}: {e}")
+            except httpx.ReadTimeout as e:
+                exc = TimeoutErrorX(f"Read timeout calling {path}: {e}")
+            except httpx.ConnectError as e:
+                exc = ConnectionErrorX(f"Connection failed calling {path}: {e}")
+            except httpx.HTTPError as e:
+                exc = GrafanaMetricsError(
+                    f"Transport error calling {path}: {e}", ErrorCode.UNKNOWN_ERROR, retryable=True
+                )
+            else:
+                exc = self._classify_response(resp, path)
+                if exc is None:
+                    await self._breaker.record_success()
+                    return resp
+
+            await self._breaker.record_failure()
+            attempt += 1
+            if not exc.retryable or attempt > self.max_retries:
+                raise exc
+
+            backoff_delay = min(self.backoff_max, self.backoff_base * (2 ** (attempt - 1)))
+            backoff_delay *= 0.5 + random.random()
+            retry_after = exc.details.get("retry_after") if exc.details else None
+            delay = backoff_delay
+            if retry_after is not None:
+                # Honor the server's requested wait, but never more than
+                # max_retry_after_seconds -- a huge Retry-After shouldn't be
+                # allowed to eat the whole per-call deadline on one metric.
+                delay = max(delay, min(retry_after, self.max_retry_after_seconds))
+
+            remaining = self._remaining_budget()
+            if remaining <= 0:
+                raise DeadlineExceededError(
+                    f"Overall time budget exhausted while backing off from {path}",
+                    details={"path": path},
+                )
+            delay = min(delay, remaining)
+
+            logger.warning(
+                "Retrying %s (attempt %d/%d) after %s: %s (delay=%.1fs%s)",
+                path, attempt, self.max_retries, exc.error_code.value, exc.message,
+                delay, ", server-requested" if retry_after is not None else "",
+            )
+            await asyncio.sleep(delay)
+
+    async def discover_metric_names(
+        self, app_id: str, component: str, cluster: str, env: str, start_epoch: int, end_epoch: int
+    ) -> list:
+        selector = _build_label_selector(app_id, component, cluster, env)
+        params = {"match[]": selector, "start": start_epoch, "end": end_epoch}
+        resp = await self._request_with_retry("GET", "/api/v1/series", params)
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise InvalidResponseError(f"Non-JSON response from /api/v1/series: {e}")
+        _raise_if_promql_error(payload, "/api/v1/series")
+        series = payload.get("data", [])
+        names = sorted({s.get("__name__") for s in series if isinstance(s, dict) and s.get("__name__")})
+        return names
+
+    async def _fetch_chunk(self, query: str, start: int, end: int, step_seconds: int) -> list:
+        """Fetch one time-window chunk for a single PromQL query. Returns the
+        raw `data.result` list (one entry per label-set series in this
+        chunk). Raises GrafanaMetricsError on failure -- caller aggregates."""
+        params = {"query": query, "start": start, "end": end, "step": step_seconds}
+        resp = await self._request_with_retry("GET", "/api/v1/query_range", params)
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise InvalidResponseError(f"Non-JSON response from /api/v1/query_range: {e}")
+        _raise_if_promql_error(payload, "/api/v1/query_range")
+        data = payload.get("data", {})
+        return data.get("result", [])
+
+    async def fetch_metric_range(
+        self,
+        metric_name: str,
+        app_id: str,
+        component: str,
+        cluster: str,
+        env: str,
+        start_epoch: int,
+        end_epoch: int,
+        step_seconds: int,
+        max_chunk_seconds: int = DEFAULT_MAX_CHUNK_SECONDS,
+    ) -> MetricFetchResult:
+        selector = _build_label_selector(app_id, component, cluster, env)
+        query = f"{metric_name}{selector}"
+        chunks = _build_chunks(start_epoch, end_epoch, max_chunk_seconds, step_seconds)
+        try:
+            raw_results = await asyncio.gather(
+                *[self._fetch_chunk(query, c_start, c_end, step_seconds) for c_start, c_end in chunks],
+                return_exceptions=True,
+            )
+            # return_exceptions=True lets every chunk request run to
+            # completion (no dangling background tasks) even if one fails;
+            # we then surface the first failure explicitly.
+            first_error = next((r for r in raw_results if isinstance(r, BaseException)), None)
+            if first_error is not None:
+                raise first_error
+            chunk_results = raw_results
+
+            # Merge series across chunks: same label set = same logical
+            # series, values concatenated in chunk (i.e. chronological) order.
+            merged: dict = {}
+            order: list = []
+            for raw_series in chunk_results:
+                for s in raw_series:
+                    key = tuple(sorted(s.get("metric", {}).items()))
+                    vals = s.get("values", [])
+                    if key not in merged:
+                        merged[key] = MetricSeriesResult(labels=s.get("metric", {}), values=list(vals))
+                        order.append(key)
+                    else:
+                        merged[key].values.extend(vals)
+
+            series_list = [merged[k] for k in order]
+            point_count = sum(len(s.values) for s in series_list)
+            status = "success" if series_list else "empty"
+            return MetricFetchResult(
+                metric_name=metric_name, status=status, series=series_list,
+                series_count=len(series_list), point_count=point_count,
+            )
+        except GrafanaMetricsError as e:
+            logger.warning("Failed to fetch metric %s: %s", metric_name, e.message)
+            return MetricFetchResult(metric_name=metric_name, status="error", error=e.to_dict())
+        except Exception as e:  # absolute safety net -- nothing escapes uncaught
+            logger.exception("Unexpected error fetching metric %s", metric_name)
+            return MetricFetchResult(
+                metric_name=metric_name, status="error",
+                error={"error_code": ErrorCode.UNKNOWN_ERROR.value, "message": str(e),
+                       "status_code": None, "retryable": False, "details": {}},
+            )
+
+
+# --------------------------------------------------------------------------
+# Public orchestrator
+# --------------------------------------------------------------------------
+
+async def fetch_all_metrics(
+    grafana_url: str,
+    token: str,
+    app_id: str,
+    component: str,
+    start_epoch: int,
+    end_epoch: int,
+    cluster: str = "man07",
+    env: str = "nonprod",
+    *,
+    verify_ssl: bool = True,
+    ca_bundle_path: Optional[str] = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
+    max_datapoints_per_series: int = DEFAULT_MAX_DATAPOINTS_PER_SERIES,
+    step_seconds_override: Optional[int] = None,
+    overall_timeout_seconds: float = DEFAULT_OVERALL_TIMEOUT_SECONDS,
+    max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
+    max_chunk_seconds: int = DEFAULT_MAX_CHUNK_SECONDS,
+    circuit_breaker_threshold: int = DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+    circuit_breaker_reset_seconds: float = DEFAULT_CIRCUIT_BREAKER_RESET_SECONDS,
+) -> FetchAllMetricsResult:
+    """
+    Discover every metric scoped to (app_id, component, cluster, env) and
+    fetch its full time series over [start_epoch, end_epoch]. Never raises
+    for operational failures -- inspect the returned `status` field.
+    """
+    t0 = time.monotonic()
+
+    try:
+        _validate_inputs(grafana_url, token, app_id, component, cluster, env, start_epoch, end_epoch)
+    except ValidationError as e:
+        return FetchAllMetricsResult(
+            status="error", app_id=app_id, component=component, cluster=cluster, env=env,
+            start_epoch=int(start_epoch) if isinstance(start_epoch, (int, float)) else 0,
+            end_epoch=int(end_epoch) if isinstance(end_epoch, (int, float)) else 0,
+            step_seconds=0, discovered_metric_count=0, succeeded_count=0, failed_count=0,
+            empty_count=0, duration_seconds=time.monotonic() - t0, validation_error=e.to_dict(), metrics=[],
+        )
+
+    start_epoch = int(start_epoch)
+    end_epoch = int(end_epoch)
+    step_seconds = step_seconds_override or _compute_step_seconds(
+        start_epoch, end_epoch, max_datapoints_per_series, DEFAULT_MIN_STEP_SECONDS
+    )
+
+    async with GrafanaPrometheusClient(
+        grafana_url, token, verify_ssl=verify_ssl, ca_bundle_path=ca_bundle_path,
+        connect_timeout=connect_timeout, read_timeout=read_timeout,
+        concurrency=concurrency, max_retries=max_retries,
+        overall_timeout_seconds=overall_timeout_seconds,
+        max_retry_after_seconds=max_retry_after_seconds,
+        circuit_breaker_threshold=circuit_breaker_threshold,
+        circuit_breaker_reset_seconds=circuit_breaker_reset_seconds,
+    ) as client:
+
+        try:
+            metric_names = await client.discover_metric_names(app_id, component, cluster, env, start_epoch, end_epoch)
+        except GrafanaMetricsError as e:
+            logger.error("Metric discovery failed: %s", e.message)
+            return FetchAllMetricsResult(
+                status="error", app_id=app_id, component=component, cluster=cluster, env=env,
+                start_epoch=start_epoch, end_epoch=end_epoch, step_seconds=step_seconds,
+                discovered_metric_count=0, succeeded_count=0, failed_count=0, empty_count=0,
+                duration_seconds=time.monotonic() - t0, discovery_error=e.to_dict(), metrics=[],
+            )
+        except Exception as e:
+            logger.exception("Unexpected error during discovery")
+            return FetchAllMetricsResult(
+                status="error", app_id=app_id, component=component, cluster=cluster, env=env,
+                start_epoch=start_epoch, end_epoch=end_epoch, step_seconds=step_seconds,
+                discovered_metric_count=0, succeeded_count=0, failed_count=0, empty_count=0,
+                duration_seconds=time.monotonic() - t0,
+                discovery_error={"error_code": ErrorCode.UNKNOWN_ERROR.value, "message": str(e),
+                                  "status_code": None, "retryable": False, "details": {}},
+                metrics=[],
+            )
+
+        if not metric_names:
+            return FetchAllMetricsResult(
+                status="success", app_id=app_id, component=component, cluster=cluster, env=env,
+                start_epoch=start_epoch, end_epoch=end_epoch, step_seconds=step_seconds,
+                discovered_metric_count=0, succeeded_count=0, failed_count=0, empty_count=0,
+                duration_seconds=time.monotonic() - t0,
+                discovery_error={
+                    "error_code": ErrorCode.NO_METRICS_FOUND.value,
+                    "message": "No metrics found for this app_id/component/cluster/env in the given time range.",
+                    "status_code": None, "retryable": False, "details": {},
+                },
+                metrics=[],
+            )
+
+        tasks = [
+            client.fetch_metric_range(
+                name, app_id, component, cluster, env, start_epoch, end_epoch, step_seconds,
+                max_chunk_seconds=max_chunk_seconds,
+            )
+            for name in metric_names
+        ]
+        metric_results = await asyncio.gather(*tasks)
+
+    succeeded = sum(1 for m in metric_results if m.status == "success")
+    empty = sum(1 for m in metric_results if m.status == "empty")
+    failed = sum(1 for m in metric_results if m.status == "error")
+    deadline_exceeded = sum(
+        1 for m in metric_results if m.error and m.error.get("error_code") == ErrorCode.DEADLINE_EXCEEDED.value
+    )
+    circuit_open = sum(
+        1 for m in metric_results if m.error and m.error.get("error_code") == ErrorCode.CIRCUIT_OPEN.value
+    )
+
+    if failed == 0:
+        overall = "success"
+    elif succeeded + empty > 0:
+        overall = "partial_success"
+    else:
+        overall = "error"
+
+    return FetchAllMetricsResult(
+        status=overall, app_id=app_id, component=component, cluster=cluster, env=env,
+        start_epoch=start_epoch, end_epoch=end_epoch, step_seconds=step_seconds,
+        discovered_metric_count=len(metric_names), succeeded_count=succeeded,
+        failed_count=failed, empty_count=empty,
+        deadline_exceeded_count=deadline_exceeded, circuit_open_count=circuit_open,
+        duration_seconds=time.monotonic() - t0, metrics=list(metric_results),
+    )
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Fetch all Prometheus metrics for an app_id/component via Grafana.")
+    p.add_argument("--grafana-url", required=True)
+    p.add_argument("--token", required=True)
+    p.add_argument("--app-id", required=True)
+    p.add_argument("--component", required=True)
+    p.add_argument("--start-epoch", required=True, type=int)
+    p.add_argument("--end-epoch", required=True, type=int)
+    p.add_argument("--cluster", default="man07", choices=sorted(ALLOWED_CLUSTERS))
+    p.add_argument("--env", default="nonprod", choices=sorted(ALLOWED_ENVS))
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    p.add_argument("--overall-timeout-seconds", type=float, default=DEFAULT_OVERALL_TIMEOUT_SECONDS,
+                    help="Wall-clock budget for the whole call; unfinished metrics fail fast with DEADLINE_EXCEEDED.")
+    p.add_argument("--max-retry-after-seconds", type=float, default=DEFAULT_MAX_RETRY_AFTER_SECONDS,
+                    help="Cap on how long a single Retry-After header is honored.")
+    p.add_argument("--max-chunk-seconds", type=int, default=DEFAULT_MAX_CHUNK_SECONDS,
+                    help="Split time ranges longer than this into sequential chunks per query_range call.")
+    p.add_argument("--circuit-breaker-threshold", type=int, default=DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+                    help="Consecutive failures before the circuit opens and requests fail fast.")
+    p.add_argument("--circuit-breaker-reset-seconds", type=float, default=DEFAULT_CIRCUIT_BREAKER_RESET_SECONDS,
+                    help="How long the circuit stays open before requests are attempted again.")
+    p.add_argument("--no-verify-ssl", action="store_true")
+    p.add_argument("--ca-bundle", default=None)
+    p.add_argument("--log-level", default="INFO")
+    p.add_argument("--output", default=None, help="Write JSON result to this file instead of stdout")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = _parse_args(argv)
+    logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    result = asyncio.run(
+        fetch_all_metrics(
+            grafana_url=args.grafana_url,
+            token=args.token,
+            app_id=args.app_id,
+            component=args.component,
+            start_epoch=args.start_epoch,
+            end_epoch=args.end_epoch,
+            cluster=args.cluster,
+            env=args.env,
+            verify_ssl=not args.no_verify_ssl,
+            ca_bundle_path=args.ca_bundle,
+            concurrency=args.concurrency,
+            max_retries=args.max_retries,
+            overall_timeout_seconds=args.overall_timeout_seconds,
+            max_retry_after_seconds=args.max_retry_after_seconds,
+            max_chunk_seconds=args.max_chunk_seconds,
+            circuit_breaker_threshold=args.circuit_breaker_threshold,
+            circuit_breaker_reset_seconds=args.circuit_breaker_reset_seconds,
+        )
+    )
+
+    output_json = json.dumps(result.to_dict(), indent=2, default=str)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(output_json)
+    else:
+        print(output_json)
+
+    sys.exit({"success": 0, "partial_success": 1, "error": 2}[result.status])
+
+
+if __name__ == "__main__":
+    main()
