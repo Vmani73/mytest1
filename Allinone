@@ -1,0 +1,1127 @@
+---
+name: dependency-intelligence-suite
+description: >
+  Complete dependency intelligence for a repository in one playbook.
+  Builds and serves codegraph.json (a persistent, provenance-tagged repo
+  knowledge graph with a bounded agent tool-call contract); maps package
+  transitive dependency trees with root-cause tracing and a weighted
+  scorecard; maps code-level upward/downward dependency hierarchy and blast
+  radius; and remediates OSS findings for .NET/NuGet and Gradle with
+  mandatory verification gates.
+triggers:
+  - "build codegraph"
+  - "repo knowledge graph"
+  - "find transitive dependency"
+  - "why is <package> installed"
+  - "dependency hierarchy"
+  - "upward dependency"
+  - "downward dependency"
+  - "blast radius"
+  - "oss remediation dotnet"
+  - "nuget vulnerable package"
+  - "gradle override transitive version"
+  - "gradle hardcoded version"
+audience: developers, architects, build engineers, security/compliance/governance reviewers
+runtime: tree-sitter (accelerator) or stdlib parsers; ecosystem-native resolvers; .NET SDK; Gradle; git; shell
+output: codegraph.json, dependency-intelligence-report.md, dependency-graph.mmd, dependency-graph.json, remediation-plan.json
+version: 3.0.0
+---
+
+# Dependency Intelligence Suite
+
+> **Consolidation note.** This file merges five capabilities that are
+> otherwise independent playbooks: codegraph substrate, package transitive
+> mapping, code hierarchy mapping, .NET OSS remediation, Gradle transitive
+> remediation. This trades the one-capability-per-file convention for a
+> single entry point. Each Part keeps its own certification harness,
+> Fidelity Ledger, and limitations section — consolidation means one file,
+> not one undifferentiated process. Parts 2–5 do **not** require Part 1;
+> `codegraph.json` is an accelerator for them, never a prerequisite.
+
+## Part 0 — Routing
+
+| Question | Go to |
+|---|---|
+| Build/refresh the repo knowledge graph; define agent tool calls | Part 1 |
+| What packages does this repo pull in? Why is package X here? | Part 2 |
+| What does this file/class depend on? What breaks if I change it? | Part 3 |
+| Fix vulnerable/deprecated/outdated NuGet packages | Part 4 |
+| Fix a Gradle transitive version that resolves wrong | Part 5 |
+| Combined limitations, absence notation, command reference | Part 6 |
+
+---
+
+# PART 1 — codegraph Substrate
+
+## 1.1 Purpose
+
+Produce one committable JSON file an AI agent queries instead of reading
+the repository. Construction is deterministic and expensive; queries are
+cheap and repeatable. The token saving is entirely conditional on that
+separation holding — see §1.11.
+
+## 1.2 Phase 0 — Presence & Freshness Gate (runs first, always)
+
+```
+1. Does ./codegraph.json exist?
+   NO  → full build (§1.4).
+   YES → freshness check.
+2. Read meta.repo_head_sha, meta.file_hashes{}, meta.schema_version
+3. Compute current git HEAD sha + per-file SHA256 of tracked files.
+4. Decide:
+   - Same HEAD sha AND no hash drift  → CURRENT. Use as-is.
+   - Drift on N files                 → INCREMENTAL (§1.5) on those N only.
+   - schema_version mismatch          → full rebuild.
+   - File malformed/unparseable       → full rebuild, and report the
+                                        corruption explicitly rather than
+                                        silently overwriting.
+```
+
+If freshness cannot be established (not a git working tree, no HEAD sha),
+report **"Not verifiable — codegraph freshness unconfirmed: [reason]"** and
+require an explicit full rebuild. Never partially trust a stale graph.
+
+Every run reports: `BUILT | INCREMENTAL(n) | CURRENT | REBUILT(reason)`.
+
+## 1.3 codegraph.json Schema
+
+```json
+{
+  "meta": {
+    "schema_version": "3.0.0",
+    "generated_at": "2026-07-28T00:00:00Z",
+    "repo_head_sha": "a1b2c3d",
+    "generator": "dependency-intelligence-suite@3.0.0",
+    "parser_tier": "A",
+    "languages_detected": ["csharp", "typescript"],
+    "ecosystems_detected": ["nuget", "npm"],
+    "file_hashes": { "src/Order.cs": "sha256:..." },
+    "coverage": {
+      "files_parsed": 1204,
+      "files_skipped": 17,
+      "skip_reasons": { "binary": 12, "parse_error": 5 },
+      "degraded_languages": ["php"]
+    }
+  },
+  "nodes": [
+    { "id": "file:src/Services/OrderService.cs", "type": "file",
+      "language": "csharp", "loc": 240 },
+    { "id": "class:OrderService", "type": "class",
+      "file": "src/Services/OrderService.cs", "line": 12 },
+    { "id": "fn:OrderService.PlaceOrder", "type": "function",
+      "file": "src/Services/OrderService.cs", "line": 45 },
+    { "id": "pkg:Dapper@2.1.35", "type": "package",
+      "ecosystem": "nuget", "scope": "runtime" },
+    { "id": "svc:billing-service", "type": "service",
+      "contract": "openapi/billing.yaml" },
+    { "id": "note:WHY:src/Order.cs:88", "type": "annotation", "kind": "WHY" }
+  ],
+  "edges": [
+    { "from": "file:src/Services/OrderService.cs",
+      "to": "file:src/Repositories/OrderRepository.cs",
+      "type": "imports", "tier": 1, "provenance": "EXTRACTED",
+      "source": "roslyn:SymbolFinder", "line": 4 }
+  ],
+  "communities": [
+    { "id": "c1", "label": "order-processing",
+      "members": ["class:OrderService"], "provenance": "INFERRED" }
+  ]
+}
+```
+
+**Node types:** `file`, `directory`, `module`, `namespace`, `class`,
+`interface`, `function`, `method`, `variable` (module-scope), `package`,
+`framework_binding`, `service`, `endpoint`, `db_table`, `config_key`,
+`test`, `entrypoint`, `annotation`.
+
+**Edge types:** `imports`, `calls`, `inherits`, `implements`,
+`instantiates`, `references`, `depends_on_package`, `injects`,
+`exposes_endpoint`, `consumes_endpoint`, `reads_table`, `writes_table`,
+`tests`, `configured_by`.
+
+### Tier — defines the `tier` field (used by Parts 1 and 3)
+- **Tier 1** — import/module graph from a native static-analysis tool.
+  Highest structural confidence.
+- **Tier 2** — symbol-level call/reference graph. Materially weaker than
+  Tier 1 in every language; weaker still in dynamically typed ones.
+- **Tier 3** — framework DI/component graph. Conditional on framework
+  signature detection.
+- **Tier 4** — cross-service graph from API/queue contracts. Conditional
+  on spec artifacts existing in-repo.
+- **Tier 0** — regex fallback for languages with no grammar. Always
+  low-confidence, always labeled.
+
+### Provenance — mandatory on every edge
+- `EXTRACTED` — present in AST or resolver output. Citable as evidence.
+- `INFERRED` — heuristic or convention (communities, layering guesses,
+  Tier 0 edges). **Not** citable as fact.
+- `AMBIGUOUS` — multiple possible resolutions, not disambiguated
+  (overloaded call target, dynamic import with computed path).
+
+Reporting an `INFERRED` or `AMBIGUOUS` edge as established fact is a
+misuse of this file.
+
+## 1.4 Phase 1 — Full Build
+
+### 1.4a Discovery
+Walk the repo respecting `.gitignore`. Record each file, language
+(extension + shebang + content sniff), SHA256. Log every skipped file and
+why — binary, vendored, generated, over size cap.
+
+### 1.4b Parse — executed by script, never by the agent
+**The agent runs a generated script and reads only its stdout summary.**
+If the agent reads source files to build the graph, the entire rationale
+for this Part is defeated: a full parse pass through LLM context is the
+most expensive operation here.
+
+Parser selection is an accelerator tier, not a hard dependency:
+
+| Tier | Condition | Parser | Provenance |
+|---|---|---|---|
+| A | tree-sitter already installed | tree-sitter grammar per language | `EXTRACTED` |
+| B | Python-only repo, no tree-sitter | stdlib `ast` | `EXTRACTED` |
+| C | Neither | regex import scan | `INFERRED` |
+
+Tier A is materially better and is the only tier yielding trustworthy
+call/inheritance edges. Do not install tree-sitter silently — report the
+tier that ran and let the operator decide. Record in `meta.parser_tier`.
+
+### 1.4c Package overlay
+Run each ecosystem's native resolver (Part 2 §2.3 is the authority table);
+merge `package` nodes and `depends_on_package` edges. Tag each package
+node with `scope`: `runtime` | `dev` | `test` | `build`. Never merge
+scopes into one list.
+
+### 1.4d Symbol resolution (Tier 1 → Tier 2)
+Where compiler-grade tooling is available and the build loads: Roslyn
+`SymbolFinder` (C#), TypeScript Compiler API / `ts-morph`, `jdeps` +
+javac Tree API (Java/Kotlin), `golang.org/x/tools` `callgraph` (Go),
+`grimp`/`pyright` (Python, best-effort), `cargo modules` (Rust).
+Unresolved or multi-target call sites → `AMBIGUOUS`, never guessed.
+
+### 1.4e Framework, service & data overlays
+Only on positive signature detection (Part 3 §3.5 table); otherwise
+`"Not detected"`. Service contracts: OpenAPI/Swagger, `.proto`, queue
+topic config. Data: SQL DDL and ORM models → `db_table`,
+`reads_table`/`writes_table`. Config: env schemas, `appsettings.json`,
+Terraform/HCL → `config_key`, `configured_by`.
+
+### 1.4f Annotation mining
+Extract `TODO`, `FIXME`, `NOTE`, `WHY`, `HACK` comments as `annotation`
+nodes linked to the enclosing symbol. These capture intent the AST cannot
+— often the only record of *why* a dependency exists.
+
+### 1.4g Community detection & hub metrics
+Cluster into subsystems (`communities`, tagged `INFERRED`). Compute
+in-degree rankings so consumers can identify hub nodes.
+
+### 1.4h Write
+Write atomically (temp file + rename) so an interrupted build never leaves
+a half-written graph a later run would trust.
+
+## 1.5 Phase 2 — Incremental Refresh
+
+1. Re-parse only drifted files.
+2. Remove all edges *originating* from them.
+3. Re-extract and re-insert their nodes/edges.
+4. Re-resolve any `AMBIGUOUS` edge pointing *into* a drifted file.
+5. Re-run the package overlay **only** if a manifest or lockfile drifted —
+   package resolution is expensive and unaffected by source edits.
+6. Re-run community detection (skipping it leaves stale clusters).
+7. Update `file_hashes`, `repo_head_sha`, `generated_at`.
+
+## 1.6 Phase 3 — Certification Harness (gate before serving any query)
+
+1. **Coverage floor** — `files_parsed / (parsed + skipped)` ≥ 0.90.
+   Below → all answers labeled low-confidence.
+2. **No orphan edges** — every endpoint resolves to a node. Dangling edges
+   indicate a broken incremental refresh.
+3. **Provenance completeness** — 100% of edges tagged. Untagged = build bug.
+4. **Round-trip check** — one known file, one known class, one known
+   package: verify graph edges match what the native tool reports directly.
+5. **Freshness confirmed** — §1.2 returned `CURRENT` or a build succeeded.
+
+**Gate: FAIL on 2, 3, or 4 blocks queries entirely for the affected layer.**
+1 and 5 downgrade confidence without blocking.
+
+## 1.7 Tool-Call Contract
+
+**Provenance note:** this contract is designed from the requirements in
+this playbook. It is not a reproduction of any third-party tool's
+interface and claims no compatibility with one.
+
+**Transport:** CLI + `jq` over `codegraph.json` via the terminal tool. No
+MCP server, no daemon — deliberately rejected as unnecessary for a
+single-assistant, single-repo target (§1.11).
+
+### Universal response envelope
+```json
+{
+  "ok": true,
+  "result": { },
+  "sufficiency": {
+    "hit": true,
+    "graph_state": "CURRENT",
+    "coverage": 0.96,
+    "provenance_mix": { "EXTRACTED": 14, "INFERRED": 0, "AMBIGUOUS": 2 },
+    "truncated": false,
+    "nodes_returned": 16,
+    "fallback_recommended": false,
+    "fallback_scope": []
+  },
+  "tokens_estimate": 340
+}
+```
+
+### Tools
+
+| Tool | Params | Budget |
+|---|---|---|
+| `codegraph.status` | none | ≤150 |
+| `codegraph.build` | `{mode: auto\|full\|incremental}` | ≤200 |
+| `codegraph.search` | `{term, type?, limit=10}` | ≤200 |
+| `codegraph.deps` | `{id, depth=3, max_nodes=40, include_packages=true}` | ≤600 |
+| `codegraph.impact` | `{id, depth=3, max_nodes=40, group_by_break_type=true}` | ≤700 |
+| `codegraph.path` | `{from, to, max_paths=3}` | ≤400 |
+| `codegraph.why` | `{package, ecosystem?}` | ≤400 |
+| `codegraph.annotations` | `{id, radius=1}` | ≤300 |
+
+- `codegraph.status` — call once per session; not again unless a build ran.
+- `codegraph.search` — resolves informal names ("the order repo") to node
+  ids. Without it, bad ids produce constant `hit: false` and trigger
+  fallbacks that quietly destroy the token saving.
+- `codegraph.impact` — returns consumers grouped `compile_time`,
+  `runtime_cross_service`, `runtime_data`.
+
+### Hard caps (non-negotiable)
+- Every traversal enforces `max_nodes`. On exceed: truncate, set
+  `truncated: true`, return **highest in-degree nodes first** — not an
+  arbitrary prefix.
+- No tool returns file *contents*. Ids, paths, line numbers only.
+- Query turn budget ~1,500 tokens. A blast-radius query dumping 4,000
+  nodes costs more than reading the three files actually needed.
+
+## 1.8 Fallback Contract
+
+**Fall back to reading source only when at least one holds:**
+1. `hit: false` — target absent from the graph.
+2. `graph_state != CURRENT` **and** the target is in `stale_files`.
+3. `truncated: true` **and** the truncated portion is material.
+4. The answer path is majority `INFERRED`/`AMBIGUOUS` — the graph is
+   guessing, so it is not evidence.
+5. The question is **behavioral, not structural** ("is this logic
+   correct", "what does this compute"). The graph maps relationships, not
+   semantics. No amount of querying answers this. Read the file.
+
+**Do NOT fall back merely because** the answer seems short, confidence
+feels low, or the result is surprising. A correct graph answer is often a
+small one.
+
+**Fallback stays scoped.** Even when insufficient, the graph knows which
+files are relevant — it returns `fallback_scope`, a concrete file list.
+The agent reads those and no others. A failed query narrows the search
+from the whole repo to a handful of files; it is not a licence to re-read
+the codebase.
+
+**Retry order before falling back:** `codegraph.search` (bad node id is
+the most common cause of `hit: false`), then `codegraph.build
+--mode=incremental` if stale. Only then read source.
+
+## 1.9 Outputs
+1. **`codegraph.json`** — the persistent graph.
+2. **`codegraph-build-report.md`** — gate outcome, parser tier, coverage,
+   skipped files with reasons, degraded languages.
+
+## 1.10 Committing the graph — a real decision, not a default
+
+Committing gives the team and CI one shared graph and enables offline
+query. It also produces large, merge-hostile diffs on every refresh. A
+union-merge driver mitigates but does not eliminate this. Gitignoring plus
+a CI rebuild step is the lower-friction default; commit only if offline or
+shared access genuinely matters. Decide deliberately.
+
+## 1.11 Part 1 Limitations
+
+- **A graph is a snapshot.** Between refreshes it drifts. §1.2's gate is
+  the only thing between a stale graph and a confidently wrong answer.
+- **Static analysis cannot see runtime wiring.** DI registration by string
+  name, `importlib.import_module()` with computed paths, reflection,
+  `import()` with a variable — all under-report. Known gap, not a bug.
+- **`INFERRED` is not evidence.** Communities and layering judgments are
+  useful and belong in the graph; they do not belong in a finding
+  presented as fact.
+- **The token saving is conditional, not automatic.** It holds only if
+  (a) the build runs as a script, never through agent context, and (b)
+  results stay within §1.7 caps. Violate either and this costs more than
+  grepping. Rough break-even: 3–5 structural queries on a repo of a few
+  hundred files. Below that, grep wins.
+- **A markdown playbook cannot enforce any of this.** §1.4b says "never
+  read source to build the graph" — that is an instruction, not a
+  constraint. Verify empirically before trusting the token claim: run one
+  blast-radius query with and without the graph on the same repo and
+  compare actual context consumed.
+- **`path` and `impact` are worst-case exponential** on dense graphs.
+  `max_nodes` makes them safe but means hub-node results are genuinely
+  partial — the truncation flag is load-bearing, not decorative.
+- **No MCP server, by choice.** Scoped to a single assistant with terminal
+  access. Serving several assistants or a team over the network is a real
+  gap this design does not cover.
+- **Large monorepos** may exceed practical single-file JSON size. Shard by
+  top-level module and record shard pointers in `meta` rather than
+  silently truncating.
+
+---
+
+# PART 2 — Package Transitive Dependency Mapping
+
+## 2.1 Purpose
+
+Map every package dependency edge — direct and transitive — with two
+query modes:
+1. **Full graph** — the entire resolved tree.
+2. **Target lookup** — every path from a manifest-level dependency down to
+   a given package, with depth and intermediates.
+
+This Part does not re-implement any package manager's resolution
+algorithm. It orchestrates each ecosystem's own resolver.
+
+## 2.2 Scope & Non-Goals
+
+**In scope:** npm/yarn/pnpm, pip/poetry/pipenv, Maven/Gradle, NuGet,
+Cargo, Go modules.
+
+**Not covered — stated plainly, not silently degraded to "Not detected":**
+PHP (Composer), Ruby (Bundler), Swift (SPM/CocoaPods), Dart (pub), Elixir
+(Mix), C/C++ (no dominant ecosystem — Conan/vcpkg/system packages). On a
+repo in one of these this Part produces nothing useful. Adding one is
+mechanical — a Fidelity Ledger row plus an Appendix entry — not a
+redesign.
+
+**Out of scope by design:** vulnerability severity scoring (structure
+only — see Part 4 for .NET remediation); license extraction (§2.11).
+
+## 2.3 Fidelity Ledger
+
+**Single authority per ecosystem.** Manifests are never hand-parsed to
+*infer* a graph: manifests express ranges, not resolution — only the
+resolver (or the lockfile it produced) knows the resolved answer.
+
+| Ecosystem | Authority | Rejected alternative | Why rejected |
+|---|---|---|---|
+| npm | `npm ls --all --json`, `npm explain` | Hand-parsing `package.json` ranges | Ranges ≠ resolved versions; misses hoisting/dedup |
+| yarn | `yarn why`, `yarn list --json` | Re-deriving from `package.json` | Dedup/hoisting logic is undocumented and version-specific |
+| pnpm | `pnpm why`, `pnpm list --depth Infinity --json` | Walking `node_modules/.pnpm` symlinks | Content-addressed store layout changes across versions |
+| pip | `pipdeptree --json-tree` | Chaining `pip show` manually | `pip show` gives one hop only |
+| poetry | `poetry show --tree` | pip-style resolution | Poetry has its own resolver; pip's view of the same venv can disagree |
+| Maven | `mvn dependency:tree -Dverbose` | Reading `<dependencies>` in `pom.xml` | Misses transitive mediation and conflict-omitted versions entirely |
+| Gradle | `./gradlew <module>:dependencies` | Reading `build.gradle` | Conflict resolution (highest-wins) is not visible in source |
+| NuGet | `dotnet list package --include-transitive` | Parsing `.csproj`/`packages.lock.json` by hand | Central Package Management and floating versions break static parsing |
+| Cargo | `cargo tree`, `cargo tree -i` | `Cargo.lock` manual parse | `cargo tree` already resolves feature unification; native reverse mode exists |
+| Go | `go mod graph`, `go mod why -m` | Parsing `go.sum` | `go.sum` is a checksum ledger, not a dependency graph |
+
+`pipdeptree` is an accelerator: installed if missing, never assumed. If a
+resolver binary is absent, report **"Not run — resolver unavailable:
+[tool] not found on PATH"**, never approximate by manifest-parsing.
+
+## 2.4 Phase 0 — Certification Harness (mandatory gate)
+
+Report PASS/FAIL with evidence. A FAIL halts that ecosystem only; others
+proceed independently.
+
+1. **Manifest present** — cite the path.
+2. **Lockfile present**, or explicit justification. Without one, resolution
+   is non-deterministic — a fidelity caveat, not a blocker.
+3. **Resolver binary on PATH**, version captured.
+4. **Resolvable without network mutation** — prefer lockfile-only flags
+   (`npm ls --package-lock-only`, `pnpm list --offline`). If a live
+   install is required to materialize a tree (Maven needs artifacts
+   present), state it and require the operator to run the install first
+   rather than silently triggering a network install.
+5. **Dry-run parse check** — run the resolver against one known-good
+   package and confirm output parses into the expected schema.
+
+**Gate:** proceed if 1–3 and 5 pass. Check 4 downgrades confidence.
+
+## 2.5 Phase 1 — Ecosystem Detection & Inventory
+
+Monorepo-aware (one level of workspace detection). Record per match:
+ecosystem, manifest path, lockfile path (or "Not detected"), and
+workspace/module name — npm/yarn/pnpm workspaces, Maven multi-module
+`<modules>`, Cargo workspace members, Go module path.
+
+| Ecosystem | Manifest | Lockfile | Workspace |
+|---|---|---|---|
+| npm | `packages/web/package.json` | `package-lock.json` (root) | web |
+| poetry | `services/api/pyproject.toml` | `poetry.lock` | api |
+
+Zero manifests → **"Not detected — no supported ecosystem manifest found
+in scanned paths: [list]"**. Stop.
+
+## 2.6 Phase 2 — Graph Extraction
+
+```json
+{
+  "ecosystem": "npm",
+  "resolver": "npm@10.8.2",
+  "source": "npm ls --all --json",
+  "resolved_at": "2026-07-28T00:00:00Z",
+  "edges": [
+    { "from": "my-app@1.0.0", "to": "express@4.19.2",
+      "direct": true, "scope": "runtime" },
+    { "from": "express@4.19.2", "to": "body-parser@1.20.2",
+      "direct": false, "scope": "runtime" }
+  ]
+}
+```
+
+Store raw resolver output alongside the normalized JSON so any edge can be
+audited back to source. No edge is inferred or interpolated.
+
+## 2.7 Phase 3 — Classification & Path Reconstruction
+
+- **Classification** — `direct` (in the manifest) vs `transitive`.
+- **Scope** — `runtime` | `dev` | `test` | `build`. npm `devDependencies`,
+  Maven `test` scope, Cargo `dev-dependencies` are **never merged into one
+  undifferentiated list**; a dev-only vulnerability has a different risk
+  profile from a runtime one.
+- **Depth** — shortest-path hops from a direct dependency.
+- **All resolution paths** — a package reachable via multiple direct
+  dependencies (diamond) gets every distinct path enumerated, not just the
+  shortest. Impact analysis needs the full set.
+- **Multiple resolved versions** — if the same package resolves to several
+  versions in one tree (common in npm without full dedup), each version is
+  listed separately with its own path set and its own pulling parent.
+
+## 2.8 Phase 4 — Target Lookup Mode
+
+1. Locate the target (all matching versions).
+2. Walk reverse edges to every direct dependency reaching it.
+3. Report each path in full:
+
+```
+express@4.19.2 (direct, package.json:14, scope=runtime)
+  └─ body-parser@1.20.2
+       └─ qs@6.11.0  ← TARGET (depth 3)
+```
+
+4. Absent → **"Not detected — <package> not present in resolved graph for
+   <ecosystem>/<workspace> as of <resolver> run at <timestamp>"**.
+5. **Prefer the native reverse command** over reimplementing the backward
+   walk: `npm explain`, `yarn why`, `pnpm why`,
+   `pipdeptree --reverse --packages`, `cargo tree -i`, `go mod why -m`,
+   `dotnet nuget why`. Cross-check native output against the graph walk;
+   on disagreement report the discrepancy rather than silently preferring
+   one.
+
+## 2.9 Phase 5 — Conflict, Risk & Duplication Detection
+
+Evidence-only flags, each citing packages/versions:
+
+- **Multiple resolved versions** of one package — all versions, with which
+  direct dependency pulled each.
+- **Excessive depth** — chains beyond a configurable threshold (default 6).
+- **Unpinned transitive ranges** in the lockfile. Report **"Not
+  applicable"** for ecosystems whose lockfiles always pin exact versions
+  (`Cargo.lock`, `poetry.lock`).
+- **Single-path fragility** — a widely-used transitive package reachable
+  via only one direct dependency; removing it silently drops the package.
+- **Scope leakage** — a package in both `dev` and `runtime` scope at
+  different versions.
+
+### Weighted scorecard (A–F) per workspace
+
+| Factor | Weight | Evidence required |
+|---|---|---|
+| Version duplication | 25% | count + package list |
+| Max depth | 20% | deepest chain(s), cited |
+| Unpinned transitive count | 25% | count, or "Not applicable" |
+| Single-path fragility | 30% | count + package list |
+
+Grade bands: A ≥90, B ≥80, C ≥70, D ≥60, F <60.
+
+**Confidence annotation** on every score: `High` (lockfile present, Phase
+0 check 4 clean), `Medium` (lockfile present, live resolution required),
+`Low` (no lockfile — resolution non-deterministic, so counts may not
+reproduce).
+
+## 2.10 Phase 6 — Outputs
+
+1. **`dependency-intelligence-report.md`** — inventory, scorecard with
+   confidence, target-lookup results, flagged risks; every claim citing a
+   manifest/lockfile path and the exact resolver command run.
+2. **`dependency-graph.mmd`** — Mermaid, paginated for large trees:
+
+```mermaid
+graph TD
+  A[my-app] --> B[express@4.19.2]
+  B --> C[body-parser@1.20.2]
+  C --> D[qs@6.11.0]
+```
+
+3. **`dependency-graph.json`** — normalized edge list so downstream
+   consumers need not re-run resolution.
+
+## 2.11 Part 2 Limitations
+
+- **No CVE or vulnerability data.** Structure only. Do not present this
+  output as a security scan.
+- **No license data.** Treat licensing questions as "Not detected".
+- **Six ecosystems only** (§2.2).
+- **Optional peerDependencies / extras / features** appear only if
+  satisfied at resolution time; reported per-ecosystem based on what the
+  authority tool surfaces.
+- **Private/internal registries**: if the resolver cannot reach one and
+  Phase 0 check 4 fails, that subtree is marked low-confidence rather than
+  omitted. A silent registry failure looks identical to a clean tree —
+  which is why check 4 is reported, not skipped.
+- **No lockfile means no reproducibility.** Two runs can legitimately
+  differ; the scorecard confidence annotation carries this.
+
+---
+
+# PART 3 — Code Dependency Hierarchy (Upward/Downward)
+
+## 3.1 Purpose
+
+Given a file, module, class, function, or service:
+1. **Downward** — everything it depends on ("what do I need to
+   compile/run this").
+2. **Upward** — everything that depends on it ("what breaks if I change
+   or delete this").
+
+Both directions are one graph traversed differently. One construction
+phase, two query modes — never two builds.
+
+## 3.2 Confidence Tiers
+
+Tier definitions are shared with Part 1 §1.3 (Tier 0–4). No single tool
+produces a code-level dependency graph for "any language"; every edge
+carries the tier that produced it, and tiers are not equally trustworthy.
+
+## 3.3 Fidelity Ledger — Tier 1 & 2 authorities
+
+| Language | Tier 1 (import graph) | Tier 2 (call graph) | Rejected alternative | Why rejected |
+|---|---|---|---|---|
+| JS/TS | `dependency-cruiser` or `madge` | TypeScript Compiler API / `ts-morph` | Regex over `import`/`require` | Misses re-exports, barrel files, dynamic `import()`, path aliases |
+| Python | `pydeps` / `grimp` | `jedi` or `pyright` references (best-effort) | `grep "^import\|^from"` | Misses dynamic and conditional imports, `importlib.import_module()`, `__init__.py` re-exports |
+| Java/Kotlin | `jdeps` (JDK built-in, bytecode-level) | javac Compiler Tree API (heavier, optional) | Parsing `.java` import statements | Misses reflection-based wiring and runtime classpath additions |
+| C#/.NET | Roslyn `SymbolFinder` | Roslyn, deeper query | Regex on `using` statements | Misses partial classes, extension methods, implicit global usings, source generators |
+| Go | `golang.org/x/tools/refactor/importgraph` (official; forward *and* reverse) | `golang.org/x/tools/cmd/callgraph` | `go mod graph` | Module-level only; misses intra-module package structure |
+| Rust | `cargo modules generate graph` | No mature native call-graph tool — manual `mod` walk | Reading `Cargo.toml` | Misses macro-generated modules and `cfg()`-conditional compilation |
+
+NDepend offers a more mature architectural graph for .NET but is
+commercial and not assumed present. Any language absent from this table
+gets Tier 0 only, reported as such.
+
+## 3.4 Phase 0 — Certification Harness (mandatory gate, per language)
+
+1. **Repo parses.** Syntactically valid code — a broken build degrades
+   every tier. Confirm via compile/parse dry-run. **This blocks.**
+2. **Tier 1 authority on PATH**, version captured. Missing → **"Not run —
+   resolver unavailable: [tool] not found on PATH"**.
+3. **Tier 2/3/4 prerequisites checked before attempting**, never
+   substituted silently: Tier 2 needs loadable build output; Tier 3 needs
+   a positive framework signature; Tier 4 needs actual spec files.
+4. **Dry-run sanity check** — one known file/class, confirm against manual
+   expectation before the full run.
+
+## 3.5 Phase 1 — Language, Framework & Boundary Detection
+
+Detect frameworks by signature; "Not detected" for anything outside this
+list — never a best-effort guess for an unrecognized setup.
+
+| Framework | Detection signature | Tier 3 extraction |
+|---|---|---|
+| Spring / Boot | `@SpringBootApplication`, `spring-boot-starter` | Actuator `/actuator/beans` (runtime) or `@Autowired`/`@Component` static scan |
+| ASP.NET Core | `WebApplication.CreateBuilder` in `Program.cs` | `IServiceCollection` registration scan |
+| Angular | `angular.json` | `@Injectable`/`providedIn` static scan |
+| NestJS | `@nestjs/core` in `package.json` | `@Module`/`@Injectable` decorator graph |
+| Django | `manage.py` + `INSTALLED_APPS` | App/model graph via `django.apps` |
+| Rails | `config/application.rb` | Zeitwerk autoload graph |
+
+Tier 4 boundaries: OpenAPI/Swagger, `.proto`, queue topic/consumer config.
+
+## 3.6 Phase 2 — Graph Construction
+
+```json
+{ "tier": 1, "language": "csharp",
+  "from": "src/Services/OrderService.cs",
+  "to": "src/Repositories/OrderRepository.cs",
+  "kind": "using", "source_command": "Roslyn SymbolFinder",
+  "provenance": "EXTRACTED" }
+```
+
+Every edge traces to raw tool output. Unresolved or multi-target call
+sites are recorded as `AMBIGUOUS`, never dropped and never guessed.
+
+## 3.7 Phase 3 — Downward Query
+
+Walk forward edges to full depth. Enumerate **all** distinct paths — a
+shared utility reached via two callers is a diamond here too. Classify
+direct/transitive, tier-tagged, with depth.
+
+## 3.8 Phase 4 — Upward Query (blast radius) — usually the higher-value direction
+
+Walk reverse edges to full depth; report every consumer path.
+
+**Critical distinction the report must surface:** a dependent at Tier 1–3
+(internal code) breaks at **compile time** — the build catches it. A
+dependent at Tier 4 (another service calling this one's API) breaks at
+**runtime**, no compiler in the loop, across a deploy boundary. Data
+consumers (`reads_table`/`writes_table`) also break at runtime, and
+potentially silently until a query fails in production. Do not present
+these with the same implied safety net.
+
+```
+OrderRepository.cs
+  ← OrderService.cs        (Tier 1, direct       — compile-time)
+  ← ReportingService.cs    (Tier 1, transitive   — compile-time)
+  ← billing-service        (Tier 4, GET /orders  — runtime, cross-deploy,
+                            no compiler protection)
+  ← db_table:orders        (runtime, silent-failure risk)
+```
+
+## 3.9 Phase 5 — Cycle Detection & Layering Violations
+
+- **Circular dependencies** (A → B → A) at any tier — an architectural
+  risk independent of cause; flag regardless of language.
+- **Layering violations** — only where an intended layering is evident
+  from the repo's own folder/namespace structure (e.g. `controllers` →
+  `services` → `repositories`); flag inverting edges. **Never assume a
+  layering convention that isn't visible in the repo itself.** Layering
+  findings are heuristic and labeled as such, not cited as fact.
+
+## 3.10 Phase 6 — Outputs
+
+1. Report section — per query, full path enumeration with tier and
+   confidence on every line; cycles and layering violations with
+   file-path citations.
+2. Mermaid diagram — full graph or focused sub-diagram per target.
+3. `dependency-graph.json` — normalized tiered edge list.
+
+## 3.11 Unified single-target impact (only available when Parts 2 and 3 both ran)
+
+Scoped to **one node only** — a combined full-repo view across both layers
+is unreadable, and this playbook says so rather than attempting it.
+
+```
+class:OrderRepository  [codegraph: CURRENT, coverage 0.96]
+  ── upward (blast radius) ──
+  ← class:OrderService          EXTRACTED  compile-time
+  ← svc:billing-service         EXTRACTED  runtime, cross-deploy (GET /orders)
+  ← db_table:orders             EXTRACTED  runtime, silent-failure risk
+  ── downward (package surface) ──
+  → pkg:Dapper@2.1.35                     direct
+      → pkg:System.Data.SqlClient@4.8.6   transitive (depth 2)
+  ── annotations ──
+  note:WHY:src/OrderRepository.cs:88 — "raw SQL here because the ORM
+      couldn't express the window function"
+```
+
+## 3.12 Part 3 Limitations
+
+- **No tool covers "any language" at Tier 1+.** Six languages have
+  authorities (§3.3); everything else is Tier 0, reported plainly rather
+  than disguised as full analysis.
+- **Runtime and reflective wiring is invisible to static tiers.** DI
+  containers registering by string name, `importlib.import_module()` with
+  a computed path, JS `import()` with a variable — all under-report.
+- **Tier 2 is materially less reliable than Tier 1 in every language**,
+  and weaker still in dynamically typed ones.
+- **Tier 3 detection is signature-based against a known list.** Unlisted
+  or customized framework setups report "Not detected", never approximated.
+- **A clean upward result is not proof nothing breaks.** It means nothing
+  *statically visible* breaks. Reflection, config-driven dispatch, and
+  consumers outside this repo are all outside the graph.
+
+---
+
+# PART 4 — .NET / NuGet OSS Remediation
+
+## 4.1 Purpose
+
+Take a .NET solution from "unknown OSS risk" to "remediated and verified,"
+with evidence at every step. Four categories: known vulnerabilities,
+deprecated/unlisted packages, outdated-but-not-vulnerable packages, and
+**transitive-only vulnerabilities** — the category that matters most,
+because the package appears in no `.csproj` and a source-only review will
+never find it.
+
+## 4.2 Fidelity Ledger
+
+| Concern | Authority | Rejected alternative | Why rejected |
+|---|---|---|---|
+| Vulnerability data | NuGetAudit during `dotnet restore` (GitHub Advisory Database via nuget.org) | Third-party SCA as primary | Adds a second source of truth; use as corroboration, not authority |
+| Resolved package set | `dotnet list package --include-transitive` | Parsing `.csproj`/`packages.lock.json` by hand | CPM, floating versions and transitive resolution break static parsing |
+| Root-cause tracing | `dotnet nuget why <pkg>` | Manual tree reading | Native reverse lookup; equivalent to `npm explain` / `cargo tree -i` |
+| Fix verification | Re-run of the detection command | Assuming the edit worked | An unverified fix is not a fix |
+
+## 4.3 Phase 0 — Certification Harness (mandatory gate)
+
+1. **SDK version captured** — `dotnet --version`. Audit behavior differs
+   materially by version (§4.4).
+2. **Solution restores cleanly.** A failing restore means audit data is
+   incomplete, not that the solution is clean.
+3. **Audit source reachable.** Confirm the configured package/audit source
+   returns vulnerability data. **The single most important check in this
+   Part.** An enterprise on a curated private feed with no public feed
+   access gets *no vulnerability data at all*, and the output is identical
+   to a clean solution. If unreachable, report **"Not run — audit source
+   unreachable: [source]. Absence of findings is NOT evidence of absence
+   of vulnerabilities."** and stop.
+4. **Baseline captured** — full `dotnet list package --include-transitive`
+   output stored before any modification.
+5. **Build and tests pass pre-change** — a red baseline makes post-fix
+   breakage unattributable.
+
+**Gate: all five.** Check 3 failing halts the run entirely.
+
+## 4.4 Phase 1 — Configure Audit Scope
+
+`NuGetAuditMode` controls scope: `direct` (project references only) or
+`all` (direct **and** transitive).
+
+**The default changed by version.** Targeting .NET 10 or higher the
+default is `all`; below that it remains `direct`. Do not rely on the
+default — set it explicitly in `Directory.Build.props`:
+
+```xml
+<PropertyGroup>
+  <NuGetAudit>true</NuGetAudit>
+  <NuGetAuditMode>all</NuGetAuditMode>
+  <NuGetAuditLevel>moderate</NuGetAuditLevel>
+</PropertyGroup>
+```
+
+If the team uses `<TreatWarningsAsErrors>` and needs findings not to break
+the build immediately, scope the exemption narrowly rather than disabling
+audit:
+
+```xml
+<WarningsNotAsErrors>NU1901;NU1902;NU1903;NU1904;$(WarningsNotAsErrors)</WarningsNotAsErrors>
+```
+
+Record the choice — a suppressed-warning build and a clean build are not
+the same result.
+
+## 4.5 Phase 2 — Detection
+
+```
+dotnet list package --vulnerable --include-transitive
+dotnet list package --deprecated
+dotnet list package --outdated --include-transitive
+```
+
+`--include-transitive` is **not** the default. Omitting it hides exactly
+the category this Part exists for.
+
+Per finding record: package id, requested vs resolved version,
+direct/transitive, severity, advisory URL, affected projects. No finding
+is reported without its advisory URL.
+
+## 4.6 Phase 3 — Root-Cause Tracing
+
+```
+dotnet nuget why <transitive-package-id>
+```
+
+Identifies the top-level package pulling in the vulnerable dependency.
+Record the full chain. **Remediating the parent is preferred over
+overriding the child** — §4.7.
+
+## 4.7 Phase 4 — Remediation, in order of preference
+
+**4.7a Direct package.** `dotnet add package <id> --version <fixed>`
+
+**4.7b Transitive — upgrade the parent first.** If a newer parent version
+already depends on a patched version, this is the cleanest fix: no
+override, no untested combination. Try before 4.7c.
+
+**4.7c Transitive — explicit direct reference (override).** NuGet uses
+nearest-wins, so a direct `PackageReference` to the patched version forces
+it up the tree.
+
+```xml
+<PackageReference Include="System.Text.Json" Version="8.0.5" />
+```
+
+**Honest risk:** brittle at scale. You now reference a package you don't
+use, pinning a version the parent was never tested against. Can produce
+runtime failures that compile cleanly. Document each override with a
+reason and a removal condition ("remove when parent ships a version
+depending on ≥8.0.5").
+
+**4.7d Central Package Management.** Bump centrally in
+`Directory.Packages.props`; use `VersionOverride` on the single project
+needing an exception rather than fragmenting the central version.
+
+**4.7e Accepted-risk suppression — last resort, documented.**
+```xml
+<NuGetAuditSuppress Include="https://github.com/advisories/GHSA-xxxx-xxxx-xxxx" />
+```
+**Do not fully trust this.** There is a known inconsistency where
+`dotnet list package --vulnerable` does not always honor suppression the
+same way `restore` does. Re-verify after suppressing. Every suppression
+needs an owner, rationale, and review date.
+
+## 4.8 Phase 5 — Verification Gate (mandatory, blocks completion)
+
+1. **Advisory cleared** — re-run detection; confirm the specific advisory
+   is absent. Diff against the Phase 0 baseline.
+2. **No new findings introduced** — the upgrade may have pulled in new
+   transitive packages with their own advisories. Compare full sets.
+3. **Build succeeds.**
+4. **Tests pass** at or above the Phase 0 baseline rate.
+
+Any failure → revert and report as **unremediated with cause**, rather
+than leaving a partially applied fix. Never report a fix complete on the
+basis of the edit having been made.
+
+## 4.9 Outputs
+
+`remediation-plan.json`:
+```json
+{
+  "findings": [
+    { "package": "System.Text.Json", "resolved": "8.0.3",
+      "fixed_version": "8.0.5", "transitive": true,
+      "root_cause": "Some.Parent.Package@2.1.0",
+      "advisory": "https://github.com/advisories/GHSA-...",
+      "action": "4.7c-override", "verified": true }
+  ],
+  "suppressions": [],
+  "audit_source_reachable": true
+}
+```
+
+## 4.10 Part 4 Limitations
+
+- **Private feed blindness.** Without reachable advisory data there are no
+  findings — indistinguishable from a clean solution. §4.3 check 3 is the
+  only thing preventing a false all-clear.
+- **False positives from runtime hoisting.** Packages hoisted to a newer,
+  non-vulnerable version by the shared runtime can still be reported
+  vulnerable. Verify the actually-loaded assembly version before
+  overriding a framework-provided package.
+- **Advisory lag.** A clean result means no *known, published* advisory as
+  of this run. Re-run on a schedule, not once.
+- **No reachability analysis.** This reports that a vulnerable package is
+  present, not that the vulnerable code path is callable. A finding is not
+  automatically an exploitable risk; severity is a prioritization input,
+  not a verdict.
+- **Overrides create untested combinations** (§4.7c). Compiling is not
+  evidence of runtime compatibility.
+
+---
+
+# PART 5 — Gradle Transitive Remediation
+
+## 5.1 Purpose
+
+*This transitive dependency resolves to a version I don't want — where is
+that coming from, and how do I change it without breaking the build?*
+
+Covers **A**: overriding an unwanted resolved version (including one
+pinned by a third-party library via `strictly`), and **B**: eliminating
+hardcoded version numbers in favour of dynamic ranges plus a lockfile.
+
+## 5.2 Fidelity Ledger
+
+| Concern | Authority | Rejected alternative | Why rejected |
+|---|---|---|---|
+| What version actually resolved | `./gradlew dependencies` / `dependencyInsight` | Reading `build.gradle` | Conflict resolution (highest-wins) is not visible in source |
+| Why it resolved that way | `./gradlew <mod>:dependencyInsight --dependency <pkg>` | Inferring from tree indentation | `dependencyInsight` names the declaring node and resolution reason directly |
+| Reproducibility of a dynamic version | `gradle.lockfile` via `--write-locks` | Trusting the range | Ranges resolve differently over time; the lockfile is the only record of what was used |
+
+## 5.3 Phase 0 — Certification Harness (mandatory gate)
+
+1. **Wrapper present and runs** — `./gradlew --version`. Available
+   mechanisms differ across versions.
+2. **Baseline resolution captured** — full
+   `./gradlew <module>:dependencies --configuration <config>` before any
+   change. Every later claim diffs against this.
+3. **Build and tests green pre-change.**
+4. **Target identified precisely** — group, artifact, current resolved
+   version, desired version.
+
+## 5.4 Phase 1 — Diagnose the source of the pin
+
+```
+./gradlew <module>:dependencies --configuration compileClasspath
+./gradlew <module>:dependencyInsight --dependency <group:artifact>
+```
+
+| Marker in output | Meaning | Applicable fix |
+|---|---|---|
+| `1.9 -> 1.10` | normal conflict resolution, highest wins | §5.5a constraint |
+| `{strictly 1.9}` | a strict version declared somewhere | §5.5a, or §5.5b force |
+| `(forced)` | `resolutionStrategy.force` in effect | find and change the force |
+| version from a platform/BOM | a `platform()`/BOM is governing | change the BOM, or override per §5.5a |
+| constraint from a project dependency | another module in this build declared it | §5.7 — known edge case |
+
+**Do not proceed to a fix until the marker is identified.** Applying a
+constraint against a `force`, or a force against a project-dependency
+constraint, silently fails to take effect.
+
+## 5.5 Phase 2 — Apply the override (in order of preference)
+
+### 5.5a Dependency constraints — preferred
+Constraints can override transitive dependencies and enforce strict
+versions, including downgrading, and work even when the unwanted version
+came from a library you don't control.
+
+```groovy
+dependencies {
+    constraints {
+        implementation("group:artifact:2.15.2") {
+            because("CVE-2026-XXXX; previous versions vulnerable")
+        }
+    }
+}
+```
+
+The `because` clause is not optional in practice — on a team, an
+unexplained version pin becomes permanent because nobody dares remove it.
+
+### 5.5b `resolutionStrategy.force` — older mechanism
+Works reliably, including where `strictly` does not, but is the legacy
+path; Gradle's guidance steers toward strict versions and constraints.
+
+```groovy
+configurations.all {
+    resolutionStrategy.force("group:artifact:2.15.2")
+}
+```
+
+### 5.5c Exclude + re-declare
+```groovy
+implementation("some:library:1.0") {
+    exclude group: "group", module: "artifact"
+}
+implementation("group:artifact:2.15.2")
+```
+Riskier: the parent still expects the excluded package at runtime.
+
+### 5.5d `dependencySubstitution` — powerful, most likely to fail silently
+```groovy
+configurations.all {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("group:artifact")).using(module("group:artifact:2.15.2"))
+    }
+}
+```
+**A substitution fails if the module has a `strictly` reference declared
+elsewhere in the graph** — it can appear applied and do nothing. Last
+resort; always verify per §5.8.
+
+## 5.6 Phase 3 — Converting hardcoded versions to dynamic
+
+Dynamic versions alone are **not** safe for production — ranges like `1.+`
+or `[1.0,2.0)` make builds non-deterministic, and a build can break with
+no code change when a new version publishes. The safe pattern is dynamic
+declaration **plus** a lockfile:
+
+```groovy
+dependencyLocking { lockAllConfigurations() }
+
+dependencies {
+    constraints { implementation("group:artifact:2.15.+") }
+}
+```
+```
+./gradlew dependencies --write-locks
+./gradlew classes --update-locks group:artifact
+```
+
+Wildcards are supported in the update selector (`org.apache.commons:*`).
+`gradle-versions-plugin` provides `./gradlew dependencyUpdates` as a
+read-only staleness report.
+
+**Honest tradeoff:** Gradle's own guidance leans toward exact versions for
+reproducibility. Dynamic-plus-lockfile is a legitimate middle ground but
+is strictly more machinery than a pinned version. Adopt it because manual
+version churn is a real cost here, not because dynamic sounds better.
+
+**`LockMode.STRICT` caveat:** locking does not fail symmetrically in all
+cases — there are reported scenarios where changing a declared version
+*downward* against an existing lock does not fail the build the way an
+upward change does. Do not treat the lockfile as an enforcement mechanism
+without testing that it actually fails on your Gradle version.
+
+## 5.7 Known edge case — constraints from project dependencies
+
+When the unwanted version is set by a constraint on a **project
+dependency** (another module in the same multi-project build) rather than
+an external artifact, `strictly` does not reliably override it while
+`force` does. If §5.5a appears not to take effect in a multi-module build,
+check this before concluding the syntax is wrong.
+
+## 5.8 Phase 4 — Verification Gate (mandatory, blocks completion)
+
+1. **Re-run `dependencyInsight`** — confirm the resolved version is now
+   intended, and that the resolution *reason* names your constraint/force.
+   If the reason still names the original source, the override did not take.
+2. **Diff the full dependency tree** against baseline — overriding one
+   version can shift others.
+3. **Build succeeds.**
+4. **Tests pass** at or above baseline.
+
+Failure → revert and report as unremediated with cause.
+
+## 5.9 Part 5 Limitations
+
+- **Overrides create untested combinations.** Inherent to every mechanism
+  in §5.5, including the preferred one.
+- **`dependencySubstitution` can silently no-op** against a `strictly`
+  declaration — §5.8 is the only thing that catches this.
+- **Android/Kotlin plugin interactions.** Some plugins apply their own
+  `resolutionStrategy`; ordering can determine which wins. If a
+  correct-looking override doesn't take, plugin ordering is a likely cause.
+- **Configuration-specific results.** A version can resolve differently on
+  `compileClasspath` vs `runtimeClasspath`. Always name the configuration.
+- **No vulnerability data.** This changes versions; it does not tell you
+  which version is safe.
+
+---
+
+# PART 6 — Cross-Cutting Reference
+
+## 6.1 Explicit Absence Notation (all Parts)
+
+- `Not detected — [what was scanned]`
+- `Not run — resolver unavailable: [tool] not found on PATH`
+- `Not applicable — [layer/tier] has no prerequisite artifacts in this repo`
+- `Not verifiable — codegraph freshness unconfirmed: [reason]`
+- `Degraded — [language] parsed by fallback scan, edges tagged INFERRED`
+- `Not run — audit source unreachable: [source]. Absence of findings is NOT evidence of absence of vulnerabilities.`
+- `Unremediated — [package]: no patched version published as of [date]`
+- `Suppressed — [advisory], owner [x], review by [date]`
+- `Override did not take — resolution reason still names [source] after change`
+
+## 6.2 Combined Command Reference
+
+| Ecosystem/Language | Package forward | Package reverse | Code forward | Code reverse |
+|---|---|---|---|---|
+| npm | `npm ls --all --json` | `npm explain <pkg>` | `madge <entry>` | `dependency-cruiser --reaches` |
+| yarn | `yarn list --json` | `yarn why <pkg>` | — | — |
+| pnpm | `pnpm list --depth Infinity --json` | `pnpm why <pkg>` | — | — |
+| pip | `pipdeptree --json-tree` | `pipdeptree --reverse --packages <pkg>` | `pydeps <module>` | `grimp find_upstream_modules` |
+| poetry | `poetry show --tree` | `poetry show --why <pkg>` | — | — |
+| Maven | `mvn dependency:tree -Dverbose` | `mvn dependency:tree -Dincludes=<pkg>` | `jdeps -summary` | invert `jdeps` edges |
+| Gradle | `./gradlew <mod>:dependencies` | `./gradlew <mod>:dependencyInsight --dependency <pkg>` | `jdeps -summary` | invert `jdeps` edges |
+| NuGet | `dotnet list package --include-transitive` | `dotnet nuget why <pkg>` | Roslyn forward walk | `SymbolFinder.FindReferencesAsync` |
+| Cargo | `cargo tree` | `cargo tree -i <pkg>` | `cargo modules generate graph` | invert generated graph |
+| Go | `go mod graph` | `go mod why -m <module>` | `importgraph.Build().Forward` | `importgraph.Build().Reverse` |
+
+## 6.3 Universal Principles (apply to every Part)
+
+1. **Single authority per domain**, with rejected alternatives documented
+   in that Part's Fidelity Ledger.
+2. **Harness before work.** No Part proceeds past its Phase 0 gate.
+3. **Evidence only.** Every finding cites a file path and the exact
+   command that produced it. `INFERRED` is never presented as fact.
+4. **Explicit absence.** Silence is never an answer; use §6.1 notation.
+5. **Verify, don't assume.** A remediation is complete only when
+   re-detection confirms it (Parts 4 and 5 verification gates).
+6. **Separate scopes and break types.** dev vs runtime packages;
+   compile-time vs runtime vs silent-data consumers. Never merged.
