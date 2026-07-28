@@ -1,0 +1,55 @@
+# SKILL: resolve_transitive_dependency
+
+## 1. Purpose
+Determine whether a specific dependency coordinate (e.g. `ch.qos.logback:logback-classic:1.5.18`) is present in a repo's **resolved** dependency graph — including transitive/runtime-only hits — and confirm the true, currently-resolved version. This skill exists specifically to prevent the WAVE3-class false negative: concluding "not found" because a literal string match against `build.gradle`/source failed, when the coordinate is actually present transitively.
+
+## 2. When to invoke
+- Any OSS/CVE remediation check ("is coordinate X present in repo Y")
+- Before writing "not found" or "not directly declared" into any evidence report
+- Any time `ccc_security_vulnerability_scan` or similar playbooks are about to conclude based on regex/grep results alone
+
+## 3. Hard rule
+**A regex/string search across manifests and source is NEVER sufficient evidence of absence.** It only proves the coordinate isn't *declared literally*. It says nothing about the resolved graph. Any report that states "not found" based solely on grep/regex must be labeled `UNVERIFIED — STRING MATCH ONLY`, never `CONFIRMED ABSENT`.
+
+## 4. Resolution method, in priority order
+
+Attempt each method in order. Stop at the first one that succeeds and record which tier was used in the output.
+
+**Tier 1 — Real build-tool resolution (highest confidence)**
+```
+./gradlew dependencyInsight --dependency <artifactId> --configuration runtimeClasspath
+./gradlew dependencies --configuration runtimeClasspath | grep <artifactId>
+mvn dependency:tree -Dincludes=<groupId>:<artifactId>
+```
+Use if the repo is buildable locally or in CI.
+
+**Tier 2 — Committed lockfile (no build needed)**
+Check for `gradle.lockfile`, `buildscript-gradle.lockfile`, `package-lock.json`, or Maven's resolved `effective-pom`. These already contain the fully resolved tree as text — grep them directly.
+
+**Tier 3 — SCA tool with real graph resolution (no build needed)**
+If JFrog Xray, Snyk, or GitHub Dependency Graph/Dependabot is available for the repo, query it directly:
+```
+GET /xray/api/v1/dependencyGraph/{repo}/{path}
+POST /xray/api/v1/component/exposures
+```
+or GitHub's dependency graph API. These tools parse manifests and resolve versions via artifact-repo metadata without compiling anything — this is how external scanners (e.g. Mythos) produce answers on non-buildable repos.
+
+**Tier 4 — Manual POM/metadata walk (last resort, explicitly degraded confidence)**
+If only plain Artifactory (no Xray) is available:
+1. GAVC search to confirm the coordinate exists somewhere in the org's resolved artifacts: `GET /artifactory/api/search/gavc?g=<g>&a=<a>&v=<v>`
+2. Fetch the parent library's POM, read its declared `<dependencies>`, repeat one hop at a time.
+3. Explicitly flag output as `PARTIAL — MANUAL POM WALK, NOT FULL TREE RESOLUTION`.
+
+**Tier 5 — Cannot resolve**
+If none of the above are available (no build access, no lockfile, no SCA tool, no Artifactory access), the finding must be reported as `UNRESOLVED — INSUFFICIENT ACCESS`, with the exact blocker stated, and handed off to the owning team rather than marked as any form of "not found."
+
+## 5. Required output format
+Every evidence entry must include:
+- `coordinate`: the exact groupId:artifactId:version checked
+- `tier_used`: which of the 5 tiers above produced the answer
+- `resolution_path`: the chain if transitive (e.g. `parent-lib → loglib-logback-spring-starter → logback-classic:1.5.18`)
+- `confidence`: CONFIRMED (tier 1-3) / DEGRADED (tier 4) / UNRESOLVED (tier 5)
+- Never output a bare "not found" without `tier_used` and `confidence` attached
+
+## 6. Failure mode this skill prevents
+Symptom seen in SYNAPTIQ-20260728-160859-WAVE3-CP-003: regex search across `build.gradle` and `src` returned no exact-string hit, concluding "not directly declared," while the coordinate was in fact present transitively via `loglib-logback-spring-starter`. Root cause: string search was treated as equivalent to dependency-graph resolution. This skill's Tier system exists specifically to close that gap.
