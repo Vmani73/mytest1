@@ -1,0 +1,507 @@
+---
+name: dependency-intelligence-mapper
+description: >
+  Builds and maintains codegraph.json — a persistent, provenance-tagged
+  knowledge graph of an entire repository — then answers dependency
+  questions against it: full transitive package trees, "why is package X
+  here", "what does this file/class/service depend on", and "what breaks if
+  it changes" (blast radius). codegraph.json is built once, cached, and
+  incrementally refreshed; all queries read from it rather than re-scanning
+  the repo.
+triggers:
+  - "build codegraph"
+  - "transitive dependency"
+  - "dependency hierarchy"
+  - "upward dependency"
+  - "downward dependency"
+  - "why is <package> installed"
+  - "blast radius"
+  - "repo knowledge graph"
+audience: developers, architects, security/compliance/governance reviewers
+runtime: tree-sitter parsers + ecosystem/language-native resolvers, invoked via shell
+output: codegraph.json (persistent), dependency-intelligence-report.md, dependency-intelligence-graph.mmd
+version: 2.0.0
+---
+
+# Dependency Intelligence Mapper (codegraph-backed)
+
+## 1. Purpose
+
+Two things, in strict order:
+
+1. **Build or refresh `codegraph.json`** — a complete, typed, provenance-
+   tagged knowledge graph of the repository: every file, symbol, import,
+   call, package, framework binding, service contract, and config
+   relationship, in one committable JSON file.
+2. **Query it** across four modes — package-downward, package-upward,
+   code-downward, code-upward — plus a unified single-target impact query.
+
+The separation matters: graph construction is expensive and deterministic;
+queries are cheap and repeatable. Never re-scan the repo to answer a
+question `codegraph.json` already contains.
+
+## 2. Phase 0 — codegraph Presence & Freshness Gate (runs first, always)
+
+This gate runs before every other phase, including the certification
+harness. No query is answered against a stale or absent graph.
+
+```
+1. Does ./codegraph.json exist?
+   NO  → full build (§4). Proceed.
+   YES → continue to freshness check.
+
+2. Read codegraph.json → meta.repo_head_sha, meta.file_hashes{}
+3. Compute current git HEAD sha + per-file SHA256 for all tracked files.
+4. Compare:
+   - Identical HEAD sha AND no hash drift  → graph is CURRENT. Use as-is.
+   - Drift on N files                      → INCREMENTAL rebuild of those
+                                             N files + any node whose edges
+                                             touched them. Do not full-rebuild.
+   - meta.schema_version mismatch          → full rebuild (schema changed).
+   - codegraph.json malformed/unparseable  → full rebuild, and report the
+                                             corruption explicitly rather
+                                             than silently overwriting.
+```
+
+**Never partially trust a stale graph.** If freshness cannot be
+established (e.g. repo is not a git working tree, so no HEAD sha exists),
+report **"Not verifiable — codegraph freshness unconfirmed: [reason]"** and
+require an explicit full rebuild rather than proceeding on assumption.
+
+Report the gate outcome in every run: `BUILT | INCREMENTAL(n files) |
+CURRENT | REBUILT(reason)`.
+
+## 3. codegraph.json Schema
+
+Single file, committable, offline-queryable. Top-level shape:
+
+```json
+{
+  "meta": {
+    "schema_version": "2.0.0",
+    "generated_at": "2026-07-28T00:00:00Z",
+    "repo_head_sha": "a1b2c3d",
+    "generator": "dependency-intelligence-mapper@2.0.0",
+    "languages_detected": ["csharp", "typescript"],
+    "ecosystems_detected": ["nuget", "npm"],
+    "file_hashes": { "src/Order.cs": "sha256:..." },
+    "coverage": {
+      "files_parsed": 1204,
+      "files_skipped": 17,
+      "skip_reasons": { "binary": 12, "parse_error": 5 }
+    }
+  },
+  "nodes": [
+    { "id": "file:src/Services/OrderService.cs", "type": "file",
+      "language": "csharp", "loc": 240 },
+    { "id": "class:OrderService", "type": "class",
+      "file": "src/Services/OrderService.cs", "line": 12 },
+    { "id": "fn:OrderService.PlaceOrder", "type": "function",
+      "file": "src/Services/OrderService.cs", "line": 45, "signature": "..." },
+    { "id": "pkg:Dapper@2.1.35", "type": "package", "ecosystem": "nuget" },
+    { "id": "svc:billing-service", "type": "service",
+      "contract": "openapi/billing.yaml" },
+    { "id": "note:WHY:src/Order.cs:88", "type": "annotation",
+      "kind": "WHY", "text": "..." }
+  ],
+  "edges": [
+    { "from": "file:src/Services/OrderService.cs",
+      "to": "file:src/Repositories/OrderRepository.cs",
+      "type": "imports", "tier": 1, "provenance": "EXTRACTED",
+      "source": "roslyn:SymbolFinder", "line": 4 }
+  ],
+  "communities": [
+    { "id": "c1", "label": "order-processing",
+      "members": ["class:OrderService", "class:OrderRepository"],
+      "provenance": "INFERRED" }
+  ]
+}
+```
+
+### Node types (exhaustive for this schema version)
+`file`, `directory`, `module`, `namespace`, `class`, `interface`,
+`function`, `method`, `variable` (module-scope only), `package`,
+`framework_binding`, `service`, `endpoint`, `db_table`, `config_key`,
+`test`, `entrypoint`, `annotation`.
+
+### Edge types
+`imports`, `calls`, `inherits`, `implements`, `instantiates`,
+`references`, `depends_on_package`, `injects` (DI), `exposes_endpoint`,
+`consumes_endpoint`, `reads_table`, `writes_table`, `tests`,
+`configured_by`.
+
+### Provenance tag — mandatory on every edge
+- `EXTRACTED` — directly present in the AST or resolver output. Citable.
+- `INFERRED` — derived by convention or heuristic (e.g. a controller/
+  service layering guess, a community grouping). Not citable as fact.
+- `AMBIGUOUS` — the tool found multiple possible resolutions and could not
+  disambiguate (e.g. an overloaded call target, a dynamic import with a
+  computed path).
+
+Any consumer of `codegraph.json` that reports an `INFERRED` or `AMBIGUOUS`
+edge as established fact is misusing it. The report layer (§9) must carry
+the tag through to the reader.
+
+## 4. Phase 1 — Full Build
+
+### 4a. Discovery
+Walk the repo respecting `.gitignore`. Record every file, its language
+(by extension + shebang + content sniff), and its SHA256. Explicitly log
+skipped files and why — binary, vendored, generated, over size cap.
+
+### 4b. Local AST parse (no network, no model calls, zero LLM tokens)
+
+**This phase is executed by a generated script, never by the agent.** The
+agent runs the script and reads only its stdout summary. If the agent ever
+reads source files to build the graph, the entire credit rationale for
+`codegraph.json` is defeated — a full parse pass through an LLM context is
+the single most expensive operation in this playbook.
+
+Parser selection follows an accelerator tier, not a hard dependency:
+
+| Tier | Condition | Parser | Provenance |
+|---|---|---|---|
+| A | `tree-sitter` bindings already installed | tree-sitter grammar per language | `EXTRACTED` |
+| B | Python-only repo, no tree-sitter | Python stdlib `ast` | `EXTRACTED` |
+| C | Neither available | regex import scan (§4f) | `INFERRED` |
+
+Tier A is materially better and is the only tier that yields trustworthy
+call/inheritance edges. Do not install tree-sitter silently as a
+prerequisite — report which tier ran, and let the operator decide whether
+to install for better fidelity. Record the tier in `meta.parser_tier`.
+
+Any file whose language has no available grammar falls to §4f, never
+silently dropped from `meta.coverage`.
+
+### 4c. Package layer overlay
+Run each ecosystem's native resolver and merge resolved package nodes and
+`depends_on_package` edges into the same graph:
+
+| Ecosystem | Forward | Reverse (why) |
+|---|---|---|
+| npm/yarn/pnpm | `npm ls --all --json` | `npm explain`, `yarn why`, `pnpm why` |
+| pip/poetry | `pipdeptree --json-tree` | `pipdeptree --reverse --packages` |
+| Maven/Gradle | `mvn dependency:tree -Dverbose` | `./gradlew dependencyInsight` |
+| NuGet | `dotnet list package --include-transitive` | `dotnet nuget why <pkg>` |
+| Cargo | `cargo tree` | `cargo tree -i <pkg>` |
+| Go | `go mod graph` | `go mod why -m` |
+
+The resolver is the sole authority for resolved versions. Manifests
+express ranges, not resolution — never hand-parse them to infer the tree.
+
+### 4d. Symbol resolution pass (upgrade Tier 1 → Tier 2)
+Where compiler-grade tooling is available and the build loads, resolve
+call/reference edges to actual symbol targets: Roslyn `SymbolFinder`
+(C#), TypeScript Compiler API / `ts-morph`, `jdeps` + javac Tree API
+(Java/Kotlin), `golang.org/x/tools` `importgraph` and `callgraph` (Go),
+`grimp`/`pyright` (Python, best-effort), `cargo modules` (Rust).
+
+Unresolved or multi-target call sites are written as `AMBIGUOUS` — not
+dropped, and not guessed.
+
+### 4e. Framework, service & data overlays
+Only on positive signature detection; otherwise `"Not detected"`:
+- **DI/framework**: Spring (`@SpringBootApplication`), ASP.NET Core
+  (`WebApplication.CreateBuilder`), Angular (`angular.json`), NestJS
+  (`@nestjs/core`), Django (`manage.py`), Rails (`config/application.rb`).
+  Produces `injects` and `framework_binding` edges.
+- **Service contracts**: OpenAPI/Swagger, `.proto`, queue topic config →
+  `exposes_endpoint` / `consumes_endpoint` edges and `service` nodes.
+- **Data**: SQL DDL files and ORM model definitions → `db_table` nodes,
+  `reads_table` / `writes_table` edges.
+- **Config**: env schemas, `appsettings.json`, Terraform/HCL →
+  `config_key` nodes and `configured_by` edges.
+
+### 4f. Degraded scan (fallback only)
+For a detected language with no available grammar and no native tooling:
+regex-based import-statement extraction. Every edge produced here is
+tagged `provenance: INFERRED` and `tier: 0`, and the language is listed in
+the report as degraded-coverage. This is never presented as equivalent to
+an AST parse.
+
+### 4g. Annotation mining
+Extract `TODO`, `FIXME`, `NOTE`, `WHY`, `HACK` comments as `annotation`
+nodes linked to their enclosing symbol. These capture intent the AST
+cannot — often the only record of *why* a dependency exists at all.
+
+### 4h. Community detection & hub metrics
+Cluster the graph into subsystems, recorded under `communities` and tagged
+`INFERRED`. Compute and store in-degree rankings so §8 can name the nodes
+most of the repo depends on.
+
+### 4i. Write
+Write `codegraph.json` atomically (temp file + rename) so an interrupted
+build never leaves a half-written graph that a later run would trust.
+Commit it or gitignore it — the playbook works either way, but committing
+it means the team and CI share one graph.
+
+## 5. Phase 2 — Incremental Refresh
+
+Given the drift set from §2:
+1. Re-parse only the drifted files.
+2. Remove all edges *originating* from those files.
+3. Re-extract and re-insert their nodes/edges.
+4. Re-resolve any `AMBIGUOUS` edge that pointed *into* a drifted file.
+5. Re-run the package layer **only** if a manifest or lockfile is in the
+   drift set — package resolution is expensive and unaffected by source
+   edits.
+6. Re-run community detection (cheap relative to parsing; skipping it
+   leaves stale clusters).
+7. Update `meta.file_hashes`, `meta.repo_head_sha`, `meta.generated_at`.
+
+## 6. Phase 3 — Certification Harness (gate before any query)
+
+Runs after the graph exists, before any answer is given:
+
+1. **Coverage floor** — `files_parsed / (files_parsed + files_skipped)`
+   meets threshold (default 0.90). Below it, every downstream answer is
+   labeled low-confidence rather than presented as complete.
+2. **No orphan edges** — every edge endpoint resolves to a node in the
+   graph. Dangling edges indicate a broken incremental refresh.
+3. **Provenance completeness** — 100% of edges carry a provenance tag. An
+   untagged edge is a build bug; fail the gate.
+4. **Round-trip check** — pick one known file, one known class, and one
+   known package; verify their edges in `codegraph.json` match what the
+   native tool reports directly. A mismatch means the graph is untrustworthy
+   for that layer; report it rather than proceeding.
+5. **Freshness confirmed** — §2 gate returned `CURRENT`, or a successful
+   build/refresh completed.
+
+**Gate: all five must pass. FAIL on 2, 3, or 4 blocks queries entirely for
+the affected layer.** 1 and 5 downgrade confidence without blocking.
+
+## 6.5 Tool-Call Contract (the credit-saving layer)
+
+### Design rule
+The agent never reads source files to answer a graph question. It calls a
+tool, receives a bounded JSON payload, and reasons over that payload. Build
+is a script; query is a shell command. The LLM's only job is choosing the
+call and interpreting a small result.
+
+**Provenance note:** this contract is designed here from the requirements
+in this playbook. It is not a reproduction of any third-party tool's
+interface, and does not claim compatibility with one.
+
+### Transport
+CLI + `jq` over `codegraph.json`, invoked through the terminal tool already
+available in Copilot agent mode. No MCP server, no daemon, no transport
+layer — deliberately rejected as unnecessary complexity for a single-
+assistant, single-repo target. Every call below is a shell invocation whose
+stdout is the JSON payload.
+
+### Universal response envelope
+Every tool returns this shape. The `sufficiency` block exists so the agent
+can decide about fallback **deterministically**, not by impression:
+
+```json
+{
+  "ok": true,
+  "result": { },
+  "sufficiency": {
+    "hit": true,
+    "graph_state": "CURRENT",
+    "coverage": 0.96,
+    "provenance_mix": { "EXTRACTED": 14, "INFERRED": 0, "AMBIGUOUS": 2 },
+    "truncated": false,
+    "nodes_returned": 16,
+    "fallback_recommended": false,
+    "fallback_scope": []
+  },
+  "tokens_estimate": 340
+}
+```
+
+### Tools
+
+**`codegraph.status`** — freshness/coverage gate. Always call first in a
+session; never call again in the same session unless a build ran.
+Params: none. Budget: ≤150 tokens.
+Returns `graph_state`, `coverage`, `parser_tier`, `node_count`,
+`edge_count`, `stale_files` (count only, never the list unless asked).
+
+**`codegraph.build`** — full or incremental build.
+Params: `{ "mode": "auto|full|incremental" }`. Budget: ≤200 tokens.
+Runs the generated script; returns only the summary counts and gate
+outcome. **Never streams parse output into context.**
+
+**`codegraph.search`** — resolve an informal name to a node id. Needed
+because users say "the order repo", not `class:OrderRepository`.
+Params: `{ "term": str, "type": str|null, "limit": int=10 }`.
+Budget: ≤200 tokens. Returns ranked `[{id, type, file, line}]`.
+
+**`codegraph.deps`** — downward: what a node needs.
+Params: `{ "id": str, "depth": int=3, "max_nodes": int=40,
+"include_packages": bool=true }`. Budget: ≤600 tokens.
+
+**`codegraph.impact`** — upward: blast radius. The highest-value call.
+Params: `{ "id": str, "depth": int=3, "max_nodes": int=40,
+"group_by_break_type": bool=true }`. Budget: ≤700 tokens.
+Returns consumers grouped as `compile_time`, `runtime_cross_service`,
+`runtime_data` — the §7 4d distinction, machine-readable.
+
+**`codegraph.path`** — how two nodes connect.
+Params: `{ "from": str, "to": str, "max_paths": int=3 }`.
+Budget: ≤400 tokens.
+
+**`codegraph.why`** — package-upward: why is package X present.
+Params: `{ "package": str, "ecosystem": str|null }`. Budget: ≤400 tokens.
+
+**`codegraph.annotations`** — `WHY`/`HACK`/`NOTE` notes attached to a node
+or its neighbors. Cheap, and frequently answers intent questions that no
+structural query can.
+Params: `{ "id": str, "radius": int=1 }`. Budget: ≤300 tokens.
+
+### Hard caps (non-negotiable)
+- Every traversal tool enforces `max_nodes`. On exceed: truncate, set
+  `truncated: true`, and return the **highest in-degree** nodes first —
+  the ones that matter — rather than an arbitrary prefix.
+- No tool returns file *contents*. Ever. Ids, paths, and line numbers only.
+- Total budget for a query turn: ~1,500 tokens. A blast-radius query that
+  dumps 4,000 nodes into context costs more than reading the three files
+  the agent actually needed, and erases the reason this playbook exists.
+
+## 6.6 Fallback Contract — when the agent should abandon the graph
+
+The graph is a cache, and caches are wrong sometimes. This must be an
+explicit, bounded escape hatch, not a judgment call — otherwise the agent
+either over-trusts a stale graph or bails to full-codebase reading at the
+first ambiguity and costs more than having no graph at all.
+
+**Fall back to reading source only when at least one is true:**
+1. `hit: false` — the node/package isn't in the graph at all.
+2. `graph_state != "CURRENT"` **and** the query target is in `stale_files`.
+3. `truncated: true` **and** the truncated portion is material to the
+   question asked.
+4. `provenance_mix` for the answer path is majority `INFERRED` or
+   `AMBIGUOUS` — the graph is guessing, so it isn't evidence.
+5. The question is about **behavior, not structure** — "is this logic
+   correct", "what does this function actually compute". The graph maps
+   relationships; it does not model semantics, and no amount of graph
+   querying answers a behavioral question. Go read the file.
+
+**Do NOT fall back merely because** the answer seems short, the agent
+wants more confidence, or the result is surprising. A correct graph answer
+is often a small one.
+
+**Fallback must stay scoped.** Even when the graph is insufficient, it
+still knows *which files are relevant* — so it returns `fallback_scope`, a
+concrete file list. The agent reads those files and no others. A failed
+graph query narrows the search from the whole repo to a handful of files;
+it is not a licence to re-read the codebase.
+
+```
+codegraph.impact("class:OrderRepository")
+  → sufficiency.hit = false
+  → fallback_scope = ["src/Repositories/", "src/Services/OrderService.cs"]
+  → agent reads 2 paths, not 1,200 files
+```
+
+**Retry order before falling back:** `codegraph.search` to check for a bad
+node id (most common cause of `hit: false`), then `codegraph.build
+--mode=incremental` if `graph_state` is stale. Only then read source.
+
+## 7. Phase 4 — Query Modes (all read from codegraph.json only)
+
+**4a. Package-downward** — full transitive tree from `depends_on_package`
+edges; direct vs transitive, depth, all resolution paths (diamonds
+enumerated, not collapsed to shortest).
+
+**4b. Package-upward ("why is X here?")** — reverse-walk to every direct
+dependency reaching the target. Cross-check against the ecosystem's native
+`why` command; report any discrepancy rather than silently preferring one.
+
+**4c. Code-downward ("what does X need?")** — forward walk from a file/
+class/function node, all paths, tier and provenance tagged.
+
+**4d. Code-upward / blast radius ("what breaks if X changes?")** — reverse
+walk. Separate results by break type, because they are not the same risk:
+- Internal consumers (`imports`, `calls`, `inherits`) → **compile-time
+  break**, caught by the build.
+- Cross-service consumers (`consumes_endpoint`) → **runtime break**, no
+  compiler in the loop, across a deploy boundary.
+- Data consumers (`reads_table` / `writes_table`) → **runtime break**,
+  potentially silent until a query fails in production.
+
+**4e. Unified single-target impact** — scoped to one node only; a combined
+full-repo view across all layers is unreadable, and this playbook says so
+rather than attempting it:
+
+```
+class:OrderRepository  [codegraph: CURRENT, coverage 0.96]
+  ── upward (blast radius) ──
+  ← class:OrderService          EXTRACTED  compile-time
+  ← svc:billing-service         EXTRACTED  runtime, cross-deploy (GET /orders)
+  ← db_table:orders             EXTRACTED  runtime, silent-failure risk
+  ── downward (package surface) ──
+  → pkg:Dapper@2.1.35                     direct
+      → pkg:System.Data.SqlClient@4.8.6   transitive (depth 2)
+  ── annotations ──
+  note:WHY:src/OrderRepository.cs:88 — "raw SQL here because the ORM
+      couldn't express the window function"
+```
+
+## 8. Phase 5 — Risk Detection
+
+- **Package**: duplicate resolved versions, excessive depth, unpinned
+  ranges, single-path fragility.
+- **Code**: circular dependencies at any tier; layering violations, only
+  where an intended layering is evident from the repo's own structure —
+  never against an assumed convention.
+- **Hub nodes**: highest in-degree nodes (§4h) — what most of the repo
+  depends on, where any change has the widest blast radius.
+- **Cross-layer**: a wide blast radius that also crosses a service or data
+  boundary *and* carries a fragile external package chain — surfaced as
+  compounded risk, evidence-cited, only when each underlying fact is
+  independently confirmed and `EXTRACTED`.
+
+## 9. Phase 6 — Outputs
+
+1. **`codegraph.json`** — the persistent graph. Primary artifact; survives
+   between runs and is consumable by other playbooks without re-scanning.
+2. **`dependency-intelligence-report.md`** — gate outcome, coverage stats,
+   query results with tier + provenance on every line, risks with file-path
+   citations.
+3. **`dependency-intelligence-graph.mmd`** — Mermaid diagram scoped to the
+   query target. Full-repo Mermaid is unreadable past a few hundred nodes;
+   emit per-community diagrams instead when a full view is requested.
+
+## 10. Known Limitations / Honest Fidelity Tradeoffs
+
+- **A graph is a snapshot.** Between refreshes it drifts. §2's gate is the
+  only thing between a stale graph and a confidently wrong answer — don't
+  bypass it.
+- **Static analysis cannot see runtime wiring.** DI registration by string
+  name, `importlib.import_module()` with a computed path, reflection,
+  `import()` with a variable — all under-report. Known gap, not a bug to
+  chase.
+- **`INFERRED` is not evidence.** Communities, layering judgments, and
+  degraded-scan edges are heuristics. They belong in the graph because
+  they're useful; they do not belong in a finding presented as fact.
+- **Tier 2 symbol resolution is materially weaker than Tier 1 imports** in
+  every language, and weaker still in dynamically typed ones.
+- **No CVE or license data.** Structure only. Feed `codegraph.json` to a
+  dedicated SCA playbook for that.
+- **Large monorepos** may exceed practical single-file JSON size; shard by
+  top-level module and record shard pointers in `meta` rather than
+  silently truncating.
+- **The credit saving is conditional, not automatic.** It holds only if
+  (a) the build runs as a script and never through agent context, and
+  (b) query results stay within the §6.5 caps. Violate either and this
+  playbook costs more than grepping. The first build is a real cost paid
+  once; it pays back across sessions, and does not pay back at all on a
+  repo touched once and abandoned.
+- **`codegraph.path` and `codegraph.impact` are worst-case exponential**
+  on densely connected graphs. The `max_nodes` cap makes them safe but
+  means results on hub nodes are genuinely partial — the truncation flag
+  is load-bearing, not decorative.
+- **No MCP server, by choice.** Scoped to Copilot agent mode with terminal
+  access. If the graph ever needs to serve several assistants or a team
+  over the network, that's a real gap this design does not cover.
+
+## 11. Explicit Absence Notation
+
+- `Not detected — [what was scanned]`
+- `Not run — resolver unavailable: [tool] not found on PATH`
+- `Not applicable — [layer/tier] has no prerequisite artifacts in this repo`
+- `Not verifiable — codegraph freshness unconfirmed: [reason]`
+- `Degraded — [language] parsed by fallback scan, edges tagged INFERRED`
