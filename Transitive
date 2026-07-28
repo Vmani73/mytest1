@@ -1,0 +1,274 @@
+---
+name: transitive-dependency-mapper
+description: >
+  Builds an evidence-backed transitive dependency graph for a repository and
+  answers "why is package X in my tree, and what depends on it transitively?"
+  Detects the repo's package ecosystem(s), invokes each ecosystem's own
+  authoritative resolver, reconstructs full resolution paths (direct ->
+  transitive -> leaf), and produces a cited Markdown + Mermaid + JSON report.
+triggers:
+  - "find transitive dependency"
+  - "why is <package> installed"
+  - "dependency tree"
+  - "what pulls in <package>"
+  - "transitive dependency audit"
+audience: developers, architects, security/compliance reviewers
+runtime: Node.js / Python / JVM / .NET / Rust / Go toolchains (ecosystem-native, invoked via shell)
+output: transitive-dependency-report.md, dependency-graph.mmd, dependency-graph.json
+version: 1.0.0
+---
+
+# Transitive Dependency Mapper & Impact Tracer
+
+## 1. Purpose
+
+Given a repository, produce a complete, cited map of every dependency edge —
+direct and transitive — and support two query modes:
+
+1. **Full graph mode** — enumerate the entire resolved dependency tree.
+2. **Target lookup mode** — given a package name (optionally a version or
+   range), return every path from a direct/manifest-level dependency down to
+   that package, with exact depth and the intermediate packages on each path.
+
+This playbook does not attempt to re-implement any package manager's
+resolution algorithm. It orchestrates each ecosystem's own resolver and
+normalizes the output. See §3, Fidelity Ledger.
+
+## 2. Scope & Non-Goals
+
+**In scope:** npm/yarn/pnpm (Node), pip/poetry/pipenv (Python), Maven/Gradle
+(JVM), NuGet (.NET), Cargo (Rust), Go modules.
+
+**Out of scope (explicitly, not silently):**
+- Vulnerability severity scoring — this playbook maps *structure*, not CVEs.
+  Feed its output to a dedicated SCA tool or a separate vuln-scoring playbook.
+- License text extraction — flagged as a known gap in §8, not fabricated.
+- Monorepo workspace-boundary policy (which workspace may depend on which) —
+  the graph is built per resolvable manifest; cross-workspace policy is a
+  separate governance concern.
+
+## 3. Fidelity Ledger
+
+**Single authority per ecosystem.** For every ecosystem this playbook uses
+the package manager's own canonical resolver/introspection command as the
+sole ground truth for "what resolves to what." It never hand-parses
+manifests to *infer* a graph, because manifests express ranges, not the
+resolved graph — only the resolver (or the lockfile it produced) knows the
+resolved answer.
+
+| Ecosystem | Authority | Rejected alternative | Why rejected |
+|---|---|---|---|
+| npm | `npm ls --all --json`, `npm explain <pkg>` | Hand-parsing `package.json` ranges | Ranges ≠ resolved versions; misses hoisting/dedup |
+| yarn (classic/berry) | `yarn why <pkg>`, `yarn.lock` via `yarn list --json` | Re-deriving from `package.json` | Yarn's dedup/hoisting logic is undocumented and version-specific |
+| pnpm | `pnpm why <pkg>`, `pnpm list --depth Infinity --json` | Walking `node_modules/.pnpm` symlinks manually | pnpm's content-addressed store layout changes across versions |
+| pip | `pipdeptree --json-tree`, `pipdeptree --reverse --packages <pkg>` | `pip show` chained manually | `pip show` gives one hop only; pipdeptree is the community-standard authority and is treated as an accelerator (installed if missing, never assumed) |
+| poetry | `poetry show --tree`, `poetry show --why <pkg>` (if plugin present) | pip-style resolution | Poetry has its own resolver; pip's view of the same venv can disagree |
+| Maven | `mvn dependency:tree -Dverbose` | Reading `pom.xml` `<dependencies>` | Misses transitive mediation/conflict-omitted versions entirely |
+| Gradle | `./gradlew <module>:dependencies` | Reading `build.gradle` | Gradle's conflict resolution (highest-version-wins by default) isn't visible in source |
+| NuGet/.NET | `dotnet list package --include-transitive` | Parsing `.csproj`/`packages.lock.json` by hand | Central Package Management and floating versions make static parsing unreliable |
+| Cargo | `cargo tree`, `cargo tree -i <pkg>` (inverted/reverse) | `Cargo.lock` manual parse | `cargo tree` already resolves feature-unification correctly; native reverse mode exists — use it |
+| Go modules | `go mod graph`, `go mod why -m <module>` | Parsing `go.sum` | `go.sum` is a checksum ledger, not a dependency graph |
+
+If a required resolver binary is not installed, this is reported as
+**"Not run — resolver unavailable: <tool> not found on PATH"**, never
+approximated by manifest-parsing as a silent substitute.
+
+## 4. Phase 0 — Certification Harness (mandatory gate)
+
+No graph is extracted until this harness passes. Report each check as
+PASS/FAIL with evidence; a single FAIL halts the run for that ecosystem only
+(other detected ecosystems in the repo proceed independently).
+
+1. **Ecosystem manifest present** — e.g. `package.json`, `pyproject.toml`,
+   `pom.xml`, `*.csproj`, `Cargo.toml`, `go.mod`. Cite the file path.
+2. **Lockfile present** (or explicit justification if absent) — e.g.
+   `package-lock.json`/`yarn.lock`/`pnpm-lock.yaml`, `poetry.lock`,
+   `Cargo.lock`, `go.sum`. Without a lockfile, resolution can be
+   non-deterministic; report this as a fidelity caveat, not a blocker.
+3. **Resolver binary available on PATH**, with version captured
+   (`npm --version`, `mvn --version`, `cargo --version`, etc.).
+4. **Repo resolvable without network mutation** — prefer flags that read
+   the lockfile without hitting the registry (`npm ls --package-lock-only`,
+   `pnpm list --offline` where supported). If a live install is required to
+   get a materialized tree (e.g. Maven needs artifacts present), state this
+   explicitly and require the user/agent to run the install step first
+   rather than silently triggering a network install.
+5. **Dry-run parse check** — run the resolver against one known-good
+   package name from the manifest and confirm output parses into the
+   expected schema before running the full extraction.
+
+**Gate:** ecosystem proceeds to Phase 1 only if checks 1–3 and 5 pass.
+Check 4 downgrades fidelity confidence but does not block.
+
+## 5. Phase 1 — Ecosystem Detection & Inventory
+
+Scan the repo root and immediate subdirectories (monorepo-aware, one level
+of workspace detection) for manifest files. For each match, record:
+
+- Ecosystem type, manifest path, lockfile path (or "Not detected").
+- Workspace/module name if part of a monorepo (npm/yarn/pnpm workspaces,
+  Maven multi-module `<modules>`, Cargo workspace members, Go module path).
+
+Output a table. Example:
+
+| Ecosystem | Manifest | Lockfile | Workspace |
+|---|---|---|---|
+| npm | `packages/web/package.json` | `package-lock.json` (root) | web |
+| pip | `services/api/pyproject.toml` | `poetry.lock` | api |
+
+If zero manifests are found: **"Not detected — no supported ecosystem
+manifest found in scanned paths: [list]"**. Stop; do not proceed to later
+phases.
+
+## 6. Phase 2 — Dependency Graph Extraction
+
+For each certified ecosystem (Phase 0 passed), run the Phase-3-ledger
+authority command and normalize its output into a common edge schema:
+
+```json
+{
+  "ecosystem": "npm",
+  "edges": [
+    { "from": "my-app@1.0.0", "to": "express@4.19.2", "direct": true },
+    { "from": "express@4.19.2", "to": "body-parser@1.20.2", "direct": false },
+    { "from": "body-parser@1.20.2", "to": "qs@6.11.0", "direct": false }
+  ],
+  "resolved_at": "2026-07-28T00:00:00Z",
+  "resolver": "npm@10.8.2",
+  "source": "npm ls --all --json"
+}
+```
+
+Every edge must be traceable to the raw resolver output — store the raw
+output alongside the normalized JSON so any edge can be audited back to its
+source. No edge is inferred or interpolated.
+
+## 7. Phase 3 — Transitive Classification & Path Reconstruction
+
+From the edge list, compute for every package:
+
+- **Classification**: `direct` (appears in the manifest) vs `transitive`.
+- **Depth**: shortest-path hop count from a direct dependency.
+- **All resolution paths**: a package can be reachable via multiple direct
+  dependencies (diamond dependency) — enumerate every distinct path, not
+  just the shortest, since risk/impact analysis needs the full set.
+- **Version(s) resolved**: if the same package resolves to multiple
+  versions in the tree (common in npm without full dedup), list each
+  version separately with its own path set.
+
+## 8. Phase 4 — Target Lookup Mode (core capability)
+
+Given a target package name (and optional version/range), this is the
+primary "find transitive dependency" query:
+
+1. Locate the target in the normalized graph (all matching versions).
+2. Walk backward (reverse edges) to every direct dependency that reaches it.
+3. Report each path in full, root to target:
+
+```
+express@4.19.2 (direct, package.json:14)
+  └─ body-parser@1.20.2
+       └─ qs@6.11.0  ← TARGET (depth 3)
+```
+
+4. If the target does not appear anywhere in the graph:
+   **"Not detected — <package> not present in resolved graph for
+   <ecosystem>/<workspace> as of <resolver> run at <timestamp>"**.
+5. Prefer the ecosystem's native reverse-lookup command when it exists
+   instead of reimplementing the backward walk (`npm explain`,
+   `yarn why`, `pnpm why`, `cargo tree -i`, `go mod why -m`,
+   `pipdeptree --reverse --packages`) — cross-check native output against
+   the graph-walk result; report a discrepancy if they disagree rather than
+   silently preferring one.
+
+## 9. Phase 5 — Conflict, Risk & Duplication Detection
+
+Evidence-only flags, each citing the specific packages/versions involved:
+
+- **Multiple resolved versions of the same package** (dedup failure or
+  incompatible range constraints) — list all versions and which direct
+  dependency pulled in each.
+- **Excessive depth** — transitive chains beyond a configurable threshold
+  (default depth 6); deep chains are harder to reason about and audit.
+- **Unpinned transitive ranges** in the lockfile (e.g. lockfile entries that
+  still show a range rather than an exact version — format-dependent;
+  report "Not applicable" for ecosystems whose lockfiles always pin exact
+  versions, e.g. Cargo.lock, poetry.lock).
+- **Single-path fragility** — a widely-used transitive package reachable
+  via only one direct dependency (removing that one direct dependency
+  silently drops it).
+
+Optional weighted scorecard (A–F) per workspace, each factor cited:
+
+| Factor | Weight | Evidence |
+|---|---|---|
+| Version duplication | 25% | count + package list |
+| Max depth | 20% | deepest chain(s) |
+| Unpinned transitive count | 25% | count, or "Not applicable" |
+| Single-path fragility count | 30% | count + package list |
+
+Each score carries a confidence annotation (High/Medium/Low) reflecting
+whether Phase 0 check 4 (offline resolvability) passed cleanly.
+
+## 10. Phase 6 — Reporting & Output Artifacts
+
+Produce three files per run:
+
+1. **`transitive-dependency-report.md`** — human-readable: ecosystem
+   inventory, scorecard, target-lookup results if a target was specified,
+   flagged risks, all with citations to manifest/lockfile paths and the
+   exact resolver command run.
+2. **`dependency-graph.mmd`** — Mermaid graph, capped/paginated for large
+   trees (full graph as `graph TD`, target-lookup subset as a focused
+   sub-diagram when a target is specified):
+
+```mermaid
+graph TD
+  A[my-app] --> B[express@4.19.2]
+  B --> C[body-parser@1.20.2]
+  C --> D[qs@6.11.0]
+```
+
+3. **`dependency-graph.json`** — the normalized, machine-readable edge list
+   from Phase 2/3, for consumption by other playbooks (e.g. PR Risk Score,
+   AI Cost Predictor's dependency-surface input, or a future vulnerability
+   scoring playbook) without re-running resolution.
+
+## 11. Known Limitations / Honest Fidelity Tradeoffs
+
+- **No CVE/vulnerability data.** Structure only. Do not present this
+  playbook's output as a security scan.
+- **No license data.** License fields are not extracted; treat as
+  "Not detected" if this playbook is asked about licensing.
+- **Optional peerDependencies / extras / features** may or may not be
+  reflected depending on whether they were satisfied at resolution time —
+  reported per-ecosystem based on what the authority tool actually surfaces.
+- **Private/internal registries**: if the resolver cannot reach an internal
+  registry and Phase 0 check 4 fails, the graph for that subtree is marked
+  low-confidence rather than omitted.
+- **Build-time vs runtime dependencies** (e.g. Maven `test` scope, npm
+  `devDependencies`) are classified and labeled, never merged into a single
+  undifferentiated list.
+
+## 12. Explicit Absence Notation Reference
+
+Use exactly this phrasing pattern throughout all outputs:
+
+- `Not detected — [what was scanned]`
+- `Not run — resolver unavailable: [tool] not found on PATH`
+- `Not applicable — [ecosystem] lockfiles always pin exact versions`
+
+## Appendix — Ecosystem Command Reference
+
+| Ecosystem | Forward graph | Reverse/why lookup |
+|---|---|---|
+| npm | `npm ls --all --json` | `npm explain <pkg>` |
+| yarn | `yarn list --json` | `yarn why <pkg>` |
+| pnpm | `pnpm list --depth Infinity --json` | `pnpm why <pkg>` |
+| pip | `pipdeptree --json-tree` | `pipdeptree --reverse --packages <pkg>` |
+| poetry | `poetry show --tree` | `poetry show --why <pkg>` (plugin-dependent) |
+| Maven | `mvn dependency:tree -Dverbose` | grep tree output for target, or `mvn dependency:tree -Dincludes=<pkg>` |
+| Gradle | `./gradlew <mod>:dependencies` | `./gradlew <mod>:dependencyInsight --dependency <pkg>` |
+| NuGet | `dotnet list package --include-transitive` | cross-reference `packages.lock.json` |
+| Cargo | `cargo tree` | `cargo tree -i <pkg>` |
+| Go | `go mod graph` | `go mod why -m <module>` |
