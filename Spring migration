@@ -1,0 +1,200 @@
+---
+skill_id: spring_boot_migration
+version: 1.1.0
+owner: platform-automation-codemind
+category: migration
+compatible_runtimes: [copilot-agent-mode, langgraph-ocp-sandbox, devin, openhands]
+context_layer: graphifyy
+llm_gateway: tachyon
+token_budget_tier: high
+target_version: spring-boot:4.1.0
+last_updated: 2026-07-29
+---
+
+# SKILL: spring_boot_migration
+
+## 1. Metadata & Activation
+
+**Trigger conditions** — activate this skill when the task description matches ANY of:
+- Repo contains `pom.xml` / `build.gradle*` with `spring-boot-starter-parent` or `org.springframework.boot`
+- Explicit instruction containing "migrate", "upgrade", "modernize", "decompose", "extract service" + "spring boot" / "spring" / "struts" / "ejb"
+- A TABR (Technical Architecture Board Review) ticket tagged `migration` referencing a Spring/Java stack
+
+**Does NOT activate for**: pure dependency bumps with no breaking-change surface (patch versions), or non-JVM stacks.
+
+**Declared capability boundary**: this skill produces a migration plan, executes code transformations within the OCP execution sandbox, and generates validation evidence. It does NOT approve production deployment — that remains a human TABR/CCC gate.
+
+---
+
+## 2. Purpose & Scope
+
+End-to-end playbook for three migration tracks, selectable independently or in combination:
+
+| Track | Scope | Typical Trigger |
+|---|---|---|
+| **A — Version Upgrade** | Any current version → **Spring Boot 4.1.0** (Spring Framework 7.0.8+, Jakarta EE 11, Jackson 3, Spring Security 7) | CCC vulnerability finding, EOL notice, security mandate |
+| **B — Monolith → Microservices** | Bounded-context extraction from a monolith into independently deployable services | Scaling/ownership pain, TABR-mandated decomposition |
+| **C — Legacy Framework → Spring Boot** | Struts/EJB/plain Servlet → Spring Boot | Platform standardization, EOL of legacy container |
+
+A single engagement may require Track C → Track A → Track B in sequence (legacy app is first ported to Spring Boot, then upgraded, then decomposed). Phase 0 below determines which track(s) apply and their order.
+
+**Out of scope**: non-JVM services, infrastructure provisioning (handled by separate `ocp_provisioning` playbook), and business-logic rewrites beyond what migration strictly requires.
+
+---
+
+## 3. Preconditions & Context Acquisition
+
+### 3.1 Mandatory fetches (do not proceed without these)
+
+Before any code is touched, the agent MUST fetch and hold in working context:
+
+1. **CCC reference check** — query `ccc_control_catalog` (MongoDB) for any open findings tagged against the target repo (CVEs, EOL framework flags, license issues). These become non-negotiable acceptance criteria.
+2. **TABR historical decisions** — query `tabr_decisions` for prior architecture rulings on this repo or its domain (e.g., "service must remain in region X", "no distributed transactions across payment boundary"). Do not propose anything that contradicts an existing TABR ruling; flag conflicts instead of silently overriding.
+3. **Repo file content** — pull `pom.xml`/`build.gradle`, `application.yml`/`.properties`, and the full module tree via graphifyy codegraph rather than raw file walks.
+4. **Codegraph** — run/refresh `graphifyy` indexing before analysis. All bounded-context and coupling analysis in Track B is derived from the codegraph, never from manual file inspection.
+
+### 3.2 Token economy rules
+
+- Never re-read a file already present in the codegraph unless it has changed since last index (check mtime/hash).
+- Batch MongoDB lookups (CCC + TABR + repo metadata) into a single round-trip where the schema allows; do not issue three sequential single-field queries.
+- Summarize large generated diffs before passing them back through Tachyon for review — pass diff *stats* (files changed, +/- lines, risk flags) first, full diff only on request.
+- Use `narrowdown`-style deduplication on any repeated context blocks (shared config, boilerplate) before constructing LLM prompts.
+- Cache the CCC/TABR query results for the duration of the run; do not re-query per-phase.
+
+### 3.3 Environment preconditions
+
+- Execution occurs in the LangGraph-based OCP sandbox (not local VS Code activation) — confirm sandbox has the target repo's build toolchain (Maven/Gradle wrapper, correct JDK) provisioned before Phase 0.
+- Confirm write access is scoped to a feature branch; this skill never commits directly to a protected branch.
+- If AgentGuard is present in the repo's dependency graph enforcement config, register this migration's PR against it up front so downstream dependency-graph diffs are tracked against the migration's declared scope.
+
+---
+
+## 4. Execution Workflow
+
+### Phase 0 — Migration Classification (always runs first)
+
+Inspect repo signals and classify:
+
+```
+IF pom.xml/build.gradle contains struts-*, javax.ejb, or web.xml with <servlet> mappings
+    → Track C required (run first)
+IF spring-boot-starter-parent version < 4.1.0
+    → Track A required (run after C if C applies)
+    → IF current version < 3.5.0: insert an intermediate hop to 3.5.x before jumping to 4.x
+      (Spring's own guidance: do not jump directly from a pre-3.5 3.x line straight to 4.0/4.1)
+    → IF current version in [3.5.0, 4.0.x): single hop straight to 4.1.0 is acceptable
+IF explicit decomposition request OR TABR mandate on file
+    → Track B required (run last, after A/C stabilize the codebase)
+```
+
+Output a **Migration Plan** artifact (see §6) before writing any code, including: applicable tracks, execution order, estimated blast radius (module count, LOC touched, downstream consumers from codegraph), and risk tier (Low/Med/High based on CCC findings + TABR constraints).
+
+---
+
+### Track A — Version Upgrade
+
+**A1. Dependency & BOM audit**
+- Diff current BOM against target `spring-boot-starter-parent` version; flag every dependency without an explicit compatible version in the new BOM.
+- Cross-check each flagged dependency against CCC for known-vulnerable versions — do not silently pin to the last-known-good version if CCC has an open finding on it.
+
+**A2. javax → jakarta namespace migration**
+- Mechanical package rewrite (`javax.persistence.*` → `jakarta.persistence.*`, `javax.servlet.*` → `jakarta.servlet.*`, etc.) across source, XML config, and annotation-processor-generated code.
+- Do NOT rewrite `javax.*` packages that remain valid in Jakarta EE namespace-unaffected libraries (e.g. `javax.annotation.processing` tooling) — validate against the actual Boot 3 dependency tree, not a blanket regex.
+
+**A3. Spring Security 5 → 6 reconfiguration**
+- Replace any `WebSecurityConfigurerAdapter` subclass with a `SecurityFilterChain` `@Bean`.
+- Convert `antMatchers()`/`mvcMatchers()` to `requestMatchers()`.
+- Re-verify CSRF, CORS, and method-security annotations behave identically — these are common silent-breakage points; require a passing security-focused test suite before marking A3 complete.
+
+**A4. Actuator / Micrometer changes**
+- Update actuator endpoint exposure config (`management.endpoints.web.exposure.include`) for renamed/removed endpoints.
+- Convert any Micrometer 1.9-era metric registration to the current API where signatures changed.
+
+**A5. Deprecated API & config property removal**
+- Run `spring-boot-properties-migrator` (temporarily, dev-only) to surface renamed properties, then hard-migrate `application.yml`/`.properties` and remove the migrator dependency before final commit.
+- Sweep for deprecated-and-now-removed APIs flagged by the compiler; do not suppress warnings, resolve them.
+
+**A6. Java version bump**
+- Bump source/target compatibility (17 minimum for Boot 3; 21 if virtual threads or the newer GC options are in scope).
+- Flag (don't auto-apply) opportunities to adopt records/pattern matching in touched files only — this is a modernization suggestion, not a required migration step, to keep diff surface minimal.
+
+---
+
+### Track B — Monolith → Microservices Decomposition
+
+**B1. Bounded-context identification**
+- Derive candidate bounded contexts from graphifyy's dependency clustering (package cohesion, shared-table access patterns, transaction boundaries) — not from org-chart or guesswork.
+- Cross-reference against any TABR ruling that already mandates specific service boundaries.
+
+**B2. Strangler-fig extraction order**
+- Rank candidate services by coupling score (lowest first). Extract the least-coupled bounded context first to validate the pattern before tackling high-coupling, high-risk boundaries.
+- Each extraction step must leave the monolith in a deployable state — no long-lived half-extracted branches.
+
+**B3. Data decomposition**
+- For each extracted service: identify owned tables vs. shared tables. Shared tables require either (a) a temporary dual-write/CDC bridge, or (b) an API-mediated read from the owning service — never direct cross-service DB access post-extraction.
+- Flag any extraction that would require a distributed transaction; default to the outbox pattern + eventual consistency unless TABR has explicitly approved 2PC/XA for that boundary.
+
+**B4. API contract & anti-corruption layer**
+- Define the extracted service's public contract (OpenAPI) before implementation. Callers in the remaining monolith go through a thin anti-corruption adapter, not direct internal-class reuse.
+
+**B5. Distributed transaction / consistency pattern**
+- Default: transactional outbox + async event consumer. Document compensating actions for the saga.
+- Use **Litmus** (behavioral equivalence record-replay) to confirm the decomposed flow produces equivalent externally observable behavior to the pre-extraction monolith path, using recorded production-shaped traffic where available.
+
+**B6. Gateway / service mesh integration**
+- Register the new service's route in the API gateway; do not expose it directly without the standard authn/authz filter chain applied.
+
+---
+
+### Track C — Legacy Framework → Spring Boot
+
+**C1. Legacy construct inventory**
+- Catalog every Struts `Action`/`ActionForm`, EJB (`@Stateless`, `@Stateful`, `@MessageDriven`), and `web.xml` servlet/filter mapping via codegraph — this becomes the migration checklist; nothing is migrated "by feel."
+
+**C2. Construct mapping**
+| Legacy | Spring Boot Equivalent |
+|---|---|
+| Struts `Action` | `@RestController` / `@Controller` method |
+| Struts `ActionForm` | `@RequestBody`/`@ModelAttribute` DTO with Bean Validation |
+| `@Stateless` EJB | `@Service` (default scope) |
+| `@Stateful` EJB | `@Service` + explicit session-scoped state management (avoid unless truly required — prefer stateless redesign) |
+| `@MessageDriven` | `@JmsListener` / Spring Cloud Stream binder |
+| `web.xml` servlet/filter | `@Component` implementing `Filter`, or Spring MVC equivalent |
+| JNDI datasource lookup | Spring Boot `DataSource` auto-configuration via `application.yml` |
+
+**C3. Configuration migration**
+- XML DI config (`applicationContext.xml`, `struts-config.xml`) → Java/annotation config or `application.yml`. Migrate one config domain at a time (datasource, security, messaging) rather than a single big-bang rewrite.
+
+**C4. Dependency injection conversion**
+- Convert manual `InitialContext.lookup()` / factory patterns to constructor-injected Spring beans. Constructor injection is required (not field injection) for testability.
+
+**C5. Behavioral parity validation**
+- Use **Litmus** record-replay against the legacy app's actual traffic/logs (where available) to establish a baseline, then replay the same inputs against the migrated Spring Boot service and diff outputs before cutover.
+
+---
+
+## 5. Validation & Quality Gates
+
+All tracks share these gates; a track is not "complete" until it passes them:
+
+1. **Compile & unit test parity** — full build green, no suppressed warnings introduced by the migration.
+2. **CCC closure check** — every CCC finding cited in Phase 0 as an acceptance criterion must show as remediated; re-query CCC, don't self-attest.
+3. **Security regression pass** — auth/authz test suite (existing + Track A3 additions) green.
+4. **Behavioral equivalence (Track B/C only)** — Litmus record-replay diff report attached with zero unexplained divergences, or explicitly waived divergences documented with rationale.
+5. **AgentGuard dependency-graph check (if enrolled)** — confirm the PR's dependency graph delta matches the declared migration scope; unexplained new edges block merge.
+6. **Rollback rehearsal** — for Track B extractions specifically, confirm the strangler-fig routing can be reverted to monolith-only with a config flip, not a code revert, before the extraction is considered production-ready.
+
+If any gate fails, the agent returns to the relevant phase — it does not proceed to the next track or mark the Migration Plan complete.
+
+---
+
+## 6. Output Format & Deliverables
+
+Every run of this skill produces, in this order:
+
+1. **Migration Plan** (Markdown) — tracks selected, execution order, blast radius, risk tier, CCC/TABR constraints in force.
+2. **Per-phase diff summaries** — file counts and risk flags per phase (per the token economy rule in §3.2), full diffs available on request.
+3. **Validation Evidence Report** — results of every gate in §5, including the Litmus divergence report where applicable.
+4. **Open Items / Human Decision Log** — anything the agent could not resolve autonomously (TABR conflicts, ambiguous bounded-context boundaries, distributed-transaction approvals needed) — surfaced explicitly, never silently assumed.
+
+All four deliverables are written back to the target repo under `/.codemind/migrations/<run-id>/` and indexed via graphifyy so future runs (e.g., Track B after Track A) can reference prior decisions instead of re-deriving them.
