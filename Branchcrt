@@ -1,0 +1,187 @@
+---
+name: branch-and-pr-automation
+description: Creates a git branch named `testbranch` after explicit user confirmation of the base branch, commits and pushes pending changes, and opens a GitHub Pull Request whose description is generated only from actual diff and commit evidence. Use this when asked to create a branch and push changes, branch off and open a PR, or push work to testbranch.
+argument-hint: [base-branch]
+---
+
+# Branch & PR Automation
+
+## Install
+
+Copy this whole folder to `.github/skills/branch-and-pr-automation/` at the
+repository root (the folder name must stay `branch-and-pr-automation` — it
+has to match the `name` field above). VS Code discovers it automatically;
+invoke it with `/branch-and-pr-automation` or let Copilot auto-load it when a
+request matches the description above.
+
+## When to use this skill
+
+- "Create a branch and push these changes"
+- "Push to testbranch and open a PR"
+- "Branch off and raise a pull request"
+
+## 0. Fidelity Ledger
+
+| Concern | Authoritative tool | Rejected alternative | Why rejected |
+|---|---|---|---|
+| Branch/commit/push mutations | `git` CLI | Editor Source Control GUI | Not scriptable/headless for agent mode; no deterministic exit codes |
+| PR creation & metadata | `gh` CLI (GitHub CLI) | Raw REST calls via `curl` + PAT | Duplicates auth handling `gh` already does correctly; higher error surface |
+| Base branch detection | `gh repo view --json defaultBranchRef` + `git branch` | Assuming `main` by convention | Repos vary (`main`, `master`, `develop`); guessing violates evidence-only principle |
+| Change description content | `git diff --stat`, `git log <base>..testbranch` | Free-form summary of "what was probably intended" | Must cite exact files/commits, never guessed intent |
+
+**Scope boundary — prompt injection:** this skill operates only on the developer's own local repo and commit history (trusted input). No external contributor content is processed, so no injection guard is included. If this skill is ever pointed at a fork/external PR body as input, that guard must be added first.
+
+---
+
+## Phase 0 — Certification Harness (hard gate, 8/8 required)
+
+Run [preflight-check.sh](./scripts/preflight-check.sh) before anything else:
+
+```bash
+bash .github/skills/branch-and-pr-automation/scripts/preflight-check.sh testbranch
+```
+
+It checks, in order: git availability, that you're inside a git repo, `gh` auth, remote reachability, push permission (best-effort), working-tree status, `testbranch` name collisions (local + remote), and current branch/HEAD SHA. Any hard-blocking failure (checks 1–4) aborts with the exact evidence — do not proceed to Phase 1 on a non-zero exit.
+
+---
+
+## Phase 1 — Base Branch Confirmation (mandatory human gate)
+
+Never assume the base branch. Build the candidate list only from Phase 0 evidence plus:
+
+```bash
+gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
+```
+
+Present exactly this and stop until the user responds:
+
+```
+CONFIRMATION REQUIRED — no branch will be created until you confirm.
+
+Create `testbranch` from which base?
+  1. <current-branch>   (currently checked out, HEAD <sha>)
+  2. <default-branch>   (repository default)
+  3. Other — specify a branch name
+
+Reply with 1, 2, or 3+name.
+```
+
+Record the confirmed base branch and its HEAD SHA (`git rev-parse <base>`) — this anchors Phase 5's diff evidence.
+
+---
+
+## Phase 2 — Collision Check & Branch Creation
+
+Using the Phase 0 collision evidence:
+
+- **No collision:**
+  ```bash
+  git checkout <confirmed-base>
+  git pull origin <confirmed-base>
+  git checkout -b testbranch
+  ```
+- **Local collision:** ask — reuse existing local `testbranch` (rebase onto confirmed base) / delete and recreate / choose a different name. Never auto-delete.
+- **Remote collision:** ask — push on top of the existing remote `testbranch` / delete the remote branch first / choose a different name. Never force-delete a remote branch without a confirmation that names that exact action.
+
+Post-condition: `git rev-parse --abbrev-ref HEAD` must equal `testbranch` before continuing.
+
+---
+
+## Phase 3 — Change Evidence Capture & Commit
+
+```bash
+git status --porcelain
+git diff --stat
+```
+
+- Both empty → `Not detected — no staged/unstaged changes found via git status --porcelain`. Abort; nothing to push.
+- Otherwise:
+  ```bash
+  git add -A
+  git commit -m "<generated message>"
+  ```
+- **Commit message rule:** built only from the `git diff --stat` file list and change type (added/modified/deleted) — no inferred rationale. Example: `Update auth/session.py, add auth/tests/test_session.py (3 files changed, +142/-18)`.
+
+---
+
+## Phase 4 — Push to Remote
+
+```bash
+git push -u origin testbranch
+```
+
+Non-fast-forward/rejected push → stop, show the exact `git` error, ask the user how to proceed. Never `--force` without a separate confirmation that names force-push specifically. Verify: `git ls-remote origin testbranch` SHA must match local `git rev-parse testbranch`.
+
+---
+
+## Phase 5 — PR Creation (evidence-only description)
+
+Generate the body with [generate-pr-body.sh](./scripts/generate-pr-body.sh):
+
+```bash
+bash .github/skills/branch-and-pr-automation/scripts/generate-pr-body.sh <confirmed-base> testbranch > /tmp/pr-body.md
+```
+
+This produces `Summary`, `Changes Made` (per-file, from `--name-status`), `Commits` (from `git log`), `Testing`, and `Related Issues` (auto-detected `#123`-style refs from commit messages, or an explicit "Not detected" line) — every line traces to real diff/log output.
+
+Create the PR:
+```bash
+gh pr create --base <confirmed-base> --head testbranch \
+  --title "<generated from diff --stat summary>" \
+  --body-file /tmp/pr-body.md
+```
+
+---
+
+## Phase 6 — Post-Creation Verification
+
+```bash
+gh pr view <number> --json url,state,baseRefName,headRefName
+```
+
+Confirm `baseRefName` == confirmed base, `headRefName` == `testbranch`, `state` == `OPEN`. Report to the user: PR URL, PR number, base branch, files changed count, commit count.
+
+---
+
+## Rollback / Failure Handling
+
+At every phase, on any command failure: stop immediately, show the exact command and its exact error output, do not attempt an automatic alternate path, and suggest specific manual remediation (e.g., `git branch -D testbranch` to undo a bad local create). No phase silently continues past a failed prior phase.
+
+## Known Limitations (honest fidelity tradeoffs)
+
+- Does not resolve merge conflicts if `testbranch` diverges from base after creation — flags for manual resolution rather than auto-merging.
+- Assumes a single remote named `origin`; multi-remote repos require an explicit `--repo` override to `gh`.
+- Assumes `gh auth login` has already been completed interactively; this skill does not perform first-time OAuth setup.
+- Fixed branch name `testbranch` is per spec — collision handling exists, but no auto-suffixing (e.g., `testbranch-2`) happens without explicit user confirmation.
+
+---
+
+## Flow Diagram
+
+```mermaid
+flowchart TD
+    A[Phase 0: preflight-check.sh 8/8] -->|hard-block fails| X[Abort - report evidence]
+    A -->|passes| B[Phase 1: Confirm base branch - human gate]
+    B -->|no response| X2[Wait - do not proceed]
+    B -->|confirmed| C[Phase 2: Collision check]
+    C -->|unresolved collision| X3[Abort - ask resolution]
+    C -->|clear or resolved| D[Create testbranch]
+    D --> E[Phase 3: Capture diff evidence]
+    E -->|no changes| X4[Abort - nothing to push]
+    E -->|changes found| F[Commit]
+    F --> G[Phase 4: Push to origin]
+    G -->|rejected| X5[Abort - show error]
+    G -->|success| H[Phase 5: generate-pr-body.sh]
+    H --> I[gh pr create]
+    I --> J[Phase 6: Verify PR state]
+    J --> K[Report URL + summary to user]
+```
+
+---
+
+## Playbook Metadata (CodeMind library record)
+
+- Audience: developer
+- Runtime: git CLI, GitHub CLI (`gh`), Bash, GitHub Copilot Agent Skills (VS Code)
+- Output: pushed remote branch `testbranch` + GitHub Pull Request (number + URL)
+- Version: 1.1.0 — adapted from the standalone SKILL.md convention to VS Code's native Agent Skills spec (June 2026)
