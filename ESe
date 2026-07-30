@@ -1,0 +1,220 @@
+# EASE — Bulk Repo Batch Execution
+
+Two standalone prompts, one per surface. Paste each into its own agent session (Copilot Agent Mode / Claude Code) against the relevant repo. Do not run them in the same session — backend must land and be verified before frontend consumes it.
+
+Shared facts both prompts assume (do not re-derive, do not re-litigate):
+- Existing endpoints: `POST /api/v1/orchestrator/batches/run`, `GET /api/v1/orchestrator/batches/{batch_id}`, `GET /api/v1/orchestrator/batches/{batch_id}/items`
+- Existing item shape: `{ repo_url, branch, cd_repo_url, cd_branch }`
+- Existing batch request shape: `{ items[], playbook_name, goal, user_id, max_parallel, cd_mode, branch_strategy, enable_cd }`
+- Existing item statuses: `pending | running | completed | failed | skipped`
+- Existing execution path: Codemind → Tachyon (Gemini 2.5 Pro gateway)
+- New execution path to add: Codemind → Devin API, as a second engine, not a replacement
+
+---
+
+## 1. Backend prompt (Codemind)
+
+```
+OBJECTIVE
+Add two capabilities to the existing batch orchestrator: (1) CSV-based bulk repo
+submission, (2) a pluggable execution engine so a batch item can run through
+Tachyon (current, default) or Devin (new), with a hard concurrency cap of 2
+in-flight items per batch, auto-filling the next queued item as soon as a slot
+frees up.
+
+CONTEXT
+Read the existing batch run/poll/items endpoints and their Mongo models before
+writing anything. Do not guess the schema — inspect it. If a queue, worker
+pool, or LangGraph node already exists for driving batch items through
+pending → running → completed, extend that mechanism. Do not introduce a
+second, competing execution path.
+
+CONSTRAINTS — violating any of these is a failed implementation
+- Concurrency is fixed at 2 in-flight items per batch. Not configurable via
+  request payload. Not a soft target — enforce with a semaphore or equivalent
+  bounded pool.
+- No new infrastructure. No Kafka, Redis, RabbitMQ, Celery, or external queue
+  service unless one is already running in this stack — check first, ask if
+  unsure, do not add one speculatively.
+- The queue is local to the batch worker process and Mongo-backed for
+  durability: every state transition (pending→running→completed/failed/
+  skipped) is written to Mongo immediately, not just held in memory. If the
+  worker restarts mid-batch, in-flight items must be recoverable from Mongo,
+  not silently lost or re-run from scratch.
+- Existing Tachyon execution path must keep working unchanged for any
+  batch/item that does not specify engine=devin. Default engine is tachyon.
+  This is additive, not a rewrite.
+- CSV upload only adds a way to populate items[] — it must not change the
+  existing request/response contract for callers who still send items[]
+  directly.
+
+TASKS
+1. Schema: add `engine: "tachyon" | "devin"` to the item object, default
+   "tachyon", backward compatible with existing payloads that omit it.
+2. CSV ingestion: accept a CSV (multipart or base64 field — match whatever
+   upload pattern already exists elsewhere in this API; do not invent a new
+   convention) with columns repo_url, branch, cd_repo_url, cd_branch, engine
+   (engine column optional, defaults to tachyon). Parse into items[] using
+   the existing validation rules for that object. Reject the whole batch
+   with row-level errors (row number, column, reason) if any row is
+   malformed — do not partially enqueue a batch with bad rows silently
+   dropped.
+3. Execution engine abstraction: introduce a small interface —
+   submit(item) -> external_run_id, poll(external_run_id) -> raw_status —
+   with two implementations: the existing Tachyon client wrapped to this
+   interface, and a new DevinExecutor. Item-level engine routing happens
+   through this interface, not through if/else branching scattered across
+   the worker.
+4. Devin status mapping: write an explicit table mapping every Devin session
+   state to one of pending/running/completed/failed/skipped. No
+   unmapped state may pass through — unknown states default to failed
+   with the raw state logged, never silently marked completed.
+5. Bounded worker: exactly 2 items in flight per batch at any time. On
+   completion (success or failure) of any in-flight item, immediately pull
+   the next pending item for that batch, if any, and start it. No polling
+   delay between slot-free and next-item-start beyond what's operationally
+   necessary.
+6. Idempotency: a batch_id + item index (or repo_url, whichever this codebase
+   already uses as the item identity) must not be submitted to Tachyon or
+   Devin twice. Guard against duplicate submission on worker restart.
+7. Error capture: executor failures (timeout, 4xx/5xx from Devin/Tachyon,
+   malformed response) are stored per item using the existing error schema
+   already visible in the items GET response (msg, type). No swallowed
+   exceptions.
+8. Structured logging: one log line per item state transition — batch_id,
+   item id, engine, from_status, to_status, duration_ms. This is what you'll
+   grep when a batch hangs.
+
+NON-GOALS — do not do these even if it seems convenient
+- No new public endpoints beyond what CSV ingestion strictly requires.
+- No UI work.
+- No change to auth/authz.
+- No configurable concurrency, no configurable engine defaults beyond what's
+  specified above.
+- No retry-with-backoff logic beyond what already exists for Tachyon calls,
+  unless Devin's API requires it for correctness (e.g., 429 handling) — if
+  so, keep it minimal and symmetric between both executors.
+
+ACCEPTANCE CRITERIA
+- A batch of 10 items via CSV, all engine=tachyon, runs with never more than
+  2 items in running state at once, verified by polling GET /batches/{id}.
+- A mixed batch (some items engine=tachyon, some engine=devin) completes
+  correctly with each item's engine reflected in its final record.
+- Killing and restarting the worker mid-batch resumes without re-running
+  completed items or losing pending ones.
+- A CSV with one malformed row is rejected in full, with a specific row/
+  column/reason in the response, before anything is enqueued.
+- Existing non-CSV batch submission (current EASE/Discovery Agent behavior)
+  is unaffected — run the existing integration tests, they must still pass.
+
+If anything above conflicts with how this codebase already does batching,
+queuing, or state persistence, stop and flag the conflict instead of
+resolving it silently in either direction.
+```
+
+---
+
+## 2. Frontend prompt (EASE, formerly Discovery Agent)
+
+**UI reference:** `ease-bulk-run-dashboard.html` (companion mockup). It is a visual/interaction
+reference only — colors, fonts, and animation are not requirements — but the *structure* below
+should be treated as the actual target layout, not a suggestion:
+
+- A **Single repo / Bulk CSV** segmented toggle at the top of the page, next to the existing
+  theme toggle. Switching modes swaps both the left config panel and the telemetry strip above
+  the deck — it does not navigate to a different page.
+- **Single-repo mode** is the existing flow, untouched, with one addition: an engine selector
+  (Tachyon / Devin) added to the config panel.
+- **Bulk mode** config panel: playbook selector (unchanged), a default-engine selector with
+  explicit copy stating a row's own `engine` column overrides it, a CSV dropzone (click-to-browse
+  and drag-drop), a "load sample CSV" fallback for quick testing, and a preview table (row #,
+  repo_url, branch, engine, a flag icon on invalid rows) that appears once a file is parsed.
+  Execute is disabled until at least one valid row exists, and its label states the row count,
+  e.g. "Execute batch (7 repos)".
+- **Telemetry strip swaps by mode**: single mode keeps the existing one-line trace. Bulk mode
+  replaces it with two labeled slots ("Slot A" / "Slot B") — this is the literal, load-bearing
+  visualization of the backend's hard 2-concurrent cap, not decoration. Each slot shows which
+  repo currently occupies it (or "— empty —"), and an aggregate counter row underneath
+  (pending / running / completed / failed) driven by the same numbers GET /batches/{batch_id}
+  returns.
+- **Results panel in bulk mode**: the Report/Artifacts tabs are replaced by a live queue table
+  (repo, engine, status badge, duration, error) sourced from GET /batches/{batch_id}/items; Raw
+  JSON tab stays. In single mode the results panel is unchanged.
+
+Build against this structure. If the existing codebase's component/routing conventions make any
+part of it awkward (e.g., panel-swapping vs. separate routes), follow the codebase's convention
+and flag the deviation — don't silently diverge from both.
+
+```
+OBJECTIVE
+Rename the Discovery Agent run dashboard to EASE, and add a bulk-submission
+path: attach a CSV of repos instead of picking one repo at a time, with a
+live view of batch progress driven by polling the existing batch APIs.
+
+CONTEXT
+This consumes the backend batch endpoints as-is — do not design around an
+API that doesn't exist yet. If a field this prompt references (engine,
+per-item error, etc.) isn't present in the backend response you're actually
+hitting, stop and flag it rather than mocking it client-side.
+
+CONSTRAINTS
+- Rename is text/branding only: every visible "Discovery Agent" / "Run
+  Dashboard" reference relevant to this page becomes "EASE". Do not rename
+  routes, component internals, or anything backend-facing unless the
+  backend has already renamed it — check before touching URLs.
+- Reuse the existing single-repo submission flow; bulk CSV is an additional
+  path, not a replacement. Both must work.
+- Concurrency (max 2 in flight) is backend-owned. The frontend displays that
+  state (e.g., "2 running · 6 queued · 2 done"), it does not implement or
+  simulate the limit itself.
+- No new component library, state management pattern, or styling system —
+  match whatever this codebase already uses. Look at the existing dashboard
+  code before writing new code.
+- No localStorage/sessionStorage for batch state — keep it in memory /
+  existing state management, since a page refresh mid-batch should re-fetch
+  from the backend anyway (GET /batches/{batch_id}), not resurrect stale
+  client state.
+
+TASKS
+1. Rename: page title, nav label, and any header text from Discovery Agent /
+   Run Dashboard to EASE.
+2. CSV upload: file input accepting the columns repo_url, branch,
+   cd_repo_url, cd_branch, engine (optional). Parse client-side for an
+   immediate preview table before submit — show row count and flag obviously
+   malformed rows (missing repo_url) inline, but the backend is still the
+   source of truth for validation; don't try to fully replicate backend
+   validation client-side.
+3. Engine selector: Tachyon (default) / Devin, applied to the batch (or per
+   row if the CSV's engine column is populated — row-level value wins over
+   the batch-level default).
+4. Submit: build the same payload shape the existing single-repo flow
+   already builds, with items[] sourced from the parsed CSV instead of one
+   manually selected repo.
+5. Progress view: after submit, poll GET /batches/{batch_id} on an interval
+   (start at 3s) for aggregate counts, and GET /batches/{batch_id}/items for
+   per-row status. Render as a table: repo, engine, status, error (if any).
+6. Polling lifecycle: stop polling once the batch reaches a terminal state
+   (no items left pending or running). On a failed poll request, back off
+   (e.g., double the interval, cap it) rather than hammering the endpoint;
+   surface a "results may be stale" indicator rather than failing silently.
+7. Cancel/unmount: if the user navigates away, stop the polling interval —
+   no orphaned timers.
+
+NON-GOALS
+- No redesign of layout beyond what's needed to fit the CSV/engine controls
+  and the progress table.
+- No changes to the Playbook Store or any other page.
+- No client-side retry/resubmit logic for failed items — that's a backend
+  concern; the frontend just displays the failed state.
+- No client-side enforcement of the 2-concurrent limit.
+
+ACCEPTANCE CRITERIA
+- Uploading a CSV of 10 repos submits one batch and shows a live-updating
+  table that never claims more than 2 rows as "running" at once (matching
+  backend behavior), and stops polling once all rows are terminal.
+- Existing single-repo submission flow still works unchanged.
+- Navigating away from the page during an active batch does not leave a
+  polling loop running.
+- A CSV with a missing repo_url on one row is flagged in the preview before
+  submit.
+```
