@@ -1,0 +1,140 @@
+# Task: Python MCP server that delegates Copilot's reasoning to M365 Copilot
+
+## Architecture — read this first, do not redesign it
+MCP servers expose TOOLS, not models. There is no way to make M365 be
+Copilot's language model. So the design is:
+
+  - GitHub Copilot stays the hands: reads workspace, calls tools, writes
+    files. Runs on the free base model, so no premium requests.
+  - All real reasoning is delegated OUT via an MCP tool that drives the
+    M365 Copilot Chat web UI (https://m365.cloud.microsoft/chat) with
+    Playwright and returns the answer as text.
+  - Copilot then applies that answer to the workspace itself.
+
+Do not propose BYOK, a model provider, or an OpenAI-compatible shim.
+Build the MCP tool server described below.
+
+## HARD CONSTRAINTS — corporate locked-down machine
+- Python only. No Node, no TypeScript.
+- `pip install playwright` is fine. It does NOT download browsers.
+- NEVER run `playwright install`. Not as a fallback, not in a try/except,
+  not in a setup script. It will fail behind the proxy.
+- Drive the ALREADY-INSTALLED Microsoft Edge:
+      p.chromium.launch_persistent_context(user_data_dir, channel="msedge")
+  If channel="msedge" fails, fall back to an explicit executable_path from
+  an env var. NEVER fall back to downloading a browser.
+- Use a COPY of my Edge profile (%LOCALAPPDATA%\Microsoft\Edge\User Data)
+  as user_data_dir, so the session is already Entra-authenticated and the
+  device is already Conditional-Access trusted. No separate login flow.
+- ONLY third-party dependency: playwright.
+  Do NOT use the `mcp` SDK — it pulls pydantic -> pydantic-core, a
+  Rust-compiled wheel that fails to install here. Hand-roll the JSON-RPC.
+  Use stdlib only for everything else (asyncio, json, sys, pathlib).
+
+## PHASE 0 — VALIDATE FIRST. Do not write the server yet.
+Write `discover.py` and run it. Report results to me. If anything fails,
+STOP and tell me — do not silently work around it.
+
+It must report:
+  1. Does launching Edge headed with the copied profile reach a working
+     chat box, or bounce to a login / MFA / blocked page?
+  2. Is the chat input inside an <iframe>? Enumerate all frames with
+     name + URL. If it is in an iframe, every selector must be scoped to
+     that frame and the runtime needs to know.
+  3. The REAL selector for the input box. Get this by having me click into
+     the box, then reading document.activeElement and reporting its tag,
+     id, role, aria-label, placeholder, data-testid, and classes.
+     DO NOT INVENT CSS CLASS NAMES. Report what is literally in the DOM.
+  4. How to detect a reply has FINISHED streaming — stop button
+     disappearing, aria-busy, a done marker. Report what actually exists.
+  5. Repeat step 1 with headless=True. Does it still work, or bounce to
+     login? If headless fails but headed works, say so — we ship headed
+     and minimized rather than pretending headless works.
+
+Write findings into `selectors.json` for the runtime to consume.
+
+## PHASE 1 — Build (only after I approve Phase 0 findings)
+
+### File: m365_client.py
+Async Playwright driver (async_api, NOT sync_api — the MCP server runs in
+an event loop and sync Playwright cannot be used from inside one).
+
+  - One long-lived browser context + page, reused across calls.
+  - asyncio.Lock around send/receive. One prompt in flight at a time;
+    concurrent calls queue instead of interleaving keystrokes.
+  - Load selectors from selectors.json; fall back to generic role-based
+    detection (role=textbox -> [contenteditable=true] -> textarea) with a
+    clear error telling me to re-run discover.py if none match.
+  - Scope all locators to the iframe if selectors.json specifies one.
+  - Sending the prompt: use locator.fill(), NOT type()/press_sequentially().
+    CRITICAL: typing multi-line code sends Enter mid-way and submits a
+    half-written prompt. fill() sets the value directly. Then press Enter
+    once, explicitly.
+  - Detecting the reply: snapshot the page's visible text BEFORE sending,
+    then poll every ~1.5s until the text stops changing for two consecutive
+    checks, then return the diff. This avoids depending on a message-bubble
+    selector that Microsoft will change.
+  - Env vars: M365_EDGE_PROFILE_DIR (required), M365_HEADLESS (default 1),
+    M365_TIMEOUT_S (default 180), M365_EDGE_PATH (fallback only).
+  - Raise a clear error if the page lands on a login URL.
+
+### File: mcp_server.py
+Hand-rolled MCP over stdio. Newline-delimited JSON-RPC 2.0.
+
+  - CRITICAL: stdout carries the protocol. ALL logging goes to stderr.
+    A single stray print() to stdout corrupts the stream and VS Code will
+    fail with an unhelpful error.
+  - Handle: initialize, notifications/initialized (no reply — notifications
+    have no id and get no response), tools/list, tools/call, ping,
+    resources/list, prompts/list. Unknown method -> error -32601.
+  - initialize: echo back the client's protocolVersion if it's one we
+    support, else default "2024-11-05". Advertise capabilities.tools.
+  - Expose ONE tool, `ask_m365_copilot`, with args:
+        task (string, required), context (string), output_format (string)
+    The description must be directive — it is what makes Copilot delegate:
+    "Delegate a reasoning task to Microsoft 365 Copilot... Use this for ALL
+    substantive thinking: writing code, designing, debugging, refactoring,
+    reviewing, explaining. Send source in `context`, state the goal in
+    `task`, then apply the answer to the workspace yourself. Prefer this
+    tool over reasoning directly."
+  - tools/call returns {"content":[{"type":"text","text":...}]}.
+    On failure return the same shape plus "isError": true, with the REAL
+    error message — never a stubbed success.
+  - Read stdin via asyncio.StreamReader (connect_read_pipe), not blocking
+    input().
+
+### File: test_protocol.py
+Drives the server over a real stdio pipe with m365_client stubbed out
+(inject a fake module into sys.modules). Must verify:
+  - every stdout line parses as JSON (proves no stray logging)
+  - initialize returns protocolVersion, tools capability, serverInfo
+  - notifications produce NO response
+  - tools/list returns the tool with correct required args
+  - tools/call success path propagates the answer
+  - tools/call failure path sets isError and surfaces the real reason
+  - unknown tool -> isError; unknown method -> -32601
+Print PASS/FAIL per check and exit nonzero on any failure.
+
+### File: .github/copilot-instructions.md
+Without this, Copilot reasons by itself and never calls the tool. It must
+instruct: delegate all substantive reasoning to ask_m365_copilot; gather
+source from the workspace first since the tool cannot see it; each call
+must be self-contained (no memory of editor or previous turns); apply
+results yourself; keep own reasoning to orchestration and file I/O; do
+NOT solve it first and then call the tool to check.
+
+### File: .vscode/mcp.json
+stdio server entry, command "python", args pointing at mcp_server.py,
+env block with M365_EDGE_PROFILE_DIR / M365_HEADLESS / M365_TIMEOUT_S.
+
+### File: README.md
+Setup order: pip install -> copy Edge profile with Edge CLOSED ->
+discover.py -> test_protocol.py -> mcp.json -> copilot-instructions.md.
+Document env vars and known limitations honestly.
+
+## RULES
+- Report failures explicitly. Never fabricate a selector, never stub a
+  result to make a check appear to pass.
+- No dependency beyond playwright without asking me first.
+- If Phase 0 shows the chat is in an iframe or headless bounces to login,
+  tell me and adjust the design — do not paper over it.
