@@ -1,0 +1,283 @@
+# Codegraph Enhancement Prompt (v2)
+
+Use this as the task prompt for your agent (Copilot Agent Mode / Codemind playbook) to
+upgrade **codegraph**. Implement every feature below independently, in our own codebase
+and coding style, using only standard/pip-installable Python libraries. Do not download,
+clone, vendor, or wrap any external code-graph tool — only the described *behavior* is
+in scope. **No LLM/gateway integration work is in scope for this task** — everything
+below is deterministic, structural graph work (AST parsing, graph algorithms, file I/O).
+
+This version is based on direct inspection of two months of real commit history and
+source (not summarized secondhand) — every item below traces to an actual verified
+fix or feature, not an assumption about what "probably" changed.
+
+---
+
+## 1. Graph integrity & quality hardening (highest priority)
+
+This is the largest and most valuable category: making the graph *trustworthy*, not
+just complete. A graph with plausible-looking but wrong edges is worse than a smaller,
+correct one — false edges quietly corrupt every downstream query, blast-radius
+analysis, and report.
+
+**1.1 Cross-language contamination guard**
+Calls/imports/references must never bind an identifier in one language to a
+same-named symbol in a different, unrelated language family (e.g. a Python `import
+time` resolving onto an unrelated `time.ts` file, or a JS callback binding to a
+same-named Kotlin function). Add an explicit interop-family check at edge-resolution
+time: an edge between two "known code" languages is only allowed when both sides
+belong to the same interop family (e.g. JVM languages together, C-family together,
+JS/TS module graph together). Config/manifest → code references are exempt. Without
+this guard, a handful of coincidental name collisions can silently weld unrelated
+subsystems together and manufacture a false top "hub" node that distorts every
+centrality-based analysis.
+
+**1.2 Builtin/stdlib type guard**
+Member-call and type-reference resolution must never collapse onto a builtin/stdlib
+type just because a user-defined symbol shares its name (e.g. a variable typed `Date`
+binding to a user class literally named `Date` in another file). Maintain a
+per-language builtin-type denylist checked before any receiver-type match is accepted.
+
+**1.3 Unverified-node flagging**
+Any node derived from a non-deterministic (model-assisted) pass that claims a code
+symbol exists but that symbol cannot be found in the referenced source must be tagged
+with an explicit `verification: "unverified"` field rather than presented as a
+confirmed fact — and never silently dropped, just flagged for review. This check
+compares the claimed label/id against the actual source content it's attributed to.
+
+**1.4 Dedup precision**
+Fuzzy/near-duplicate node merging needs several precision guards:
+- Numbered or versioned siblings whose only difference is a digit run (e.g. two
+  different ADR/RFC numbers, two different section numbers) must never merge just
+  because the surrounding text is similar.
+- Prose-derived nodes (documentation/rationale content) should be anchored to their
+  source file the same way code nodes are — near-identical boilerplate across
+  *different* files should not merge, while genuine duplicates *within* the same file
+  still should.
+- Use a stricter string-similarity metric (plain Jaro) for cross-file candidates and a
+  looser one (Jaro-Winkler, which rewards shared prefixes) only for same-file
+  candidates — a shared prefix bonus across files creates false merges when two
+  distinct concepts happen to start the same way.
+- When two records that share an exact ID from the same file are collapsed into one,
+  preserve the union of both records' fields rather than discarding one — deduplication
+  must never quietly lose data.
+
+**1.5 Hyperedge integrity**
+Multi-node relationship structures ("hyperedges" — one edge type connecting 3+ nodes
+around a shared concept) need the same rigor as binary edges:
+- Any hyperedge referencing a node that isn't actually present in the node set must be
+  dropped before it reaches the persisted graph, not carried through as a dangling
+  reference.
+- Node/edge/hyperedge IDs must be coerced to a consistent type (string) at ingest —
+  a non-string ID from any producer must not crash the build.
+- A file whose only extracted output is a hyperedge (not a plain node/edge) still
+  counts as "successfully processed" for caching/incremental-update purposes — don't
+  let it get silently re-processed every run because the completion check only looked
+  at nodes and edges.
+
+**1.6 Self-loop / phantom-cycle elimination**
+Import/reference resolution must actively reject edges whose source and target
+resolve to the same node — these show up as fake "1-file import cycles" in reports and
+usually come from an id-collision bug (e.g. a bare import alias resolving back onto the
+importing file itself, or a same-basename file in two different extensions colliding
+on a shared node-id stem). Add a build-time check: any `imports`/`imports_from`/
+`references` edge with identical source and target endpoints is dropped, and existing
+graphs should self-heal on next rebuild rather than requiring a manual fix.
+
+**1.7 Deterministic traversal output**
+Path-finding and shortest-path queries must return the *same* route on every run for
+the same graph — not a route that varies because the underlying traversal iterates
+over a non-deterministic structure. Sort/normalize the graph view before traversal.
+Each reported hop must also show the edge's real stored relationship type, not
+whatever relation happens to survive if multiple parallel edges between the same two
+nodes were collapsed arbitrarily.
+
+**1.8 Atomic writes for every persisted artifact**
+Every file codegraph writes — the graph itself, manifest/cache files, any analysis or
+label sidecars — must be written to a temporary file in the same directory and moved
+into place with an atomic rename, never written in place. A crash, OOM kill, or
+disk-full event mid-write must never leave a truncated file that then poisons every
+subsequent run (a truncated graph file should be detected on load and rejected with a
+clear recovery message, not silently trusted).
+
+**1.9 Ranking-noise filtering**
+Structural type annotations from a language's own type system (e.g. `str`, `int`,
+`bool`, common mock/test-double types) must not themselves become graph nodes or
+accumulate edges just because they appear as a parameter/return type — they inflate
+degree-based "most connected" rankings with noise and crowd out real architectural
+hubs. Filter these at extraction time, and add a defensive filter at ranking time too
+so existing graphs benefit without a full rebuild.
+
+**1.10 Pre-labeling graph-health gate**
+Before running any expensive labeling/analysis pass, run a read-only diagnostic that
+surfaces dangling edges, self-loops, and collapsed-parallel-edge risk as warnings. This
+must never block or abort the pipeline — it's a visibility gate, not a hard failure.
+
+---
+
+## 2. New/graduated tools to add
+
+**2.1 First-class "most-connected nodes" command**
+Expose the "which nodes are the biggest architectural hubs" capability as a direct,
+documented top-level command (not just something buried inside a broader analysis
+pass) — accepts a result-count limit and both human-readable and machine-readable
+(JSON) output modes.
+
+**2.2 Self-improving work-memory loop**
+Add a deterministic (no LLM) feedback loop:
+- A `save_result(question, answer, source_nodes, outcome=None, correction=None)` API
+  where `outcome` is one of `useful` / `dead_end` / `corrected`, recorded per query.
+- A `reflect()` pass that aggregates all recorded outcomes into a single lessons
+  document, grouped by community/subsystem when a graph is available. Score each
+  cited source node with a signed, time-decayed value (positive for `useful`, negative
+  for `dead_end`/`corrected`, configurable half-life, e.g. 30 days by default) so a
+  recent contradiction outweighs a stale success.
+- Only promote a node to "preferred" once it's corroborated by multiple independent
+  results (configurable minimum, e.g. 2) — a single citation should never be enough to
+  mark something as trusted. Nodes with mixed positive/negative signal render as
+  "contested," with the most recent signal winning the displayed verdict.
+- Drop citations to nodes that no longer exist in the current graph so lessons don't
+  reference stale/deleted code.
+- This should be zero-config for the agent: the agent-facing entry point should read
+  the lessons document automatically at the start of graph work, and the loop should
+  be cheap enough to run as a no-op check when nothing has changed since the last run.
+
+**2.3 Query/usage logging**
+Log every query/path/explain-style call (timestamp, kind, question, corpus path, result
+size, duration) to a local JSON-Lines log for observability and later analysis of what
+agents actually ask the graph. Do not log full response bodies by default; make that
+opt-in. Make the whole logging path itself optional and failure-safe — a logging error
+must never block or fail the underlying query.
+
+**2.4 Bounded response sizing on any graph-serving interface**
+If codegraph exposes queries to agents through any RPC/tool-calling interface, cap
+response size per call (e.g. a configurable token/character budget, sensible default)
+so one call on a highly-connected node or large subsystem can't flood the caller's
+context. Truncation must be clearly announced in the response (what was omitted, and a
+hint for narrowing the query) — never silently truncated with no signal.
+
+---
+
+## 3. Dependency-graph resolution from package manifests
+
+Parse project manifests into a canonical dependency subgraph — one node per package
+(keyed by name), with `depends_on` edges to declared dependencies. Cover, at minimum:
+`pyproject.toml` (via `tomllib`/`tomli`), `pom.xml` (via `defusedxml.ElementTree` to
+avoid XML entity-expansion issues), `go.mod` (a small deterministic line-based parser —
+no mature Python parser exists for this format), `package.json` (stdlib `json`), and
+`Cargo.toml` including workspace members (`tomllib`/`tomli`). A manifest that fails to
+parse must be skipped with a logged warning, never abort the whole extraction run. Cap
+manifest file size before parsing. Versions that don't parse cleanly (git refs, path
+deps, wildcards) should still produce a node, flagged `unresolved_version`, rather than
+being dropped or crashing.
+
+---
+
+## 4. Blast-radius / indirect call resolution
+
+Extend "what's affected by changing X" analysis to catch indirect references, not just
+direct calls:
+- Reflective/dynamic dispatch (e.g. `getattr(obj, "name")`-style lookups).
+- A function bound to a variable name, returned from a factory function, or re-aliased.
+- Dispatch tables / handler registries (a function used as a dict/list *value*).
+- Callbacks passed by reference into another function call (thread/executor targets,
+  map-style higher-order calls, event-handler registration).
+
+Each of these should be resolved per file, independently — one file's AST-walk failure
+must not stop extraction of the rest of the corpus. Scope name resolution correctly to
+avoid false positives (a shadowed local name must never bind to an unrelated global
+callable of the same name) and cap resolution fan-out to avoid pathological blowups on
+very large registries.
+
+---
+
+## 5. Agent enforcement: close every graph-bypass path
+
+Any pre-tool-use gate that nudges/requires an agent to query the graph before reading
+raw files must cover *every* file-exploration surface the agent can use (search tools,
+glob/listing tools, and direct file-read tools) — a gate that only covers one tool
+invites the agent to route around it through another. The gate must fail *open* (never
+block agent progress) if codegraph itself is unavailable or errors, with a clear log
+message and an explicit override flag for emergencies.
+
+---
+
+## 6. Context-budget discipline for the agent-facing entry point
+
+Keep the always-loaded instruction surface lean: put only what's needed to decide
+*whether and how* to invoke codegraph in the primary instructions, and move
+detailed reference material into files loaded only when a specific workflow needs it
+(progressive disclosure). Track and report the always-loaded size so regressions are
+visible.
+
+---
+
+## 7. Update `.github/copilot-instructions.md` with new capabilities
+
+Codegraph's install/update step must keep the repo's `copilot-instructions.md` in sync
+with current capabilities, using an **idempotent, marker-delimited section** so
+re-running the updater never duplicates content:
+
+- Use a unique marker (e.g. a `## codegraph` heading) to delimit codegraph's own
+  section within the file.
+- On update: if the file doesn't exist, create it with the section. If it exists but
+  has no marker, append the section. If the marker already exists, replace only the
+  content between the marker and the next same-or-higher-level heading — leave
+  everything else in the file untouched.
+- The section content itself should state, plainly: what triggers using codegraph
+  (e.g. "any question about this repo's architecture, structure, or how files/classes
+  relate"), which tool to reach for per situation (broad question vs. targeted
+  relationship question vs. focused single-concept question vs. blast-radius/impact
+  question), and a fallback rule for when to read raw source instead (only when
+  codegraph lacks the detail, is missing, or is stale).
+- This same update step should re-run automatically whenever codegraph gains a new
+  query capability, so the instructions file never silently drifts out of date with
+  what the tool can actually do.
+- Writing the file must go through the same atomic-write discipline as any other
+  codegraph artifact (see 1.8) — a failed or interrupted instructions-file update must
+  never leave a corrupted or half-written file behind.
+
+---
+
+## Cross-cutting error handling contract (applies to every feature above)
+
+1. **Isolate failures per unit of work.** One bad file, manifest, or record must never
+   abort a full run. Catch at the smallest reasonable scope, log with enough context to
+   debug (file path, stage, exception type/message), and continue.
+2. **Validate before you trust.** Any externally-derived data (parsed manifest,
+   extracted fragment, cache read) is validated against an expected schema before it's
+   allowed to mutate the graph.
+3. **Fail loud in logs, fail soft in behavior.** Log every swallowed exception at
+   WARNING or ERROR with structured context; don't let the process crash for a
+   recoverable per-item failure.
+4. **Atomic writes everywhere** — no partial/corrupt files on crash mid-write.
+5. **Bounded resources.** Explicit caps on file size read, retry count, worker
+   fan-out, cache growth, and response size.
+6. **Idempotency.** Re-running the same operation twice produces the same graph state
+   and the same instructions-file content, not duplicates.
+7. **No bare excepts.** Every `except` names the exception type(s) it expects and logs
+   what happened; a catch-all is only acceptable at the outermost run-loop boundary,
+   and even then it must log the full traceback before continuing or exiting cleanly.
+
+---
+
+## Testing requirements
+
+- Unit test for each guard in Section 1, with both a positive case and a deliberately
+  adversarial/malformed input exercising the error path.
+- A test that simulates one corrupt manifest among several valid ones, asserting the
+  valid ones still produce correct nodes.
+- A test for atomic-write recovery: simulate an interrupted write and assert the prior
+  valid state is preserved.
+- A test that re-runs the `copilot-instructions.md` updater twice and asserts the file
+  is byte-identical after the second run (true idempotency, no duplicated sections).
+
+## Acceptance criteria
+
+- All features implemented using only standard/pip-installable Python libraries — no
+  external code-graph tool downloaded, vendored, or wrapped, and no LLM/gateway
+  integration introduced.
+- No feature above can cause a full pipeline failure from a single bad input.
+- `copilot-instructions.md` accurately reflects every new query/tool capability after
+  install/update, and re-running the updater is a true no-op when nothing changed.
+- Existing codegraph behavior is unchanged for anyone not opting into a new flag/API.
