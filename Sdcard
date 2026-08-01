@@ -1,0 +1,1753 @@
+#!/usr/bin/env python3
+"""
+sd_elements_scan.py — Deterministic SD Elements characteristic scanner.
+
+Produces a schema-conformant {component}-sd-elements.json artifact by statically
+scanning a source repository (and optionally a CD/deployment repository) for
+literal code signals — annotations, dependency coordinates, config keys, file
+patterns — as defined by an SD Elements add-on ruleset (Application Type,
+Functional Attributes, Application Security Tier, Application Classification).
+
+DESIGN GOALS
+------------
+1. Zero LLM calls in the core detection path. Every field is derived from a
+   regex/manifest match against real repository content. This is intentional:
+   the source ruleset is expressed entirely as literal tokens (annotations,
+   dependency names, config keys), which is a static-analysis problem, not a
+   reasoning problem. Determinism > fluency for a compliance artifact.
+2. Zero organization-specific hardcoding. "Internal" package prefixes (e.g.
+   your internal Maven groupId convention) are supplied at runtime via
+   --internal-package-prefixes. Nothing about your org is embedded in this file.
+3. No secrets on the command line. The GitHub token is read only from an
+   environment variable and sent only as an Authorization header — never
+   written into a clone URL, a log line, or a temp file.
+4. No git binary dependency. Repository content is fetched via the GitHub
+   REST API tarball endpoint using only the Python standard library.
+5. Fail loud, not soft. Missing required inputs, unreachable repos, invalid
+   tokens, or a JSON structure that doesn't validate against the target
+   schema all raise a hard error with a specific message — nothing is
+   silently defaulted or guessed.
+
+KNOWN LIMITATION (stated, not hidden)
+--------------------------------------
+This is a regex + manifest-parser detection layer, not a full AST/code-graph
+engine. It is deliberately scoped to be a self-contained, zero-dependency,
+100%-reproducible alternative to an LLM call. For maximum precision (e.g.
+distinguishing a *called* method from a *string literal* mentioning the same
+name), wire an AST-based code-graph indexer in as an additional evidence
+source and merge its hits into the same Hit model used here — the JSON
+assembly, decision tables, and confidence scoring do not need to change.
+
+USAGE
+-----
+    export GITHUB_TOKEN=ghp_xxx            # never pass as a CLI argument
+    python3 sd_elements_scan.py \
+        --source-repo your-org/your-service \
+        --component your-service \
+        --app-id APP-1234 \
+        --owner platform-engineering \
+        --mnemonic your-app-bundle \
+        --data-classification internal \
+        [--cd-repo your-org/your-service-cd] \
+        [--internal-package-prefixes com.yourorg,com.yourorg.internal] \
+        [--output-dir ./out]
+
+Only Python 3.9+ standard library is required. No pip installs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+SCRIPT_VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------
+# Constants: filesystem scanning
+# --------------------------------------------------------------------------
+
+SKIP_DIR_NAMES = {
+    ".git", "node_modules", "dist", "build", "target", ".gradle", "vendor",
+    "__pycache__", ".idea", ".vscode", "out", "bin", "obj", "coverage",
+    ".next", ".nuxt", ".venv", "venv", ".tox", ".pytest_cache", "eggs",
+    ".mypy_cache", "site-packages",
+}
+
+BINARY_SKIP_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2",
+    ".ttf", ".eot", ".otf", ".jar", ".war", ".ear", ".class", ".zip",
+    ".tar", ".gz", ".7z", ".rar", ".pdf", ".exe", ".dll", ".so", ".dylib",
+    ".bin", ".pyc", ".pyo", ".webp", ".bmp", ".mp4", ".mp3",
+    ".avi", ".mov", ".wasm", ".lock",
+}
+
+# Prose/documentation file types are excluded from indexing entirely. No rule
+# in the source ruleset treats documentation content as valid code evidence,
+# and README/CHANGELOG example snippets ("here's how to configure CORS: ...")
+# are a systematic source of false positives for keyword-based scanning if
+# left in the corpus. This affects every detector uniformly rather than
+# patching individual regexes.
+DOC_SKIP_EXTENSIONS = {
+    ".md", ".markdown", ".rst", ".txt", ".adoc", ".rdoc", ".rtf",
+}
+
+DEFAULT_MAX_FILE_SIZE_KB = 512
+DEFAULT_MAX_TOTAL_FILES = 20000
+
+# Conventional test-path markers. Used ONLY to exclude test fixtures/assertions
+# from risk-scoring detectors (Security Tier, PAA/Classification) — test code
+# routinely contains synthetic PII, placeholder payment fields, and permissive
+# CORS/auth configuration for the sole purpose of exercising the code under
+# test, none of which reflects production risk posture. Capability detectors
+# (Application Type, Functional Attributes) intentionally do NOT apply this
+# filter, since "the codebase contains deserialization logic" is still true
+# even if the only call site found happens to sit in a test file.
+TEST_PATH_PATTERN = re.compile(
+    r"(^|/)(test|tests|__tests__|spec|specs|src/test)(/|$)|"
+    r"(Test|Tests|IT)\.(java|kt|cs)$|"
+    r"\.(test|spec)\.(js|ts|tsx|jsx)$|"
+    r"test_[\w]+\.py$|[\w]+_test\.py$",
+    re.IGNORECASE,
+)
+
+
+def is_test_path(relpath: str) -> bool:
+    return bool(TEST_PATH_PATTERN.search(relpath))
+
+GITHUB_TARBALL_ACCEPT = "application/vnd.github+json"
+
+
+# --------------------------------------------------------------------------
+# Error types
+# --------------------------------------------------------------------------
+
+class ScanError(RuntimeError):
+    """Raised for any condition that should hard-stop the scan with a clear message."""
+
+
+# --------------------------------------------------------------------------
+# Data model
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Hit:
+    """A single positive signal match found during scanning."""
+    repo: str            # "source" or "cd"
+    path: str             # path relative to repo root
+    line: int              # 1-indexed line number, 0 if not line-addressable (e.g. filename match)
+    snippet: str            # the matched line/content, truncated
+    signal: str               # human-readable description of what this hit represents
+
+    def cite(self) -> str:
+        if self.line:
+            return f"{self.repo}:{self.path}:{self.line}"
+        return f"{self.repo}:{self.path}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Dependency:
+    """A single dependency coordinate extracted from a manifest file."""
+    repo: str
+    manifest: str
+    coordinate: str      # e.g. "org.springframework.boot:spring-boot-starter-web" or "axios"
+    raw_name: str          # the bare package/artifact name for prefix matching
+
+
+# --------------------------------------------------------------------------
+# GitHub fetch layer — header-based auth only, stdlib only, no git binary
+# --------------------------------------------------------------------------
+
+def parse_owner_repo(value: str) -> Tuple[str, str]:
+    """Accepts 'owner/repo', a full https URL, or a git URL and returns (owner, repo)."""
+    value = value.strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        parsed = urllib.parse.urlparse(value)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            raise ScanError(f"Could not parse owner/repo from URL: {value}")
+        owner, repo = parts[0], parts[1]
+    elif "/" in value:
+        owner, repo = value.split("/", 1)
+    else:
+        raise ScanError(
+            f"Repository '{value}' must be in 'owner/repo' form or a full GitHub URL."
+        )
+    repo = repo[:-4] if repo.endswith(".git") else repo
+    if not owner or not repo:
+        raise ScanError(f"Could not parse owner/repo from: {value}")
+    return owner, repo
+
+
+def _github_request(url: str, token: str, accept: str) -> urllib.request.Request:
+    headers = {
+        "Accept": accept,
+        "User-Agent": f"sd-elements-deterministic-scanner/{SCRIPT_VERSION}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)
+
+
+def _sleep_for_retry(resp_headers, attempt: int) -> float:
+    """
+    Computes a backoff delay honoring GitHub's Retry-After / X-RateLimit-Reset
+    headers when present, otherwise exponential backoff.
+    """
+    if resp_headers:
+        retry_after = resp_headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), 120.0)
+            except ValueError:
+                pass
+        remaining = resp_headers.get("X-RateLimit-Remaining")
+        reset = resp_headers.get("X-RateLimit-Reset")
+        if remaining == "0" and reset:
+            try:
+                delta = float(reset) - time.time()
+                if 0 < delta <= 300:
+                    return delta + 1
+            except ValueError:
+                pass
+    return min(2.0 ** attempt, 60.0)
+
+
+def _urlopen_with_retry(req: urllib.request.Request, timeout: int, max_attempts: int = 4):
+    """
+    Opens a request, retrying on 429 (rate limit) and 5xx (transient server
+    errors). 401/403-with-no-rate-limit/404 are not retried — those are
+    deterministic failures the caller must surface immediately.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            retryable = e.code == 429 or 500 <= e.code < 600
+            if e.code == 403 and e.headers and e.headers.get("X-RateLimit-Remaining") == "0":
+                retryable = True
+            if not retryable or attempt == max_attempts - 1:
+                raise
+            delay = _sleep_for_retry(e.headers, attempt)
+            print(f"      transient GitHub error {e.code}; retrying in {delay:.0f}s "
+                  f"(attempt {attempt + 2}/{max_attempts})", file=sys.stderr)
+            time.sleep(delay)
+            last_error = e
+        except urllib.error.URLError as e:
+            if attempt == max_attempts - 1:
+                raise
+            delay = min(2.0 ** attempt, 30.0)
+            print(f"      network error; retrying in {delay:.0f}s "
+                  f"(attempt {attempt + 2}/{max_attempts})", file=sys.stderr)
+            time.sleep(delay)
+            last_error = e
+    if last_error:
+        raise last_error
+    raise ScanError("Request failed with no recorded error.")
+
+
+def github_get_json(url: str, token: str, timeout: int = 60) -> dict:
+    req = _github_request(url, token, GITHUB_TARBALL_ACCEPT)
+    try:
+        with _urlopen_with_retry(req, timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        if e.code == 401:
+            raise ScanError(
+                "GitHub API returned 401 Unauthorized. The token is missing, "
+                "expired, or invalid. Check the environment variable it was "
+                "read from."
+            ) from e
+        if e.code == 403:
+            raise ScanError(
+                f"GitHub API returned 403 Forbidden for {url}. This is either "
+                "a rate limit or the token lacks access to this repository "
+                f"(SSO authorization, org access, or scope). Response: {body}"
+            ) from e
+        if e.code == 404:
+            raise ScanError(
+                f"GitHub API returned 404 Not Found for {url}. Verify the "
+                "owner/repo name and that the token has read access to it."
+            ) from e
+        raise ScanError(f"GitHub API error {e.code} for {url}: {body}") from e
+    except urllib.error.URLError as e:
+        raise ScanError(f"Network error contacting GitHub API ({url}): {e}") from e
+
+
+def github_download_tarball(
+    api_base: str, owner: str, repo: str, ref: str, token: str, dest_file: Path,
+    timeout: int = 180,
+) -> None:
+    url = f"{api_base}/repos/{owner}/{repo}/tarball/{urllib.parse.quote(ref)}"
+    req = _github_request(url, token, "application/octet-stream")
+    try:
+        with _urlopen_with_retry(req, timeout) as resp:
+            with open(dest_file, "wb") as f:
+                shutil.copyfileobj(resp, f)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise ScanError("GitHub tarball download: 401 Unauthorized (bad/expired token).") from e
+        if e.code == 404:
+            raise ScanError(
+                f"GitHub tarball download: 404 Not Found for {owner}/{repo}@{ref}. "
+                "Verify the repo name and ref (branch/tag/sha) exist and the "
+                "token can read this repository."
+            ) from e
+        raise ScanError(f"GitHub tarball download failed ({e.code}) for {owner}/{repo}@{ref}.") from e
+    except urllib.error.URLError as e:
+        raise ScanError(f"Network error downloading tarball for {owner}/{repo}@{ref}: {e}") from e
+
+
+def fetch_repo_snapshot(
+    api_base: str, owner: str, repo: str, ref: Optional[str],
+    token: str, work_dir: Path,
+) -> Tuple[Path, str, str]:
+    """
+    Resolves ref -> commit SHA via the API, downloads + extracts the tarball.
+    Returns (extracted_root_path, resolved_ref, commit_sha).
+    """
+    meta = github_get_json(f"{api_base}/repos/{owner}/{repo}", token)
+    resolved_ref = ref or meta.get("default_branch")
+    if not resolved_ref:
+        raise ScanError(f"Could not resolve a default branch for {owner}/{repo}; pass --source-ref explicitly.")
+
+    commit = github_get_json(
+        f"{api_base}/repos/{owner}/{repo}/commits/{urllib.parse.quote(resolved_ref)}", token
+    )
+    sha = commit["sha"]
+
+    tarball_path = work_dir / f"{owner}-{repo}-{sha[:12]}.tar.gz"
+    github_download_tarball(api_base, owner, repo, resolved_ref, token, tarball_path)
+
+    extract_dir = work_dir / f"{owner}-{repo}-{sha[:12]}-extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tarball_path, "r:gz") as tf:
+        base = extract_dir.resolve()
+        # Reject absolute paths, traversal, and links pointing outside the
+        # extraction root. Symlink/hardlink members are rejected outright:
+        # a source snapshot never needs them, and they are the standard
+        # tarball-escape vector that a naive path check misses.
+        for member in tf.getmembers():
+            if member.issym() or member.islnk():
+                raise ScanError(
+                    f"Refusing to extract link member from tarball: {member.name}")
+            member_path = (extract_dir / member.name).resolve()
+            if not str(member_path).startswith(str(base) + os.sep) and member_path != base:
+                raise ScanError(f"Refusing to extract unsafe tarball member: {member.name}")
+        # Python 3.12+ supports extraction filters; use the strictest available.
+        try:
+            tf.extractall(extract_dir, filter="data")
+        except TypeError:
+            tf.extractall(extract_dir)
+
+    top_level = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(top_level) != 1:
+        raise ScanError(
+            f"Unexpected tarball layout for {owner}/{repo}@{resolved_ref} "
+            f"(expected exactly one top-level directory, found {len(top_level)})."
+        )
+    tarball_path.unlink(missing_ok=True)
+    return top_level[0], resolved_ref, sha
+
+
+# --------------------------------------------------------------------------
+# Repository indexing: file content cache + manifest dependency extraction
+# --------------------------------------------------------------------------
+
+class RepoIndex:
+    """
+    Reads every eligible text file under one or more repo roots into memory
+    once, and exposes regex scanning + basename/dir lookups + dependency
+    lists over that cache. "eligible" = not in a skip-dir, not a binary
+    extension, under the size cap.
+    """
+
+    def __init__(self, max_file_size_kb: int = DEFAULT_MAX_FILE_SIZE_KB,
+                 max_total_files: int = DEFAULT_MAX_TOTAL_FILES):
+        self.max_file_size_bytes = max_file_size_kb * 1024
+        self.max_total_files = max_total_files
+        self._roots: Dict[str, Path] = {}          # repo_tag -> root path
+        self._files: Dict[str, List[str]] = {}       # repo_tag -> list of relpaths (posix)
+        self._contents: Dict[Tuple[str, str], str] = {}  # (repo_tag, relpath) -> text
+        self.dependencies: List[Dependency] = []
+        self.scanned_file_count = 0
+        self.truncated = False
+        # Files skipped for exceeding --max-file-size-kb. Tracked and reported
+        # because a silently skipped oversized SecurityConfig or pom.xml is a
+        # false-negative source the operator must be able to see.
+        self.oversized_skipped: List[str] = []
+
+    def add_root(self, repo_tag: str, root: Path) -> None:
+        self._roots[repo_tag] = root
+        self._files[repo_tag] = []
+        # The cap is applied per repository root, matching the CLI help text.
+        indexed_in_this_root = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(".git")]
+            for fname in filenames:
+                if indexed_in_this_root >= self.max_total_files:
+                    self.truncated = True
+                    break
+                fpath = Path(dirpath) / fname
+                relpath = fpath.relative_to(root).as_posix()
+                ext = fpath.suffix.lower()
+                if ext in BINARY_SKIP_EXTENSIONS or ext in DOC_SKIP_EXTENSIONS:
+                    continue
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    continue
+                if size == 0:
+                    continue
+                if size > self.max_file_size_bytes:
+                    self.oversized_skipped.append(f"{repo_tag}:{relpath}")
+                    continue
+                text = self._read_text(fpath)
+                if text is None:
+                    continue
+                self._files[repo_tag].append(relpath)
+                self._contents[(repo_tag, relpath)] = text
+                self.scanned_file_count += 1
+                indexed_in_this_root += 1
+                self._maybe_parse_manifest(repo_tag, relpath, text)
+            if indexed_in_this_root >= self.max_total_files:
+                self.truncated = True
+                break
+
+    def content(self, repo_tag: str, relpath: str) -> str:
+        """Public accessor for indexed file content."""
+        return self._contents.get((repo_tag, relpath), "")
+
+    @staticmethod
+    def _read_text(path: Path) -> Optional[str]:
+        """
+        Reads a file as text, or returns None if it is not text.
+
+        An extension denylist alone is insufficient: latin-1 decodes *any*
+        byte sequence successfully, so an unlisted binary extension (.dat,
+        .pack, proprietary formats) would be decoded into garbage and then
+        regex-scanned, producing spurious signal hits. A NUL byte in the
+        first block is the standard, cheap binary heuristic.
+        """
+        try:
+            with open(path, "rb") as f:
+                head = f.read(8192)
+        except OSError:
+            return None
+        if b"\x00" in head:
+            return None
+        for enc in ("utf-8", "latin-1"):
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    return f.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+        return None
+
+    # -- lookups -----------------------------------------------------------
+
+    def repo_tags(self) -> List[str]:
+        return list(self._roots.keys())
+
+    def relpaths(self, repo_tag: Optional[str] = None) -> List[Tuple[str, str]]:
+        """Returns list of (repo_tag, relpath) across the requested scope."""
+        tags = [repo_tag] if repo_tag else self.repo_tags()
+        out = []
+        for t in tags:
+            for rp in self._files.get(t, []):
+                out.append((t, rp))
+        return out
+
+    def has_basename(self, basename: str, repo_tag: Optional[str] = None) -> List[Hit]:
+        hits = []
+        for t, rp in self.relpaths(repo_tag):
+            if Path(rp).name == basename:
+                hits.append(Hit(t, rp, 0, "", f"file present: {basename}"))
+        return hits
+
+    def files_with_ext(self, ext: str, repo_tag: Optional[str] = None) -> List[Tuple[str, str]]:
+        ext = ext.lower()
+        return [(t, rp) for t, rp in self.relpaths(repo_tag) if rp.lower().endswith(ext)]
+
+    def scan(
+        self, patterns: Sequence[Tuple[str, str]], repo_tag: Optional[str] = None,
+        extensions: Optional[Sequence[str]] = None, name_filter_substrings: Optional[Sequence[str]] = None,
+        max_hits: int = 25, exclude_test_paths: bool = False,
+    ) -> List[Hit]:
+        """
+        patterns: list of (regex_str, signal_description)
+        extensions: if given, only scan files whose suffix is in this list
+        name_filter_substrings: if given, only scan files whose basename contains one of these
+        exclude_test_paths: if True, skip files under conventional test directories/naming
+            (see TEST_PATH_PATTERN). Used by risk-scoring detectors only — see module note.
+        """
+        compiled = [(re.compile(p), desc) for p, desc in patterns]
+        hits: List[Hit] = []
+        for t, rp in self.relpaths(repo_tag):
+            if exclude_test_paths and is_test_path(rp):
+                continue
+            if extensions is not None and Path(rp).suffix.lower() not in extensions:
+                continue
+            if name_filter_substrings is not None:
+                base = Path(rp).name
+                if not any(s in base for s in name_filter_substrings):
+                    continue
+            text = self._contents.get((t, rp))
+            if text is None:
+                continue
+            for regex, desc in compiled:
+                m = regex.search(text)
+                if m:
+                    line_no = text.count("\n", 0, m.start()) + 1
+                    line_text = text.splitlines()[line_no - 1].strip() if line_no <= len(text.splitlines()) else m.group(0)
+                    hits.append(Hit(t, rp, line_no, line_text[:220], desc))
+                    if len(hits) >= max_hits:
+                        return hits
+        return hits
+
+    # -- manifest dependency extraction -------------------------------------
+
+    def _maybe_parse_manifest(self, repo_tag: str, relpath: str, text: str) -> None:
+        base = Path(relpath).name
+        try:
+            if base == "pom.xml":
+                self.dependencies.extend(self._parse_pom(repo_tag, relpath, text))
+            elif base == "package.json":
+                self.dependencies.extend(self._parse_package_json(repo_tag, relpath, text))
+            elif base in ("build.gradle", "build.gradle.kts"):
+                self.dependencies.extend(self._parse_build_gradle(repo_tag, relpath, text))
+            elif base == "requirements.txt":
+                self.dependencies.extend(self._parse_requirements_txt(repo_tag, relpath, text))
+            elif base == "go.mod":
+                self.dependencies.extend(self._parse_go_mod(repo_tag, relpath, text))
+            elif base.endswith(".csproj"):
+                self.dependencies.extend(self._parse_csproj(repo_tag, relpath, text))
+        except Exception:
+            # A malformed manifest must not abort the whole scan; it simply
+            # contributes zero dependency evidence from that one file.
+            pass
+
+    @staticmethod
+    def _parse_pom(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        import xml.etree.ElementTree as ET
+        deps = []
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return deps
+        for dep in root.iter():
+            if dep.tag.endswith("}dependency") or dep.tag == "dependency":
+                gid, aid = None, None
+                for child in dep:
+                    local = child.tag.split("}")[-1]
+                    if local == "groupId":
+                        gid = (child.text or "").strip()
+                    elif local == "artifactId":
+                        aid = (child.text or "").strip()
+                if gid and aid:
+                    deps.append(Dependency(repo_tag, relpath, f"{gid}:{aid}", gid))
+        return deps
+
+    @staticmethod
+    def _parse_package_json(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        deps = []
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return deps
+        for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            for name in (data.get(key) or {}).keys():
+                deps.append(Dependency(repo_tag, relpath, name, name))
+        return deps
+
+    @staticmethod
+    def _parse_build_gradle(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        deps = []
+        # Covers: implementation("group:artifact:version") / 'group:artifact:version'
+        for m in re.finditer(
+            r"""(?:implementation|api|compile|runtimeOnly|testImplementation|compileOnly|annotationProcessor)"""
+            r"""\s*[\(\s]\s*['"]([\w.\-]+):([\w.\-]+):[\w.\-\+]+['"]""",
+            text,
+        ):
+            gid, aid = m.group(1), m.group(2)
+            deps.append(Dependency(repo_tag, relpath, f"{gid}:{aid}", gid))
+        # Covers: implementation group: 'g', name: 'n', version: 'v'
+        for m in re.finditer(
+            r"""group:\s*['"]([\w.\-]+)['"]\s*,\s*name:\s*['"]([\w.\-]+)['"]""",
+            text,
+        ):
+            gid, aid = m.group(1), m.group(2)
+            deps.append(Dependency(repo_tag, relpath, f"{gid}:{aid}", gid))
+        return deps
+
+    @staticmethod
+    def _parse_requirements_txt(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        deps = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("-"):
+                continue
+            name = re.split(r"[=<>!~;\[]", line)[0].strip()
+            if name:
+                deps.append(Dependency(repo_tag, relpath, name, name))
+        return deps
+
+    @staticmethod
+    def _parse_go_mod(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        deps = []
+        for m in re.finditer(r"^\s*([\w.\-/]+)\s+v[\w.\-+]+", text, re.MULTILINE):
+            mod = m.group(1)
+            if mod in ("go", "module"):
+                continue
+            deps.append(Dependency(repo_tag, relpath, mod, mod))
+        return deps
+
+    @staticmethod
+    def _parse_csproj(repo_tag: str, relpath: str, text: str) -> List[Dependency]:
+        deps = []
+        for m in re.finditer(r'<PackageReference\s+Include="([^"]+)"', text):
+            name = m.group(1)
+            deps.append(Dependency(repo_tag, relpath, name, name))
+        return deps
+
+
+# --------------------------------------------------------------------------
+# Evidence text templating
+# --------------------------------------------------------------------------
+
+def _cite_list(hits: Sequence[Hit], limit: int = 3) -> str:
+    seen, out = set(), []
+    for h in hits:
+        c = h.cite()
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+        if len(out) >= limit:
+            break
+    return ", ".join(out)
+
+
+def count_sentences(text: str) -> int:
+    """
+    Counts sentences for Output Rules enforcement (detected:true => 2-3
+    sentences; detected:false => 1 sentence). A boundary is a terminal
+    punctuation mark followed by whitespace and a capital letter, which
+    avoids miscounting file paths ('Owner.java:151'), version numbers, and
+    abbreviations ('e.g. ssn').
+    """
+    if not text.strip():
+        return 0
+    return len(re.findall(r"[.!?]\s+[A-Z]", text)) + 1
+
+
+def true_evidence(what_found: str, hits: Sequence[Hit], confirms: str, context: str = "") -> str:
+    """
+    Evidence string for detected=true. Per Output Rules this must be 2-3
+    sentences: (1) what was found and where, (2) what it confirms, and
+    optionally (3) security-relevant context.
+
+    Citations are embedded parenthetically inside sentence 1 rather than
+    emitted as a separate 'Found at ...' sentence, which would push every
+    evidence string to 3-4 sentences and violate the rule.
+    """
+    where = _cite_list(hits)
+    stem = what_found.strip().rstrip(".")
+    s1 = f"{stem} ({where})." if where else f"{stem}."
+    s2 = f"This confirms {confirms.strip().rstrip('.')}."
+    parts = [s1, s2]
+    if context:
+        ctx = context.strip().rstrip(".")
+        # Force a capitalized opening so the sentence counter and the reader
+        # both see a clean boundary.
+        ctx = ctx[0].upper() + ctx[1:] if ctx else ctx
+        parts.append(ctx + ".")
+    return " ".join(parts)
+
+
+def false_evidence(scanned_desc: str) -> str:
+    """Exactly 1 sentence for detected=false, per Output Rules."""
+    return (f"Scanned for {scanned_desc.strip().rstrip('.')} — no matching signals were "
+            "found in the scanned repository content.")
+
+
+# --------------------------------------------------------------------------
+# Section 1 — Application Type detectors
+# --------------------------------------------------------------------------
+
+FALSE_POSITIVE_SUFFIXES = (
+    "Log", "Format", "Codec", "Test", "Tests", "Mock", "Stub", "Util",
+    "Utils", "Config", "Configuration", "Exception", "Formatter",
+)
+
+
+def _class_name_hits(idx: RepoIndex, tokens: Sequence[str], repo_tag: Optional[str] = None,
+                      exclude_test_paths: bool = False) -> List[Hit]:
+    """
+    Filename-based class-name signal match (Java/C# convention: filename ==
+    class name).
+
+    Two guards suppress the false positives a bare substring match produces,
+    which matter because these tokens drive the Tier 1 (High Risk) decision:
+
+    1. camelCase-continuation guard: the token must not be immediately
+       followed by a lowercase letter. Without this, 'Transactional*'
+       (standard Spring naming) matches 'Transaction', and 'Wireless*'
+       matches 'Wire' — escalating ordinary components to Tier 1.
+    2. Suffix denylist: names like 'TransactionLog' or 'WireFormat' describe
+       logging/serialization concerns, not payment processing.
+    """
+    hits = []
+    for t, rp in idx.relpaths(repo_tag):
+        if exclude_test_paths and is_test_path(rp):
+            continue
+        if Path(rp).suffix.lower() not in (".java", ".kt", ".cs", ".ts", ".tsx", ".py", ".go"):
+            continue
+        base = Path(rp).stem
+        for token in tokens:
+            pos = base.find(token)
+            if pos < 0:
+                continue
+            tail = base[pos + len(token):]
+            # camelCase continuation => the token is part of a longer word.
+            if tail and tail[0].islower():
+                continue
+            if any(base.endswith(token + suf) for suf in FALSE_POSITIVE_SUFFIXES):
+                continue
+            hits.append(Hit(t, rp, 0, base, f"class/file name contains '{token}'"))
+            break
+    return hits
+
+
+def detect_web_application(idx: RepoIndex) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"@RestController\b", "@RestController annotation"),
+        (r"@Controller\b", "@Controller annotation"),
+        (r"@SpringBootApplication\b", "@SpringBootApplication annotation"),
+        (r"@app\.route\s*\(", "Flask @app.route"),
+        (r"\burlpatterns\s*=", "Django urlpatterns"),
+        (r"\bapp\.(get|post|put|delete|patch)\s*\(", "Express/Fastify route handler"),
+    ], extensions=[".java", ".kt", ".py", ".js", ".ts"])
+
+    web_dep_names = {"react", "@angular/core", "vue", "next", "express", "fastify", "flask", "django"}
+    dep_hits = [Hit(d.repo, d.manifest, 0, d.coordinate, "web framework dependency")
+                for d in idx.dependencies
+                if d.raw_name in web_dep_names or d.coordinate.endswith(":spring-boot-starter-web")]
+
+    # .tsx/.html component files are a Section 1 signal in their own right.
+    # Converted to Hit objects here — passing raw (repo, path) tuples into the
+    # evidence templater would crash on citation rendering.
+    component_file_hits = [
+        Hit(t, rp, 0, "", "front-end component file")
+        for t, rp in (idx.files_with_ext(".tsx") + idx.files_with_ext(".html"))
+    ]
+
+    # Next.js routing directories only count when Next.js is actually a declared
+    # dependency; a bare folder named "app" or "pages" is far too common to treat
+    # as a framework signal on its own.
+    has_next = any(d.raw_name == "next" for d in idx.dependencies)
+    nextjs_hits: List[Hit] = []
+    if has_next:
+        for t, rp in idx.relpaths():
+            top = rp.split("/")[0]
+            if top in ("pages", "app") or rp.startswith("src/pages/") or rp.startswith("src/app/"):
+                nextjs_hits.append(Hit(t, rp, 0, "", "Next.js routing directory"))
+                break
+
+    all_hits = hits + dep_hits + nextjs_hits + component_file_hits
+    if all_hits:
+        extra = []
+        if dep_hits:
+            extra.append("a web framework dependency is declared")
+        if component_file_hits:
+            extra.append(f"{len(component_file_hits)} .tsx/.html component file(s) are present")
+        if nextjs_hits:
+            extra.append("a Next.js routing directory is present")
+        context = "; ".join(extra) if extra else ""
+        return True, true_evidence(
+            "A web server/controller annotation or front-end framework signal was found",
+            all_hits, "this is a web application, service, or web UI", context)
+    return False, false_evidence(
+        "@RestController/@Controller/@SpringBootApplication, Flask/Django routing, "
+        "Express/Fastify handlers, React/Angular/Vue/Next.js dependencies, and .tsx/.html "
+        "component files")
+
+
+def detect_mobile_app(idx: RepoIndex) -> Tuple[bool, str]:
+    manifest_hits = idx.has_basename("AndroidManifest.xml")
+    podfile_hits = idx.has_basename("Podfile")
+    xcodeproj_hits = [Hit(t, rp, 0, "", "xcodeproj present")
+                       for t, rp in idx.relpaths() if rp.endswith(".xcodeproj")]
+    rn_dep = [d for d in idx.dependencies if d.raw_name == "react-native"]
+    android_gradle = idx.scan([(r"com\.android\.application", "com.android.application Gradle plugin")],
+                               name_filter_substrings=["build.gradle"])
+    flutter_hits = idx.scan([(r"flutter\s*:", "flutter dependency in pubspec.yaml")],
+                             extensions=[".yaml", ".yml"], name_filter_substrings=["pubspec"])
+    all_hits = manifest_hits + podfile_hits + xcodeproj_hits + android_gradle + flutter_hits
+    if rn_dep:
+        all_hits = all_hits + [Hit(d.repo, d.manifest, 0, d.coordinate, "react-native dependency") for d in rn_dep]
+    if all_hits:
+        return True, true_evidence(
+            "A mobile-platform project marker was found — AndroidManifest.xml, a "
+            "com.android.application Gradle plugin, a Podfile/.xcodeproj, a react-native "
+            "dependency, or a Flutter pubspec",
+            all_hits, "this repository contains a native or cross-platform mobile app")
+    return False, false_evidence(
+        "AndroidManifest.xml, com.android.application in build.gradle, Podfile, *.xcodeproj, "
+        "react-native in package.json, and a Flutter pubspec.yaml")
+
+
+def detect_stand_alone(idx: RepoIndex, has_web_app: bool) -> Tuple[bool, str]:
+    if has_web_app:
+        return False, ("The application was classified as a web application/service "
+                        "(spring-boot-starter-web or an equivalent web framework dependency "
+                        "is present), so it is not a standalone executable.")
+    java_main = idx.scan([(r"public\s+static\s+void\s+main\s*\(\s*String", "Java main() entrypoint")],
+                          extensions=[".java", ".kt"])
+    py_main = idx.scan([(r"if\s+__name__\s*==\s*['\"]__main__['\"]", "Python __main__ entrypoint")],
+                        extensions=[".py"])
+    has_py_web_import = idx.scan([(r"^\s*(from|import)\s+(flask|django|fastapi)", "Python web framework import")],
+                                  extensions=[".py"])
+    csproj_exe = idx.scan([(r"<OutputType>Exe</OutputType>", "csproj OutputType=Exe")], extensions=[".csproj"])
+    aspnet_dep = [d for d in idx.dependencies if "Microsoft.AspNetCore" in d.raw_name]
+    hits = []
+    if java_main:
+        hits += java_main
+    if py_main and not has_py_web_import:
+        hits += py_main
+    if csproj_exe and not aspnet_dep:
+        hits += csproj_exe
+    if hits:
+        return True, true_evidence(
+            "A standalone process entrypoint (Java main(), Python __main__ guard with no "
+            "web-framework import, or a .csproj with OutputType=Exe and no ASP.NET Core "
+            "reference) was found.",
+            hits, "this component runs as a standalone executable rather than a hosted service")
+    return False, false_evidence(
+        "a Java/Kotlin main() with no spring-boot-starter-web, a .csproj OutputType=Exe "
+        "with no Microsoft.AspNetCore reference, or a Python __main__ guard with no "
+        "Flask/Django/FastAPI import")
+
+
+def detect_containerization(idx: RepoIndex) -> Tuple[bool, str]:
+    dockerfile = idx.has_basename("Dockerfile")
+    compose = idx.has_basename("docker-compose.yml") + idx.has_basename("docker-compose.yaml")
+    chart = idx.has_basename("Chart.yaml")
+    values = idx.has_basename("values.yaml", repo_tag="cd")
+    k8s = idx.scan([
+        (r"kind:\s*(Deployment|StatefulSet|DaemonSet|Service)\b", "Kubernetes manifest kind"),
+        (r"kind:\s*DeploymentConfig\b", "OpenShift DeploymentConfig"),
+    ], extensions=[".yaml", ".yml"])
+    hits = dockerfile + compose + chart + values + k8s
+    if hits:
+        detail = []
+        if dockerfile:
+            detail.append("a Dockerfile in the source repo")
+        if chart or values:
+            detail.append("a Helm chart" + (" in the CD repo" if values else ""))
+        if k8s:
+            detail.append("Kubernetes/OpenShift manifests")
+        return True, true_evidence(
+            "Containerization/deployment tooling was found (" + ", ".join(detail) + ").",
+            hits, "the application is containerized and deployed via Kubernetes/OpenShift/Helm")
+    return False, false_evidence(
+        "a Dockerfile, docker-compose file, Helm Chart.yaml/values.yaml (including in the "
+        "CD repository if supplied), and Kubernetes/OpenShift manifest 'kind:' declarations")
+
+
+def detect_consumes_apis(idx: RepoIndex) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"\bRestTemplate\b", "RestTemplate"),
+        (r"\bWebClient\b", "WebClient"),
+        (r"@FeignClient\b", "@FeignClient"),
+        (r"\bOpenFeign\b", "OpenFeign"),
+        (r"\baxios\b", "axios usage"),
+        (r"\bfetch\s*\(\s*['\"`]https?", "fetch() to an HTTP(S) URL"),
+        (r"\bHttpClient\b", "HttpClient"),
+        (r"requests\.(get|post|put|delete|patch)\s*\(", "python requests.* call"),
+        (r"\bHttpURLConnection\b", "HttpURLConnection"),
+    ], extensions=[".java", ".kt", ".py", ".js", ".ts", ".tsx", ".cs"])
+    grpc_stub_hits = [Hit(t, rp, 0, "", "gRPC generated stub filename")
+                       for t, rp in idx.relpaths()
+                       if rp.endswith("Stub.java") or rp.endswith("Grpc.java") or rp.endswith(".pb.go")
+                       or "_pb2_grpc.py" in rp]
+    openapi_client_hits = idx.scan([
+        (r"@javax\.annotation\.Generated\s*\([^)]*openapi", "generated OpenAPI client class"),
+        (r"(openapi|swagger)[-_]?generator", "OpenAPI/Swagger generator marker"),
+        (r"\bApiClient\b", "generated ApiClient class"),
+    ], extensions=[".java", ".kt", ".ts", ".py", ".cs"])
+    all_hits = hits + grpc_stub_hits + openapi_client_hits
+    if all_hits:
+        return True, true_evidence(
+            "Outbound HTTP/RPC client usage was found — RestTemplate/WebClient/@FeignClient/"
+            "axios/fetch/HttpClient/requests, a generated gRPC stub, or a generated OpenAPI "
+            "client",
+            all_hits, "the application consumes one or more downstream APIs")
+    return False, false_evidence(
+        "RestTemplate, WebClient, @FeignClient, axios, fetch(), HttpClient, python "
+        "requests.*, HttpURLConnection, generated gRPC stub filenames, and generated "
+        "OpenAPI client classes")
+
+
+def detect_script_batch_shell(idx: RepoIndex, has_web_app: bool) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"@EnableBatchProcessing\b", "@EnableBatchProcessing"),
+        (r"@Scheduled\b", "@Scheduled"),
+        (r"\bJobLauncher\b", "JobLauncher (Spring Batch)"),
+        (r"\bItemReader\b", "ItemReader (Spring Batch)"),
+        (r"\bItemWriter\b", "ItemWriter (Spring Batch)"),
+        (r"\bQuartz\b", "Quartz scheduler"),
+        (r"\bCronTrigger\b", "CronTrigger"),
+    ], extensions=[".java", ".kt", ".xml"])
+    sh_files = idx.files_with_ext(".sh") + idx.files_with_ext(".bash")
+    jil_hits = idx.scan([(r"insert_job:|job_type:\s*(CMD|BOX)", "AutoSys JIL job definition")],
+                         extensions=[".jil"]) + [
+        Hit(t, rp, 0, "", "AutoSys JIL file") for t, rp in idx.files_with_ext(".jil")
+    ]
+    all_hits = hits + jil_hits
+    # .sh/.bash files alone are only treated as a positive signal when the
+    # component was NOT already classified as a web application and shell
+    # scripts make up a majority of the (small) set of scanned source files —
+    # this avoids flagging every repo that merely ships a build/deploy helper
+    # script as a "script/batch/shell" application.
+    if not has_web_app and sh_files:
+        code_like = [rp for _, rp in idx.relpaths()
+                     if Path(rp).suffix.lower() in (".sh", ".bash", ".py", ".java", ".kt", ".js", ".ts", ".go", ".rb")]
+        if code_like and (len(sh_files) / max(1, len(code_like))) > 0.5:
+            all_hits = all_hits + [Hit(t, rp, 0, "", "shell script as majority file type") for t, rp in sh_files[:3]]
+    if all_hits:
+        return True, true_evidence(
+            "Spring Batch/Quartz scheduling constructs, an AutoSys JIL definition, or a "
+            "shell-script-majority file layout were found.",
+            all_hits, "this component operates as a batch/scheduled/shell-script application")
+    return False, false_evidence(
+        "@EnableBatchProcessing, @Scheduled, JobLauncher/ItemReader/ItemWriter, Quartz/"
+        "CronTrigger, AutoSys .jil files, and a shell-script-majority file layout")
+
+
+def detect_mainframe(idx: RepoIndex) -> Tuple[bool, str]:
+    exts = [".cbl", ".cob", ".cpy", ".jcl", ".asm"]
+    hits = []
+    for ext in exts:
+        for t, rp in idx.files_with_ext(ext):
+            hits.append(Hit(t, rp, 0, "", f"{ext} file present"))
+    endevor_hits = idx.scan([(r"\bENDEVOR\b", "Endevor metadata reference")])
+    all_hits = hits + endevor_hits
+    if all_hits:
+        return True, true_evidence(
+            "Mainframe source artifacts (.cbl/.cob/.cpy/.jcl/.asm) or Endevor metadata were found.",
+            all_hits, "this component includes mainframe/COBOL components")
+    return False, false_evidence(
+        ".cbl, .cob, .cpy (COBOL), .jcl (JCL), .asm (Assembler) file extensions and Endevor metadata")
+
+
+# --------------------------------------------------------------------------
+# Section 2 — Functional Attribute detectors
+# --------------------------------------------------------------------------
+
+PII_FIELD_TOKENS = ("ssn", "SSN", "dateOfBirth", "date_of_birth", "taxId", "tax_id",
+                     "accountNumber", "account_number", "cardNumber", "card_number", "pan", "PAN")
+
+
+def detect_external_components(idx: RepoIndex, internal_prefixes: Sequence[str]) -> Tuple[bool, str]:
+    if not idx.dependencies:
+        return False, ("No dependency manifest (pom.xml, package.json, build.gradle, "
+                        "requirements.txt, go.mod, or *.csproj) with declared dependencies "
+                        "was found in the scanned content.")
+    external = []
+    for d in idx.dependencies:
+        if internal_prefixes and any(d.raw_name.startswith(p) or d.coordinate.startswith(p) for p in internal_prefixes):
+            continue
+        external.append(d)
+    if external:
+        sample = ", ".join(sorted({d.coordinate for d in external})[:5])
+        hits = [Hit(d.repo, d.manifest, 0, d.coordinate, "external dependency") for d in external[:5]]
+        prefix_note = (f" (dependencies matching internal prefixes {list(internal_prefixes)} were excluded)"
+                        if internal_prefixes else " (no internal-prefix exclusion list was supplied, so all "
+                        "declared dependencies were treated as external)")
+        return True, true_evidence(
+            f"{len(external)} external dependency declaration(s) were found across the "
+            f"scanned manifests, including: {sample}.",
+            hits, "the application includes external components/libraries", prefix_note)
+    return False, false_evidence(
+        f"dependencies not matching the supplied internal-prefix list {list(internal_prefixes)}")
+
+
+def detect_file_uploads(idx: RepoIndex) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"\bMultipartFile\b", "MultipartFile"),
+        (r"@RequestPart\b", "@RequestPart"),
+        (r"@RequestParam\s*\(\s*[\"']file[\"']", '@RequestParam("file")'),
+        (r"multipart/form-data", "multipart/form-data content type"),
+        (r"\bmulter\b", "multer (Node.js)"),
+        (r"\bbusboy\b", "busboy (Node.js)"),
+        (r"\bformidable\b", "formidable (Node.js)"),
+        (r"request\.FILES\b", "request.FILES (Django)"),
+        (r"\bIFormFile\b", "IFormFile (.NET)"),
+        (r"[\"'](image/|application/pdf)[\"']", "file-type MIME check in validation"),
+    ], extensions=[".java", ".kt", ".py", ".js", ".ts", ".tsx", ".cs"])
+    dep_hits = [Hit(d.repo, d.manifest, 0, d.coordinate, "upload-handling dependency")
+                for d in idx.dependencies if d.raw_name in ("multer", "busboy", "formidable")]
+    all_hits = hits + dep_hits
+    if all_hits:
+        return True, true_evidence(
+            "A file-upload handling construct was found — MultipartFile, @RequestPart, "
+            "multipart/form-data handling, a MIME-type validation check, or a Node.js "
+            "upload middleware",
+            all_hits, "the application allows file uploads")
+    return False, false_evidence(
+        "MultipartFile, @RequestPart, @RequestParam(\"file\"), multipart/form-data content-"
+        "type handling, multer/busboy/formidable, request.FILES, IFormFile, and file-type "
+        "MIME checks in validation")
+
+
+def detect_secrets_sensitive_data(idx: RepoIndex) -> Tuple[bool, List[Hit], str]:
+    vault_hits = idx.scan([
+        (r"spring\.cloud\.vault", "spring.cloud.vault config"),
+        (r"vault\.hashicorp\.com", "vault.hashicorp.com annotation"),
+        (r"secretKeyRef", "K8s secretKeyRef"),
+    ])
+    value_secret_hits = idx.scan([
+        (r"@Value\s*\(\s*\"\$\{[^}]*(password|secret|credential)[^}]*\}\"", "@Value referencing password/secret/credential"),
+    ], extensions=[".java", ".kt"])
+    crypto_hits = idx.scan([
+        (r"\bCipher\b", "Cipher"), (r"\bKeyStore\b", "KeyStore"),
+        (r"\bSecretKey\b", "SecretKey"), (r"\bBCryptPasswordEncoder\b", "BCryptPasswordEncoder"),
+    ], extensions=[".java", ".kt", ".cs", ".py", ".js", ".ts"])
+    pii_hits = idx.scan(
+        [(r"\b(" + "|".join(re.escape(tok) for tok in PII_FIELD_TOKENS) + r")\b", "PII field identifier")],
+        extensions=[".java", ".kt", ".py", ".ts", ".tsx", ".js", ".cs"])
+    annot_hits = idx.scan([(r"@SensitiveData\b", "@SensitiveData"), (r"@PII\b", "@PII")],
+                           extensions=[".java", ".kt"])
+    all_hits = vault_hits + value_secret_hits + crypto_hits + pii_hits + annot_hits
+    if all_hits:
+        detail = []
+        if vault_hits:
+            detail.append("Vault/secretKeyRef configuration")
+        if crypto_hits:
+            detail.append("cryptographic/credential-handling APIs")
+        if pii_hits:
+            detail.append("PII-named fields (e.g. ssn, cardNumber, taxId)")
+        text = true_evidence(
+            "Secret-management configuration or sensitive-data field identifiers were found "
+            "(" + ", ".join(detail) + ").",
+            all_hits, "the application manages, uses, or owns secrets or sensitive data")
+        return True, all_hits, text
+    return False, [], false_evidence(
+        "spring.cloud.vault/vault.hashicorp.com config, K8s secretKeyRef, @Value secret/"
+        "password/credential references, Cipher/KeyStore/SecretKey/BCryptPasswordEncoder, "
+        "PII field identifiers, and @SensitiveData/@PII annotations")
+
+
+def detect_deserialization(idx: RepoIndex) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"ObjectMapper[\s\S]{0,200}?\.readValue\(", "ObjectMapper.readValue("),
+        (r"new\s+Gson\(\)\.fromJson\(", "Gson().fromJson("),
+        (r"@JsonDeserialize\b", "@JsonDeserialize"),
+        (r"@XmlRootElement\b", "@XmlRootElement (JAXB)"),
+        (r"json\.loads\(", "python json.loads("),
+        (r"pickle\.loads\(", "python pickle.loads("),
+        (r"yaml\.safe_load\(", "python yaml.safe_load("),
+        (r"\.parseFrom\(", "protobuf .parseFrom("),
+        (r"DocumentBuilder\.parse\(|\bSAXParser\b", "XML DocumentBuilder/SAXParser"),
+        (r"(implements|extends)\s+(JsonSerializer|JsonDeserializer)\b", "custom JsonSerializer/JsonDeserializer"),
+    ], extensions=[".java", ".kt", ".py", ".cs"])
+    if hits:
+        return True, true_evidence(
+            "A deserialization call was found — ObjectMapper.readValue, Gson.fromJson, "
+            "json.loads/pickle.loads/yaml.safe_load, protobuf parseFrom, a custom "
+            "JsonDeserializer, or an XML parser",
+            hits, "the application deserializes external data",
+            "deserialization of untrusted input is a standard threat-modeling focus area")
+    return False, false_evidence(
+        "ObjectMapper.readValue(, Gson().fromJson(, @JsonDeserialize, @XmlRootElement, custom "
+        "JsonSerializer/JsonDeserializer implementations, python json.loads/pickle.loads/"
+        "yaml.safe_load, protobuf .parseFrom(, and XML DocumentBuilder/SAXParser usage")
+
+
+def detect_http_protocol(idx: RepoIndex) -> Tuple[bool, str]:
+    hits = idx.scan([
+        (r"@RestController\b", "@RestController"),
+        (r"\bRestTemplate\b", "RestTemplate"),
+        (r"\bWebClient\b", "WebClient"),
+        (r"\bOkHttpClient\b", "OkHttpClient"),
+        (r"\bHttpClient\b", "HttpClient"),
+        (r"\baxios\b", "axios"),
+        (r"\bfetch\s*\(", "fetch("),
+        (r"^\s*(from|import)\s+requests\b", "python requests import"),
+        (r"\bHttpURLConnection\b", "HttpURLConnection"),
+        (r"@ServerEndpoint\b", "@ServerEndpoint (WebSocket)"),
+        (r"ws://|wss://", "WebSocket URI scheme"),
+        (r"\bgraphql\b", "GraphQL reference"),
+    ], extensions=[".java", ".kt", ".py", ".js", ".ts", ".tsx", ".cs"])
+    if hits:
+        return True, true_evidence(
+            "An HTTP-based client/server/protocol construct (REST controller, HTTP client "
+            "library, WebSocket endpoint, or GraphQL reference) was found.",
+            hits, "the application uses an HTTP-based protocol")
+    return False, false_evidence(
+        "REST controller annotations, RestTemplate/WebClient/OkHttpClient/HttpClient/axios/"
+        "fetch/requests, HttpURLConnection, WebSocket (@ServerEndpoint, ws://), and GraphQL references")
+
+
+# --------------------------------------------------------------------------
+# Section 3/4 — Security Tier and Application Classification
+# (cross-referenced: Tier 1 explicitly reuses the PAA signal set per spec)
+# --------------------------------------------------------------------------
+
+HEALTH_PATH_SUBSTRINGS = ("/health", "/actuator/health", "/actuator/info", "/ping", "/livez", "/readyz")
+
+
+def _paa_signals(idx: RepoIndex) -> Tuple[List[Hit], List[Hit]]:
+    """Returns (paa_positive_hits, non_paa_positive_hits). Test paths excluded — see module note."""
+    permit_all_raw = idx.scan([
+        (r"\.permitAll\s*\(\s*\)", "Spring Security permitAll()"),
+        (r"antMatchers\s*\([^)]*\)\s*\.\s*permitAll\s*\(", "antMatchers(...).permitAll()"),
+        (r"requestMatchers\s*\([^)]*\)\s*\.\s*permitAll\s*\(", "requestMatchers(...).permitAll()"),
+    ], extensions=[".java", ".kt"], max_hits=50, exclude_test_paths=True)
+    permit_all = [h for h in permit_all_raw if not any(s in h.snippet for s in HEALTH_PATH_SUBSTRINGS)]
+
+    resource_server_hits = idx.scan([
+        (r"resource[_-]?server[\s\S]{0,200}?introspection[\s\S]{0,200}?(public|anonymous)",
+         "resource_server with public token introspection"),
+        (r"introspection[_-]?endpoint[\s\S]{0,120}?(public|no-auth|anonymous)",
+         "public token introspection endpoint"),
+    ], exclude_test_paths=True)
+
+    ingress_no_auth = []
+    for t, rp in idx.relpaths():
+        if is_test_path(rp) or Path(rp).suffix.lower() not in (".yaml", ".yml"):
+            continue
+        text = idx.content(t, rp)
+        if re.search(r"kind:\s*Ingress\b", text) and "nginx.ingress.kubernetes.io/auth-url" not in text:
+            ingress_no_auth.append(Hit(t, rp, 0, "", "K8s Ingress with no auth-url annotation"))
+
+    route_no_auth = []
+    for t, rp in idx.relpaths():
+        if is_test_path(rp) or Path(rp).suffix.lower() not in (".yaml", ".yml"):
+            continue
+        text = idx.content(t, rp)
+        if re.search(r"kind:\s*Route\b", text) and re.search(r"tls:\s*\{\s*\}", text) \
+                and not re.search(r"oauth-proxy|auth-url|authenticat", text, re.IGNORECASE):
+            route_no_auth.append(Hit(t, rp, 0, "", "OCP Route with empty tls: {} and no auth middleware"))
+
+    cors_wildcard = idx.scan([
+        (r"Access-Control-Allow-Origin[\"']?\s*:\s*[\"']?\*", "CORS wildcard header"),
+        (r"@CrossOrigin\s*\(\s*origins\s*=\s*\"\*\"", "@CrossOrigin(origins=\"*\")"),
+        (r"origin\s*:\s*\[?[\"']\*[\"']", "CORS config origin: '*'"),
+    ], exclude_test_paths=True)
+    cors_wildcard = [h for h in cors_wildcard if not any(s in h.snippet for s in HEALTH_PATH_SUBSTRINGS)]
+
+    public_annot = idx.scan([
+        (r"@PublicEndpoint\b", "@PublicEndpoint annotation"),
+        (r"security:\s*\[\s*\]", "OpenAPI spec empty security: []"),
+    ], exclude_test_paths=True)
+
+    paa_hits = (permit_all + ingress_no_auth + route_no_auth + cors_wildcard
+                + public_annot + resource_server_hits)
+
+    non_paa_hits = idx.scan([
+        (r"\.authenticated\s*\(\s*\)", "Spring Security .authenticated()"),
+        (r"\.hasRole\s*\(", "Spring Security .hasRole()"),
+    ], extensions=[".java", ".kt"], exclude_test_paths=True)
+    non_paa_hits += idx.scan([
+        (r"\b[\w-]+\.(internal|corp|svc\.cluster\.local)\b", "internal-only DNS name"),
+    ], exclude_test_paths=True)
+    return paa_hits, non_paa_hits
+
+
+def decide_classification(
+    paa_hits: List[Hit], non_paa_hits: List[Hit]
+) -> Tuple[str, str, bool, str, str]:
+    """
+    Returns (selected_classification, evidence_text, resolved_directly,
+    group_confidence, notes).
+
+    resolved_directly feeds the overall Confidence Scoring table (direct
+    evidence vs. inference). group_confidence is the per-group value reported
+    in detection_summary: 'high' when the signals are unambiguous, 'medium'
+    when direct signals conflict (both public-access and auth-required signals
+    present, so PAA precedence was applied over a contested picture), and
+    'low' when the outcome is a default.
+    """
+    if paa_hits:
+        conflict = bool(non_paa_hits)
+        text = true_evidence(
+            "A public-access signal was found — an unauthenticated permitAll() route, an "
+            "Ingress with no auth-url annotation, an OCP Route with empty tls: {} and no auth "
+            "middleware, or a CORS wildcard on a non-health endpoint",
+            paa_hits,
+            "the application is classified Publicly Accessible (PAA), which takes precedence "
+            "over any authentication controls found elsewhere in the codebase")
+        if conflict:
+            notes = ("Authentication-required signals were also found (" +
+                      _cite_list(non_paa_hits, 2) + "); PAA was still selected because at least "
+                      "one endpoint or asset is reachable without authentication, per the 'PAA "
+                      "takes precedence' rule. Recommend security-engineer review to confirm scope.")
+            return "PAA", text, True, "medium", notes
+        return "PAA", text, True, "high", ""
+    if non_paa_hits:
+        text = true_evidence(
+            "Authentication-required patterns were found with no conflicting public-access "
+            "signal — Spring Security .authenticated()/.hasRole(), or internal-only DNS naming",
+            non_paa_hits, "the application is classified Non PAA Application")
+        return "Non PAA Application", text, True, "high", ""
+    text = ("No public-access signals (permitAll(), open Ingress/Route, CORS wildcard) and no "
+            "explicit authentication-required signals (.authenticated(), .hasRole(), internal-"
+            "only DNS) were found in the scanned content. Non PAA Application was applied as "
+            "the default classification rather than derived from direct code evidence.")
+    notes = ("Resolved by absence of signals, not direct evidence. This default must be "
+              "confirmed by a security engineer before submission.")
+    return "Non PAA Application", text, False, "low", notes
+
+
+def decide_tier(idx: RepoIndex, paa_hits: List[Hit]) -> Tuple[str, str, bool, str, str]:
+    """
+    Returns (selected_tier, evidence_text, resolved_directly, group_confidence, notes).
+    Highest-matching tier wins (Tier 1 overrides Tier 2; Tier 2 overrides Tier 3).
+
+    group_confidence is 'medium' when Tier 1 rests solely on the PAA
+    cross-reference (no payment or token-issuance signal of its own), since
+    that inference is weaker than a direct payment/token signal.
+    """
+    payment_hits = _class_name_hits(idx, ("Payment", "Transaction", "CardNumber", "PAN",
+                                           "AccountDebit", "Wire", "ACH"), exclude_test_paths=True)
+    token_issuance_hits = idx.scan([
+        (r"@EnableAuthorizationServer\b", "@EnableAuthorizationServer"),
+        (r"\bJwtTokenStore\b", "JwtTokenStore"),
+        (r"\bTokenEnhancer\b", "TokenEnhancer"),
+        (r"Jwts\s*\.\s*builder\s*\(", "Jwts.builder() JWT construction"),
+        (r"\.signWith\s*\(", "JWT .signWith() signing call"),
+        (r"\bSignatureAlgorithm\b", "SignatureAlgorithm (JWT signing)"),
+        (r"\bJwtEncoder\b", "JwtEncoder (Spring Security JWT issuance)"),
+    ], extensions=[".java", ".kt"], exclude_test_paths=True)
+
+    if payment_hits or token_issuance_hits or paa_hits:
+        reasons, cites = [], []
+        if payment_hits:
+            reasons.append("payment/financial class or file names")
+            cites += payment_hits
+        if token_issuance_hits:
+            reasons.append("authentication-token issuance constructs")
+            cites += token_issuance_hits
+        if paa_hits and not payment_hits and not token_issuance_hits:
+            reasons.append("an externally-reachable entry point with no authentication wall")
+            cites += paa_hits
+        text = true_evidence(
+            "Tier 1 (High Risk) signals were found in the codebase: " + "; ".join(reasons),
+            cites,
+            "the component meets the Tier 1 criteria, which override Tier 2 and Tier 3")
+        if not payment_hits and not token_issuance_hits:
+            notes = ("Tier 1 rests solely on the PAA cross-reference rule (unauthenticated "
+                      "public entry point implies Tier 1). No payment or token-issuance signals "
+                      "were found. Recommend security-engineer review to confirm data sensitivity.")
+            tier_conf = "medium"
+        else:
+            notes = ""
+            tier_conf = "high"
+        return "Tier 1", text, True, tier_conf, notes
+
+    # Tier 2 — PII, PCI-scoped fields, regulated-data references, secrets/vault usage.
+    pii_hits = idx.scan(
+        [(r"\b(ssn|SSN|dateOfBirth|date_of_birth|taxId|tax_id|email|phoneNumber|phone_number)\b",
+          "PII field identifier")],
+        extensions=[".java", ".kt", ".py", ".ts", ".tsx", ".cs"], exclude_test_paths=True)
+    name_pair_hits = idx.scan(
+        [(r"firstName[\s\S]{0,120}lastName|lastName[\s\S]{0,120}firstName", "firstName+lastName co-occurrence")],
+        extensions=[".java", ".kt", ".py", ".ts", ".tsx", ".cs"], exclude_test_paths=True)
+    regulated_hits = idx.scan([(r"\b(GDPR|CCPA|HIPAA)\b", "regulated-data reference")], exclude_test_paths=True)
+    pci_hits = idx.scan(
+        [(r"\b(cardNumber|cvv|pan|track1|track2)\b", "PCI-scoped field identifier")],
+        extensions=[".java", ".kt", ".py", ".ts", ".tsx", ".cs"], exclude_test_paths=True)
+    secrets_present, secrets_hits, _ = detect_secrets_sensitive_data(idx)
+    secrets_hits = [h for h in secrets_hits if not is_test_path(h.path)]
+    secrets_present = bool(secrets_hits)
+
+    tier2_hits = pii_hits + name_pair_hits + regulated_hits + pci_hits
+    if secrets_present:
+        tier2_hits = tier2_hits + secrets_hits
+
+    if tier2_hits:
+        reasons = []
+        if pii_hits or name_pair_hits:
+            reasons.append("PII field identifiers or first/last-name co-occurrence")
+        if regulated_hits:
+            reasons.append("regulated-data references (GDPR/CCPA/HIPAA)")
+        if pci_hits:
+            reasons.append("PCI-scoped field identifiers")
+        if secrets_present and not (pii_hits or name_pair_hits or regulated_hits or pci_hits):
+            reasons.append("secrets/vault usage")
+        text = true_evidence(
+            "Tier 2 (Medium Risk) signals were found in the codebase: " + "; ".join(reasons),
+            tier2_hits,
+            "the component handles sensitive data without meeting the Tier 1 payment, "
+            "token-issuance, or unauthenticated-public-entry-point criteria")
+        return "Tier 2", text, True, "high", ""
+
+    text = ("No Tier 1 or Tier 2 signals (payment/financial class names, authentication-token "
+            "issuance, unauthenticated public entry points, PII fields, regulated-data "
+            "references, PCI-scoped fields, or secrets/vault usage) were found in the scanned "
+            "content. Tier 3 (Low Risk) was applied as the default tier rather than derived "
+            "from direct code evidence.")
+    notes = ("Resolved by absence of signals, not direct evidence. This default must be "
+              "confirmed by a security engineer before submission.")
+    return "Tier 3", text, False, "low", notes
+
+
+# --------------------------------------------------------------------------
+# Confidence scoring — implements the Confidence Scoring table verbatim
+#
+#   high    | All four groups resolved with direct code evidence
+#           | (>=1 signal per detected attribute)
+#   medium  | 3 of 4 groups resolved with direct evidence; remaining inferred
+#   low     | >=2 groups resolved only by inference or absence of signals
+#           | (default tier/classification applied)
+#
+# "Direct" means the group's outcome was driven by at least one concrete
+# signal hit in scanned content. "Inferred" means the group fell back to a
+# default (Tier 3 by absence, Non PAA by absence) or produced no detections
+# at all. The four groups are: application_type, functional_attributes,
+# security_tier, application_classification.
+# --------------------------------------------------------------------------
+
+def overall_confidence_from_groups(direct_flags: Sequence[bool]) -> str:
+    if len(direct_flags) != 4:
+        raise ScanError(
+            f"Confidence scoring expects exactly 4 groups, received {len(direct_flags)}."
+        )
+    direct_count = sum(1 for f in direct_flags if f)
+    if direct_count == 4:
+        return "high"
+    if direct_count == 3:
+        return "medium"
+    return "low"
+
+
+def group_confidence(resolved_directly: bool, has_scannable_content: bool) -> str:
+    """Per-group confidence for detection_summary.*.confidence."""
+    if not has_scannable_content:
+        return "low"
+    return "high" if resolved_directly else "low"
+
+
+# --------------------------------------------------------------------------
+# JSON assembly
+# --------------------------------------------------------------------------
+
+def build_document(args: argparse.Namespace, idx: RepoIndex, source_url: str, head_sha: str) -> dict:
+    web_app, web_app_ev = detect_web_application(idx)
+    mobile, mobile_ev = detect_mobile_app(idx)
+    standalone, standalone_ev = detect_stand_alone(idx, has_web_app=web_app)
+    containerized, containerized_ev = detect_containerization(idx)
+    consumes_apis, consumes_apis_ev = detect_consumes_apis(idx)
+    script_batch, script_batch_ev = detect_script_batch_shell(idx, has_web_app=web_app)
+    mainframe, mainframe_ev = detect_mainframe(idx)
+
+    application_type = [
+        {"name": "web_application_service_or_web_ui", "detected": web_app, "evidence": web_app_ev},
+        {"name": "mobile_app", "detected": mobile, "evidence": mobile_ev},
+        {"name": "stand_alone", "detected": standalone, "evidence": standalone_ev},
+        {"name": "containerization_solution", "detected": containerized, "evidence": containerized_ev},
+        {"name": "consumes_apis", "detected": consumes_apis, "evidence": consumes_apis_ev},
+        {"name": "script_batch_shell", "detected": script_batch, "evidence": script_batch_ev},
+        {"name": "mainframe", "detected": mainframe, "evidence": mainframe_ev},
+    ]
+
+    ext_comp, ext_comp_ev = detect_external_components(idx, args.internal_package_prefixes)
+    uploads, uploads_ev = detect_file_uploads(idx)
+    secrets, _, secrets_ev = detect_secrets_sensitive_data(idx)
+    deserial, deserial_ev = detect_deserialization(idx)
+    http_proto, http_proto_ev = detect_http_protocol(idx)
+
+    functional_attributes = [
+        {"name": "includes_external_components_or_libraries", "detected": ext_comp, "evidence": ext_comp_ev},
+        {"name": "allows_file_uploads", "detected": uploads, "evidence": uploads_ev},
+        {"name": "manages_uses_or_owns_secrets_or_sensitive_data", "detected": secrets, "evidence": secrets_ev},
+        {"name": "application_deserializes_data", "detected": deserial, "evidence": deserial_ev},
+        {"name": "uses_http_based_protocol", "detected": http_proto, "evidence": http_proto_ev},
+    ]
+
+    paa_hits, non_paa_hits = _paa_signals(idx)
+    (selected_classification, classification_ev, classification_direct,
+     classification_conf, classification_notes) = decide_classification(paa_hits, non_paa_hits)
+    selected_tier, tier_ev, tier_direct, tier_conf, tier_notes = decide_tier(idx, paa_hits)
+
+    has_content = idx.scanned_file_count > 0
+
+    # A capability group counts as "resolved with direct code evidence" when at
+    # least one of its attributes was positively detected from a real signal.
+    # An all-false group was resolved by absence of signals, which the
+    # Confidence Scoring table treats as inference, not direct evidence.
+    app_type_direct = any(a["detected"] for a in application_type)
+    func_attr_direct = any(a["detected"] for a in functional_attributes)
+
+    app_type_conf = group_confidence(app_type_direct, has_content)
+    func_attr_conf = group_confidence(func_attr_direct, has_content)
+    if not has_content:
+        tier_conf = "low"
+        classification_conf = "low"
+
+    overall_confidence = overall_confidence_from_groups(
+        [app_type_direct and has_content, func_attr_direct and has_content,
+         tier_direct and has_content, classification_direct and has_content]
+    )
+
+    app_type_notes = "" if app_type_direct else (
+        "No Application Type attribute was positively detected; this group was resolved by "
+        "absence of signals and requires manual review.")
+    func_attr_notes = "" if func_attr_direct else (
+        "No Functional Attribute was positively detected; this group was resolved by absence "
+        "of signals and requires manual review.")
+    if idx.truncated:
+        trunc = (" The file index was truncated at the configured --max-total-files cap, so "
+                  "coverage may be incomplete.")
+        app_type_notes = (app_type_notes + trunc).strip()
+        func_attr_notes = (func_attr_notes + trunc).strip()
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    provenance = f"{source_url}/commit/{head_sha}"
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+
+    doc = {
+        "meta": {
+            "type": "Application Knowledge",
+            "title": f"SD Elements — {args.component}",
+            "description": "SD Elements application characteristics derived from source code",
+            "app_id": args.app_id,
+            "data_classification": args.data_classification,
+            "access_scope": args.access_scope,
+            "owner": args.owner,
+            "provenance": provenance,
+            "tags": tags,
+            "timestamp": now_iso,
+            "confidence": overall_confidence,
+            "generated_by": args.generated_by,
+        },
+        "application_type": application_type,
+        "functional_attributes": functional_attributes,
+        "security_tier": {
+            "selected_tier": selected_tier,
+            "evidence": tier_ev,
+        },
+        "application_classification": {
+            "selected_classification": selected_classification,
+            "evidence": classification_ev,
+        },
+        "detection_summary": {
+            "application_type": {
+                "values_detected": [a["name"] for a in application_type if a["detected"]],
+                "confidence": app_type_conf,
+                "notes": app_type_notes,
+            },
+            "functional_attributes": {
+                "values_detected": [a["name"] for a in functional_attributes if a["detected"]],
+                "confidence": func_attr_conf,
+                "notes": func_attr_notes,
+            },
+            "security_tier": {
+                "value": selected_tier,
+                "confidence": tier_conf,
+                "notes": tier_notes,
+            },
+            "classification": {
+                "value": selected_classification,
+                "confidence": classification_conf,
+                "notes": classification_notes,
+            },
+        },
+    }
+    return doc
+
+
+# --------------------------------------------------------------------------
+# Output schema validation — hard-fails rather than emitting a malformed file
+# --------------------------------------------------------------------------
+
+def validate_document(doc: dict) -> None:
+    errors = []
+
+    def req(cond: bool, msg: str):
+        if not cond:
+            errors.append(msg)
+
+    meta = doc.get("meta", {})
+    for key in ("type", "title", "description", "app_id", "data_classification", "access_scope",
+                "owner", "provenance", "tags", "timestamp", "confidence", "generated_by"):
+        req(key in meta, f"meta.{key} is missing")
+    req(meta.get("data_classification") in ("internal", "confidential", "restricted"),
+        "meta.data_classification must be one of internal|confidential|restricted")
+    req(meta.get("confidence") in ("high", "medium", "low"),
+        "meta.confidence must be one of high|medium|low")
+    req(isinstance(meta.get("tags"), list) and len(meta.get("tags", [])) > 0,
+        "meta.tags must be a non-empty list")
+
+    app_types = doc.get("application_type")
+    req(isinstance(app_types, list) and len(app_types) > 0, "application_type must be a non-empty list")
+    if isinstance(app_types, list):
+        names = [a.get("name") for a in app_types]
+        req("mainframe" in names, "application_type must include an item with name 'mainframe'")
+        req(any(a.get("detected") is True for a in app_types),
+            "Section 1 requires at least one application_type to be detected, but none matched. "
+            "This usually means the scan scope was wrong (check --source-subdir) or the stack is "
+            "not covered by the ruleset. Review manually rather than submitting this artifact.")
+
+    func_attrs = doc.get("functional_attributes")
+    req(isinstance(func_attrs, list) and len(func_attrs) > 0, "functional_attributes must be a non-empty list")
+
+    # Output Rules: detected must be boolean; evidence must be natural English with a
+    # citation; detected:true => 2-3 sentences; detected:false => 1 sentence.
+    for section_name, section in (("application_type", app_types), ("functional_attributes", func_attrs)):
+        if not isinstance(section, list):
+            continue
+        for a in section:
+            label = f"{section_name}[{a.get('name')}]"
+            detected = a.get("detected")
+            evidence = a.get("evidence")
+            req(isinstance(detected, bool), f"{label}.detected must be a boolean, not a string")
+            req(isinstance(evidence, str) and len(evidence.strip()) > 0,
+                f"{label}.evidence must be a non-empty string")
+            if isinstance(evidence, str) and evidence.strip():
+                n = count_sentences(evidence)
+                if detected is True:
+                    req(2 <= n <= 3,
+                        f"{label}.evidence must be 2-3 sentences for detected:true (found {n}): "
+                        f"{evidence[:120]}...")
+                    # Output Rules: evidence must name the specific file/class/config
+                    # where the signal was found. Citations are rendered as
+                    # "<repo>:<path>[:<line>]" by the evidence templater.
+                    req(re.search(r"\b(source|cd):[^\s,)]+", evidence) is not None,
+                        f"{label}.evidence for detected:true must cite a specific file/class "
+                        f"where the signal was found: {evidence[:120]}...")
+                elif detected is False:
+                    req(n == 1,
+                        f"{label}.evidence must be exactly 1 sentence for detected:false "
+                        f"(found {n}): {evidence[:120]}...")
+
+    # No placeholders anywhere in the emitted document.
+    rendered = json.dumps(doc)
+    for placeholder in ("{component}", "{AppId}", "{mnemonic}", "<ISO-8601>", "<internal |",
+                        "<high |", "TODO", "PLACEHOLDER", "{input_memory_store",
+                        "BOOTSTRAP_SOURCE_URL", "{HEAD_SHA}"):
+        req(placeholder not in rendered,
+            f"Unresolved placeholder '{placeholder}' found in the generated document")
+
+    tier = doc.get("security_tier", {})
+    req(tier.get("selected_tier") in ("Tier 1", "Tier 2", "Tier 3"),
+        "security_tier.selected_tier must be exactly one of 'Tier 1', 'Tier 2', 'Tier 3'")
+    req(isinstance(tier.get("evidence"), str) and len(tier.get("evidence", "")) > 0,
+        "security_tier.evidence must be a non-empty string")
+
+    cls = doc.get("application_classification", {})
+    req(cls.get("selected_classification") in ("PAA", "Non PAA Application"),
+        "application_classification.selected_classification must be exactly one of 'PAA', 'Non PAA Application'")
+    req(isinstance(cls.get("evidence"), str) and len(cls.get("evidence", "")) > 0,
+        "application_classification.evidence must be a non-empty string")
+
+    summary = doc.get("detection_summary", {})
+    for group in ("application_type", "functional_attributes", "security_tier", "classification"):
+        g = summary.get(group)
+        req(isinstance(g, dict), f"detection_summary.{group} is missing")
+        if isinstance(g, dict):
+            req(g.get("confidence") in ("high", "medium", "low"),
+                f"detection_summary.{group}.confidence must be one of high|medium|low")
+
+    if errors:
+        raise ScanError("Generated document failed schema validation:\n  - " + "\n  - ".join(errors))
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sd_elements_scan.py",
+        description="Deterministic (non-LLM) SD Elements characteristic scanner.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Security note: the GitHub token is NEVER accepted as a command-line "
+            "argument. Export it into the environment variable named by "
+            "--token-env (default GITHUB_TOKEN) before running this script.\n\n"
+            "Example:\n"
+            "  export GITHUB_TOKEN=ghp_xxx\n"
+            "  python3 sd_elements_scan.py --source-repo owner/repo --component repo "
+            "--app-id APP-1 --owner platform-eng --mnemonic app-bundle "
+            "--data-classification internal"
+        ),
+    )
+    p.add_argument("--source-repo", required=True,
+                    help="Source repository as 'owner/repo' or a full GitHub URL.")
+    p.add_argument("--source-ref", default=None,
+                    help="Branch, tag, or commit SHA to scan. Defaults to the repo's default branch.")
+    p.add_argument("--source-subdir", default=None,
+                    help="Restrict scanning to this subdirectory within the source repo (for monorepos).")
+    p.add_argument("--cd-repo", default=None,
+                    help="Optional CD/deployment repository as 'owner/repo' or a full GitHub URL.")
+    p.add_argument("--cd-ref", default=None,
+                    help="Branch, tag, or commit SHA for the CD repo. Defaults to its default branch.")
+
+    p.add_argument("--component", required=True, help="Component name (used in output filename and title).")
+    p.add_argument("--app-id", required=True, help="Application ID to record in meta.app_id.")
+    p.add_argument("--owner", required=True, help="Owning team/org value to record in meta.owner.")
+    p.add_argument("--mnemonic", required=True,
+                    help="Application bundle mnemonic used to construct the output path.")
+    p.add_argument("--data-classification", required=True, choices=["internal", "confidential", "restricted"],
+                    help="Data classification for meta.data_classification. Not derivable from code — must be supplied.")
+
+    p.add_argument("--access-scope", default="team", help="Value for meta.access_scope (default: team).")
+    p.add_argument("--tags", default="sd-elements,security-requirements,appsec",
+                    help="Comma-separated tags for meta.tags.")
+    p.add_argument("--generated-by", default="Deterministic-SD-Elements-Scanner",
+                    help="Value for meta.generated_by.")
+    p.add_argument("--internal-package-prefixes", default="",
+                    help="Comma-separated dependency-name/groupId prefixes to treat as internal "
+                         "(excluded from 'external components' detection). Empty by default — "
+                         "supply your own org's convention, e.g. 'com.yourorg,com.yourorg.internal'.")
+
+    p.add_argument("--output-dir", default=".", help="Root directory under which the bundle path is created.")
+    p.add_argument("--token-env", default="GITHUB_TOKEN",
+                    help="Name of the environment variable holding the GitHub token (default: GITHUB_TOKEN).")
+    p.add_argument("--github-api-base", default="https://api.github.com",
+                    help="GitHub API base URL (override for GitHub Enterprise, e.g. https://ghe.example.com/api/v3).")
+    p.add_argument("--github-web-base", default="https://github.com",
+                    help="GitHub web base URL used to build the provenance link.")
+    p.add_argument("--max-file-size-kb", type=int, default=DEFAULT_MAX_FILE_SIZE_KB,
+                    help=f"Skip files larger than this size in KB (default: {DEFAULT_MAX_FILE_SIZE_KB}).")
+    p.add_argument("--max-total-files", type=int, default=DEFAULT_MAX_TOTAL_FILES,
+                    help=f"Hard cap on number of files indexed per repo (default: {DEFAULT_MAX_TOTAL_FILES}).")
+    p.add_argument("--keep-temp", action="store_true",
+                    help="Do not delete the temporary extracted repository snapshot after the scan.")
+    p.add_argument("--print-only", action="store_true",
+                    help="Print the resulting JSON to stdout and do NOT write the output file.")
+    return p
+
+
+def internal_prefix_list(raw: str) -> List[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def resolve_output_path(output_dir: str, mnemonic: str, component: str) -> Path:
+    path = (Path(output_dir) / "application-bundle" / mnemonic / "components" / component
+            / "supplementary-sources" / f"{component}-sd-elements.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_token(token_env: str) -> str:
+    token = os.environ.get(token_env)
+    if not token:
+        raise ScanError(
+            f"Environment variable '{token_env}' is not set. Export a GitHub token into it "
+            f"before running this script, e.g.:\n\n  export {token_env}=ghp_your_token_here\n\n"
+            "The token is never accepted as a command-line argument."
+        )
+    return token
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    args.internal_package_prefixes = internal_prefix_list(args.internal_package_prefixes)
+
+    try:
+        if args.max_file_size_kb <= 0:
+            raise ScanError("--max-file-size-kb must be a positive integer.")
+        if args.max_total_files <= 0:
+            raise ScanError("--max-total-files must be a positive integer.")
+        if not args.component.strip():
+            raise ScanError("--component must not be empty.")
+        if not args.mnemonic.strip():
+            raise ScanError("--mnemonic must not be empty.")
+        if not [t for t in args.tags.split(",") if t.strip()]:
+            raise ScanError("--tags must contain at least one non-empty tag.")
+        token = get_token(args.token_env)
+        source_owner, source_repo = parse_owner_repo(args.source_repo)
+        source_web_url = f"{args.github_web_base}/{source_owner}/{source_repo}"
+
+        work_dir = Path(tempfile.mkdtemp(prefix="sd_elements_scan_"))
+        idx = RepoIndex(max_file_size_kb=args.max_file_size_kb, max_total_files=args.max_total_files)
+
+        print(f"[1/4] Fetching source repository {source_owner}/{source_repo} ...", file=sys.stderr)
+        src_root, src_ref, src_sha = fetch_repo_snapshot(
+            args.github_api_base, source_owner, source_repo,
+            args.source_ref, token, work_dir)
+        scan_root = src_root / args.source_subdir if args.source_subdir else src_root
+        if not scan_root.exists():
+            raise ScanError(f"--source-subdir '{args.source_subdir}' does not exist in the fetched snapshot.")
+        idx.add_root("source", scan_root)
+        print(f"      resolved ref={src_ref} sha={src_sha[:12]} files_indexed={len(idx._files.get('source', []))}",
+              file=sys.stderr)
+
+        if args.cd_repo:
+            cd_owner, cd_repo = parse_owner_repo(args.cd_repo)
+            print(f"[2/4] Fetching CD repository {cd_owner}/{cd_repo} ...", file=sys.stderr)
+            cd_root, cd_ref, cd_sha = fetch_repo_snapshot(
+                args.github_api_base, cd_owner, cd_repo,
+                args.cd_ref, token, work_dir)
+            idx.add_root("cd", cd_root)
+            print(f"      resolved ref={cd_ref} sha={cd_sha[:12]} files_indexed={len(idx._files.get('cd', []))}",
+                  file=sys.stderr)
+        else:
+            print("[2/4] No --cd-repo supplied; skipping CD repository scan.", file=sys.stderr)
+
+        if idx.truncated:
+            print(f"      WARNING: file index truncated at --max-total-files={args.max_total_files}; "
+                  "results may be incomplete for very large repositories.", file=sys.stderr)
+        if idx.oversized_skipped:
+            print(f"      WARNING: {len(idx.oversized_skipped)} file(s) exceeded "
+                  f"--max-file-size-kb={args.max_file_size_kb} and were not scanned; "
+                  "signals inside them will not appear in the artifact. First few: "
+                  + ", ".join(idx.oversized_skipped[:5]), file=sys.stderr)
+
+        print("[3/4] Running deterministic signal detection ...", file=sys.stderr)
+        doc = build_document(args, idx, source_web_url, src_sha)
+
+        print("[4/4] Validating against output schema ...", file=sys.stderr)
+        validate_document(doc)
+
+        rendered = json.dumps(doc, indent=2, ensure_ascii=False)
+
+        if args.print_only:
+            print(rendered)
+        else:
+            out_path = resolve_output_path(args.output_dir, args.mnemonic, args.component)
+            out_path.write_text(rendered + "\n", encoding="utf-8")
+            print(f"Wrote: {out_path}", file=sys.stderr)
+            print(f"Overall confidence: {doc['meta']['confidence']}", file=sys.stderr)
+            print(f"Security tier: {doc['security_tier']['selected_tier']}", file=sys.stderr)
+            print(f"Classification: {doc['application_classification']['selected_classification']}",
+                  file=sys.stderr)
+
+        if not args.keep_temp:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        return 0
+
+    except ScanError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
