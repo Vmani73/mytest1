@@ -1,0 +1,90 @@
+# Codegraph: Real Transitive Dependency Resolution
+
+Add genuine multi-hop transitive dependency resolution to **codegraph**. Implement
+using only standard/pip-installable Python libraries — no external tool downloaded,
+cloned, or vendored, and no LLM/gateway involved. This is deterministic file parsing
+and graph construction only.
+
+## Problem this solves
+
+Parsing a project's own manifest (`pyproject.toml`, `pom.xml`, `go.mod`, etc.) only
+captures what that project directly declares. Any dependency whose own manifest isn't
+in your scanned corpus — i.e. any ordinary third-party package — gets no node, and the
+edge to it must be dropped as unresolved. That means "what's affected by a CVE that's
+buried two or three levels deep in a third-party dependency" cannot be answered from
+manifest parsing alone. Lockfiles solve this because they already contain the fully
+resolved tree: every transitive package, its exact version, and its own dependency
+list.
+
+## What to build
+
+**1. Lockfile parsers, per ecosystem, each producing (name, version) nodes and
+`depends_on` edges to that package's own locked dependencies:**
+
+- `uv.lock` / `poetry.lock` (Python) — TOML via `tomllib` (stdlib, 3.11+) or `tomli` as
+  a fallback. Each locked package entry lists its own resolved dependency names.
+- `Pipfile.lock` (Python) — JSON via stdlib `json`.
+- `package-lock.json` (Node) — JSON via stdlib `json`; each entry's own
+  `dependencies`/`requires` block gives the next hop.
+- `Cargo.lock` (Rust) — TOML via `tomllib`/`tomli`; each `[[package]]` block already
+  lists its resolved `dependencies`.
+- Maven has no reliable pure-Python equivalent (resolution depends on parent POMs, BOM
+  imports, and mediation rules) — don't attempt to reconstruct it from `pom.xml` alone.
+  If the team's CI already produces a dependency-tree export (text or JSON file), treat
+  that as an optional input file to parse; otherwise mark Maven coverage as
+  "direct-only" explicitly in any report/summary output, rather than silently
+  overclaiming transitive coverage that isn't there.
+
+**2. Optional live-environment layer (Python only, no lockfile needed):**
+The standard library's `importlib.metadata` can enumerate every installed distribution
+in a real virtual environment and its declared requirements, walkable recursively into
+an actual transitive graph of what's installed right now — independent of any manifest
+or lockfile file, no subprocess involved. Useful as a cross-check, or as a fallback when
+no lockfile exists.
+
+**3. Node/edge shape:**
+- Key nodes by `(name, version)`, not name alone — the same package name resolved to
+  two different versions in two places (a real diamond-dependency/version-mismatch
+  case) must produce two distinct nodes, never collapsed into one. This distinction is
+  directly relevant to CVE triage: patched in one place, still vulnerable in another.
+- `depends_on` edges chain naturally hop to hop since every locked package's own deps
+  are already resolved to specific versions in the same file — no dangling/unresolved
+  edges should occur for anything actually present in the lockfile.
+
+## Error handling required
+
+- Missing lockfile for a given ecosystem is not an error — skip lockfile ingestion for
+  that ecosystem only, log clearly that coverage there is direct-manifest-only, and
+  never claim full transitive coverage for an ecosystem that didn't get this treatment.
+- A malformed or partial lockfile entry is skipped with a warning; the rest of the
+  lockfile must still parse (isolate the failure to that one entry).
+- Cap lockfile size before parsing (same discipline as any other input file).
+- Cap recursive `importlib.metadata` traversal depth and detect cycles — a malformed or
+  circular installed-metadata graph must not hang the run.
+- No bare `except`: every catch names the exception type(s) expected and logs context
+  (which file, which package entry, what failed).
+- Writing any new graph/cache artifact from this feature follows the existing
+  atomic-write discipline (temp file + rename) — a crash mid-write must never leave a
+  corrupted file that poisons the next run.
+
+## Testing requirements
+
+- Parse a lockfile fixture with at least three chained levels (A depends on B depends
+  on C) and assert traversal actually reaches C starting from A — a real
+  transitive-dependency assertion, not just that all three nodes exist in isolation.
+- Assert the same package name resolved to two different versions produces two
+  distinct nodes, and that a query for one version's dependents doesn't return the
+  other's.
+- Simulate one corrupted entry inside an otherwise-valid lockfile and assert the rest
+  of the file still parses correctly.
+- Assert that an ecosystem with no lockfile present is clearly reported as
+  direct-manifest-only coverage, not silently treated as fully resolved.
+
+## Acceptance criteria
+
+- Given a real lockfile, querying "what depends on package X" (directly or
+  transitively) returns every actual path to X, including multi-hop ones — verified by
+  the chained-fixture test above.
+- No ecosystem's coverage is ever misreported as more complete than it is.
+- Implemented entirely with standard/pip-installable Python libraries; no external
+  tool downloaded or invoked, no LLM/gateway dependency introduced.
