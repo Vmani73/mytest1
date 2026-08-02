@@ -1,0 +1,583 @@
+---
+applyTo: "**"
+---
+
+# The Razor Standard — all-inclusive engineering playbook
+
+This file is auto-loaded by GitHub Copilot Chat for every request in this
+workspace (`.github/copilot-instructions.md`). It is the single source of
+truth for two related standards: how code should be written (Part I), and
+how existing dead code gets found, visualized, and safely removed
+(Part II). Named for Occam's razor — don't multiply abstractions, and
+don't let unreferenced code linger, beyond necessity.
+
+> **The best code is the code you never wrote — and the second-best code
+> is the code that's already been deleted.**
+
+One companion file supports Part II: [`scripts/dead_code_graph.py`](./scripts/dead_code_graph.py),
+a renderer for the graphical reports in section 15, with a sample input/
+output alongside it. Every rule and protocol otherwise lives in this one
+document.
+
+---
+
+# Part I — Minimum-viable code standard
+
+Before generating, adding, or suggesting any code, act like the most
+senior engineer in the room: the one who has seen every framework fad come
+and go, says almost nothing, and deletes fifty lines to replace them with
+one. Lazy about volume. Never lazy about correctness.
+
+## 1. The decision ladder
+
+Before writing a single line, walk this ladder top to bottom. Stop at the
+**first rung that resolves the request.** Do not proceed to a lower rung
+"just in case."
+
+| # | Question | If yes |
+|---|----------|--------|
+| 1 | Does this need to exist at all? | Skip it. Don't build speculative features, config options, or abstractions nobody asked for (YAGNI). |
+| 2 | Does the language/runtime standard library already do this? | Use it. Don't hand-roll what `Array`, `Intl`, `crypto`, `pathlib`, `fetch`, etc. already provide. |
+| 3 | Does the native platform already do this? | Use it. Prefer `<input type="date">` over a date-picker library, native `<dialog>` over a modal framework, CSS over a JS animation library, HTML form validation over a JS validation layer. |
+| 4 | Does an already-installed dependency already do this? | Use it. Don't add a second library that overlaps an existing one. Check `package.json` / `requirements.txt` / `go.mod` first. |
+| 5 | Can this be solved correctly in roughly one line, or a handful, without a new abstraction? | Write the one-liner. Don't wrap it in a class, factory, or config object "for future flexibility." |
+| 6 | None of the above apply | Write the minimum code that correctly and safely solves the actual request. Nothing more. |
+
+If you catch yourself about to introduce a new dependency, a new design
+pattern, or a new file, ask: **which rung did I actually stop at, and can I
+justify it in one sentence in the PR description?** If you can't, go back
+up the ladder.
+
+## 2. Non-negotiable guardrails
+
+"Lazy" never means "negligent." The following are **never** cut for
+brevity, and never skipped by the decision ladder above — they are rung 0,
+always in scope:
+
+- **Trust-boundary validation.** Anything crossing a trust boundary (user
+  input, query params, request bodies, file uploads, env vars, third-party
+  API responses) is validated and sanitized before use.
+- **Data-loss prevention.** No silent overwrites, no unguarded destructive
+  operations (deletes, truncates, force-pushes, migrations without
+  rollback), no swallowed write errors.
+- **Security.** No hardcoded secrets, no disabled TLS verification, no raw
+  string interpolation into SQL/shell/HTML, no auth checks skipped "to save
+  a line." Follow the principle of least privilege by default.
+- **Error handling.** Failure paths are handled explicitly. No empty
+  `catch` blocks, no ignored promise rejections, no unchecked error
+  returns.
+- **Accessibility.** Semantic HTML, keyboard operability, and labeled
+  inputs are not optional extras — they're part of "the minimum that
+  works" for any user-facing surface.
+- **Observability where it matters.** Errors and failure states on
+  production/critical paths are logged with enough context to debug later.
+
+If satisfying a guardrail requires more code than the "lazy" answer, write
+the extra code. That's the job.
+
+## 3. Before / after
+
+```html
+<!-- Ask: "add a date picker" -->
+
+<!-- Not this -->
+<!-- npm install flatpickr; write a wrapper component; add a stylesheet;
+     start a debate about timezones -->
+
+<!-- This -->
+<input type="date">
+```
+
+```ts
+// Ask: "dedupe this array of user IDs"
+
+// Not this
+function dedupeArray<T>(arr: T[]): T[] {
+  const seen = new Set<T>();
+  const result: T[] = [];
+  for (const item of arr) {
+    if (!seen.has(item)) {
+      seen.add(item);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+// This
+const unique = [...new Set(userIds)];
+```
+
+```ts
+// Ask: "format this date for the UI"
+
+// Not this
+// npm install moment; import moment; moment(date).format('MMM D, YYYY')
+
+// This — native Intl, already in every runtime
+new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(date);
+```
+
+## 4. When more code is the right call
+
+The ladder is a default, not a ban on complexity. Climb past rung 5
+deliberately when the situation actually requires it:
+
+- Performance-critical paths with a measured (not assumed) bottleneck.
+- Concurrency, multi-tenancy, or multi-step transactions where correctness
+  requires explicit state management.
+- Public APIs / library surfaces, where a stable contract matters more than
+  brevity at the call site.
+- Anything covered by section 2's guardrails.
+
+In these cases, write the correct, complete solution — and say so plainly
+("this needs a real implementation because X") rather than defaulting to
+the shortest possible answer.
+
+## 5. Dependency policy
+
+Before proposing `npm install` / `pip install` / adding any new package:
+
+1. Confirm rungs 2–4 of the ladder don't already cover it.
+2. Confirm no existing dependency in the manifest already does this
+   (including partially — extend, don't duplicate).
+3. If a new dependency is genuinely justified, name it explicitly and say
+   why in one line (e.g., "adding `zod` because we need runtime schema
+   validation at the API boundary, which the stdlib doesn't provide").
+
+Never silently add a dependency inside a larger diff without calling it
+out.
+
+## 6. Diff review protocol
+
+Run this on request — e.g. "review this diff against the Razor Standard,"
+or before opening a PR.
+
+Do not restate what the diff does. Find what shouldn't be there. For each
+changed file, check for:
+
+1. **Unjustified rungs** — code sitting at ladder rung 6 (custom
+   implementation) when rung 2, 3, 4, or 5 would have solved it. Name the
+   specific stdlib/platform/existing-dependency alternative.
+2. **New dependencies** that duplicate something already in the manifest,
+   or that solve a problem the standard library already solves.
+3. **Speculative code** — options, parameters, branches, or abstractions
+   not exercised by any current caller or test (YAGNI violations).
+4. **Guardrail gaps** — anywhere brevity came at the cost of validation,
+   error handling, security, data-loss protection, or accessibility. These
+   are defects, not style notes — flag separately as `must-fix`.
+5. **Dead weight** — commented-out code, unused imports/exports, files
+   that could be deleted outright. For anything beyond the current diff,
+   use the dedicated dead-code workflow in Part II instead of guessing.
+
+Output one Markdown report, grouped by severity, omitting empty sections:
+
+```markdown
+## must-fix (guardrail gaps)
+- `path/file.ts:L12` — <issue> — <why it's a guardrail gap>
+
+## simplify (ladder violations)
+- `path/file.ts:L20-45` — <what's there now> → <rung N alternative to use>
+
+## delete (dead weight / speculative code)
+- `path/file.ts:L60-72` — <what it is> — <why nothing needs it today>
+
+## verdict
+<one line: is this diff at the right size for what it does, and why>
+```
+
+No praise, no summary padding — findings only.
+
+## 7. Codebase sweep protocol
+
+Run this on request for a bigger cleanup than a single diff — e.g. "run a
+Razor sweep on `src/legacy/`." This pass targets **ladder violations** —
+code that's more complex than it needs to be but is still referenced and
+used. It is not a dead-code finder; for code nothing calls at all, run
+the dead-code workflow in Part II (section 11) first, since removing
+genuinely dead code first shrinks what this sweep even has to consider.
+
+Work in three passes; never skip to execution.
+
+**Pass 1 — inventory, no edits.** List every file in scope with a one-line
+note on what it does and a rough guess at which ladder rung it's actually
+operating at. Flag candidates guessed at rung 5–6 where the problem looks
+like rung 2–4.
+
+**Pass 2 — propose, no edits.** For each flagged candidate, propose the
+specific replacement (stdlib call, platform feature, existing dependency)
+and estimate the line delta. Split into:
+
+- **safe** — behavior-preserving, mechanical, low risk.
+- **needs confirmation** — touches edge cases, public API surface, or
+  anything from section 2's guardrails. Never touch these without explicit
+  approval per item.
+
+Stop and show both lists before editing anything.
+
+**Pass 3 — execute, only after approval.** Apply the safe list with
+minimal, behavior-preserving diffs. Never weaken a guardrail to shrink a
+diff. Run or update tests for anything touched; if no tests exist for a
+touched path, say so rather than skipping verification silently. Apply
+approved "needs confirmation" items one at a time, in separate diffs.
+
+End with a summary table: files touched, lines removed/added, dependencies
+removed, and any guardrail-related items declined and why.
+
+## 8. Self-review checklist
+
+Apply before finalizing any suggestion:
+
+- [ ] Did I stop at the first rung of the ladder that actually solves this?
+- [ ] Is there a smaller diff that does the same job?
+- [ ] Did I introduce a new file/class/abstraction that isn't earning its
+      keep?
+- [ ] Did I add a dependency I could have avoided?
+- [ ] Are all guardrails in section 2 still intact — nothing cut for
+      brevity?
+- [ ] Could I explain, in one sentence, why this is the minimum correct
+      solution?
+
+If any answer is "no," revise before responding.
+
+## 9. Style
+
+- Prefer editing existing files over creating new ones.
+- Prefer deleting code over commenting it out.
+- Don't add comments that restate the code; add them where the *why* isn't
+  obvious.
+- Don't scaffold configuration, feature flags, or extensibility hooks that
+  nothing in the current request uses.
+
+---
+
+# Part II — Dead code detection, visualization, and removal
+
+A repeatable process for finding, visualizing, and safely removing dead
+code in any repo, regardless of language. "Unreferenced by a tool" is a
+candidate, not a verdict — this exists because static analysis alone
+produces false positives (reflection, dynamic dispatch, string-based
+routing) and false negatives (partially dead branches, feature-flagged
+code). Nothing gets deleted on a single signal.
+
+## 10. Ground rules
+
+1. **Two tracks, not one.** Static reference analysis (Track A) finds what
+   looks unused. Runtime verification (Track B) confirms it's actually
+   never executed. Only both tracks agreeing — or Track A plus a clean
+   manual check — earns "high confidence."
+2. **Confidence tiers, not a binary.** Every candidate is High, Medium, or
+   Excluded. Only High gets deleted directly.
+3. **Small, reviewable diffs.** Never one giant purge PR. Group by
+   module/tool/confidence tier.
+4. **Some things are never auto-deleted**, regardless of tooling output —
+   see section 14.
+5. **This is a cadence, not a one-time cleanup.** Dead code accumulates
+   continuously; re-run on a schedule (section 18).
+
+## 11. Dead-code workflow
+
+1. **Identify the stack.** Detect languages/build systems from manifest
+   files at the repo root: `package.json`, `pyproject.toml` /
+   `requirements.txt`, `go.mod`, `Cargo.toml`, `pom.xml` / `build.gradle`,
+   `Gemfile`, `composer.json`, `*.csproj`, `pubspec.yaml`, `Package.swift`.
+   A repo can have more than one stack — run the matching tools for each.
+2. **Run static analysis (Track A)** using the tool matrix in section 12.
+3. **Cross-check with a full-text search**, not just the tool's AST view.
+   Grep the exact symbol name across the *entire* repo — including
+   templates, YAML/JSON config, IaC (Terraform/Helm/CloudFormation), and
+   docs — since string-based dynamic references (DI containers, route
+   tables, plugin registries, serialization keys) won't show up in an
+   AST-based tool but will show up as a string literal.
+4. **Run the test suite with coverage (Track B).** Anything a tool flags
+   as unused *and* shows 0% coverage across the full suite moves toward
+   High confidence.
+5. **Check production telemetry if available** (APM traces, access logs,
+   error logs) over a representative window (30–90 days, or a full
+   reporting cycle for cyclical code). This catches admin tools, cron
+   jobs, and rarely-hit paths that tests and grep both miss. For JVM
+   specifically, prefer a runtime tool over guessing — see Scavenger in
+   section 12.
+6. **Categorize every candidate:**
+   - **High confidence** — unreferenced by the tool, zero test coverage,
+     zero string/dynamic references, zero telemetry hits, not a public
+     API, not on the exclusion list (section 14).
+   - **Medium confidence** — unreferenced by the tool but with partial
+     coverage, referenced only from tests, or a public export with unclear
+     external consumers. Mark and track, don't delete.
+   - **Excluded** — matches section 14. Never touch, regardless of
+     tooling.
+7. **Remove High-confidence items first**, one module or tool-category per
+   PR, referencing the tool output and cross-checks in the description.
+8. **For Medium confidence**, mark with a tracked TODO/issue and revisit at
+   the next scheduled sweep. Promote to High after two consecutive sweeps
+   with no new references.
+9. **Verify after every removal PR**: full test suite green, build green,
+   lints green, grep confirms zero remaining references, staging deploy +
+   smoke test where applicable, and a named rollback path.
+10. **Generate the graphical report** (section 15) and attach it to the PR
+    or sweep issue so reviewers see the blast radius, not just a list.
+11. **Repeat on cadence** — see section 18.
+
+## 12. Tool matrix by category
+
+### JavaScript & TypeScript
+
+- **Knip** — the strongest all-rounder: finds unused files, unexported
+  functions/types/variables, and "zombie" dependencies listed in
+  `package.json` across the whole project graph.
+- **dead-code-checker** (`npx dead-code-checker -f ./src`) — scans source
+  directories and reports unused functions/variables with file/line
+  locations and bundle size impact.
+- **ts-prune** — narrower, unused-exports-only; a quick second opinion
+  against Knip.
+- **depcheck** — unused/missing npm dependencies specifically.
+- **madge** / **dependency-cruiser** — graph engines used for the visual
+  report in section 15 (they surface orphan modules — files nothing
+  imports — directly).
+
+### Python
+
+- **Vulture** — targets uncalled functions, unused attributes, and dead
+  variables; attaches confidence scores per finding to reduce accidental
+  deletions.
+- **Pylint** — a thorough standard linter that also flags unreachable
+  code and unused/unreferenced variables (`W0612`, `W0101`).
+- **unimport** — unused-imports specifically, fast, autofix-capable.
+- **deptry** — unused/missing dependencies in `pyproject.toml`.
+
+### Java / Kotlin / JVM
+
+- **Scavenger** (Naver, `naver/scavenger`) — a **runtime** dead-code
+  analysis tool for JVM languages, successor to codekvast. It instruments
+  a running application (no source changes), collects real method
+  invocations in production, and shows a dashboard of code that's never
+  actually called — this is Track B for JVM, and the most reliable way to
+  catch dead code hidden behind reflection, Spring DI, or dynamic proxies,
+  which static tools routinely miss.
+- **PMD** (`UnusedPrivateField`, `UnusedLocalVariable`) and **detekt**
+  (Kotlin, `UnusedPrivateMember`) — static, fast, good as a first pass.
+- **SonarQube** — repo-wide static findings plus historical trend
+  tracking across sweeps.
+
+### Mobile frameworks
+
+- **dead_code_analyzer** (Dart/Flutter, on pub.dev) — CLI that maps
+  cross-file references to find unreferenced classes, functions, and
+  variables inside active Flutter widget trees, with usage-frequency
+  tracking and exclusion patterns.
+- **DCM** (`dcm check-unused-code`) — commercial-grade Flutter/Dart code
+  quality tool with a dedicated unused-code check, good for CI gating.
+- **Periphery** (Swift/iOS) — purpose-built unused-code scanner that
+  understands Swift's protocol conformance and dynamic dispatch, which
+  naive AST scans get wrong.
+
+### Enterprise & compile-time safety (C / C++ and safety-critical stacks)
+
+- **Polyspace** (MathWorks) — advanced static analysis with data-flow
+  tracing, used to prove code paths align with functional-safety standards
+  like ISO 26262 (automotive) and DO-178 (aerospace). Heavier-weight than
+  the tools below, but appropriate where dead code in a safety-critical
+  path is a certification issue, not just tech debt.
+- **cppcheck** — lighter-weight static analysis, unused-function/variable
+  detection, good default for non-safety-critical C/C++.
+- **include-what-you-use (IWYU)** — finds unused `#include`s specifically.
+- Compiler flags `-Wunused-function -Wunused-variable` — free, always on.
+
+### Go
+
+- **codecoroner** — detects unused functions and variables specifically.
+- **`golang.org/x/tools/cmd/deadcode`** — official tool, whole-program
+  reachability analysis from `main`.
+- **staticcheck** (`U1000`) / **golangci-lint** (`unused`) — fast,
+  CI-friendly.
+
+### Rust
+
+- **cargo-udeps** — unused dependencies.
+- Built-in `#[warn(dead_code)]` lint + **cargo clippy** — unused code
+  inside the crate.
+
+### Ruby
+
+- **debride** — static dead-method detection.
+- **coverband** — production runtime usage tracking (Track B for Ruby,
+  same role Scavenger plays for JVM).
+
+### PHP
+
+- **PHPStan** / **Psalm** — dead-code detection rule sets.
+- **Rector** — can both detect and auto-refactor dead code.
+
+### .NET
+
+- **endjin/deadcode** — .NET Global Tool for detecting dead code, notably
+  tuned for the kind of unused scaffolding AI code generators tend to
+  leave behind.
+- Roslyn analyzers `IDE0051`/`IDE0052` (unused private members), `IDE0005`
+  (unused usings) — built into the compiler, zero setup.
+
+### SQL / schema
+
+- No dedicated "dead code" tool — cross-reference ORM models against the
+  live schema, and check `pg_stat_statements` / slow-query logs for tables
+  and columns with zero reads over a full reporting cycle.
+
+### Generic fallback (no tool for the language/framework)
+
+1. Build a symbol inventory: every top-level function, class, exported
+   name.
+2. `ripgrep` (`rg -w '<symbol>'`) the exact name across the whole repo,
+   excluding its own definition line.
+3. Zero-hit symbols are candidates — manually check for that language's
+   dynamic-usage patterns (reflection, string routing tables, ORM magic
+   methods, event/hook registries, template interpolation) before trusting
+   a zero-hit result.
+4. Cross-reference with coverage data if any exists.
+
+## 13. Confirming production telemetry without an APM
+
+If there's no APM/tracing tool (and no Scavenger/coverband-style runtime
+agent), approximate Track B:
+
+- Grep application logs for the function/route/class name over a wide
+  window.
+- For web endpoints: check load balancer / web server access logs for the
+  route.
+- For scheduled jobs: check the scheduler's execution history.
+- For CLI commands: check shell history, internal docs, or support
+  tickets referencing the command.
+
+Absence of a hit here is weaker evidence than a runtime agent trace, but
+combined with zero static references and zero test coverage it still
+counts.
+
+## 14. Never auto-delete these, regardless of tool output
+
+- Public/exported library or API surface without a formal deprecation
+  cycle and version bump.
+- Anything referenced only from IaC, CI/CD pipeline config, cron
+  schedulers, or message-queue consumer registrations — invisible to
+  code-level static analysis.
+- Migration files and schema history.
+- Code gated behind a feature flag that's merely off right now — check the
+  flag system's current state, not just the code.
+- Generated code (protobuf/gRPC stubs, GraphQL codegen, ORM models,
+  OpenAPI clients) — fix the generator/source-of-truth, not the output.
+- Anything modified in the last N days (e.g. 14) without a full-team
+  review.
+
+## 15. Graphical dead-code reports
+
+A list of file paths is hard to review; a graph of what's dead, what's
+uncertain, and what depends on what is not. Two ways to get one:
+
+### 15a. Language-native graph tools
+
+These render real import/call graphs and are the fastest path when the
+tool exists for your stack:
+
+| Language | Command | Output |
+|---|---|---|
+| JS/TS | `npx madge --image graph.svg src/` or `npx dependency-cruiser --output-type dot src \| dot -T svg -o graph.svg` | Module graph; `dependency-cruiser` can flag orphans directly |
+| Python | `pydeps mypackage --show-deps -o graph.svg` | Import graph |
+| Go | `go-callvis ./...` | Call graph, SVG |
+| Java | `jdeps --dot-output ./out com.example.App && dot -Tsvg out/*.dot -o graph.svg` | Package/class dependency graph |
+| Rust | `cargo modules generate graph \| dot -Tsvg -o graph.svg` | Module graph |
+| Ruby | `debride --graph` (or export findings into 15b) | Method reference graph |
+
+Color/annotate the output: any node these tools mark as an orphan/unused
+maps directly to a "dead" node in the unified report below.
+
+### 15b. Unified generator (works for any language, ties into the workflow)
+
+Since not every stack has a graph tool, and reviewers want one consistent
+report regardless of language, use the included generator script,
+[`scripts/dead_code_graph.py`](./scripts/dead_code_graph.py). It reads a
+standardized findings file and renders a single self-contained HTML report
+with:
+
+- A Graphviz dependency graph — dead (High confidence) nodes in red,
+  Medium confidence in amber, live nodes in the default color.
+- A bar chart of dead lines of code by module/top-level directory.
+- A pie chart of confidence-tier distribution across the whole sweep.
+
+**Input schema** (`dead_code_findings.json`) — this is the same
+categorization produced by section 11, step 6, just serialized:
+
+```json
+{
+  "nodes": [
+    { "id": "src/utils/date.ts", "label": "date.ts", "status": "dead", "lines": 42 },
+    { "id": "src/utils/string.ts", "label": "string.ts", "status": "live", "lines": 120 },
+    { "id": "src/legacy/old.ts", "label": "old.ts", "status": "medium", "lines": 30 }
+  ],
+  "edges": [
+    { "from": "src/index.ts", "to": "src/utils/string.ts" },
+    { "from": "src/index.ts", "to": "src/legacy/old.ts" }
+  ]
+}
+```
+
+`status` is one of `dead` (High confidence), `medium`, or `live`/omitted.
+Populate `nodes`/`lines` from whichever tool in section 12 you ran;
+populate `edges` from that tool's import graph if it exposes one (Knip,
+madge, and `go-callvis` all do), or omit edges entirely for a flat report
+if a graph isn't available — the bar/pie charts still render.
+
+**Run it:**
+
+```bash
+pip install graphviz matplotlib --break-system-packages   # one-time
+python3 scripts/dead_code_graph.py dead_code_findings.json report.html
+```
+
+Open `report.html` — it's a single file, safe to attach to a PR or drop in
+a shared drive, no server required. A worked example ships alongside the
+script: `scripts/dead_code_findings.sample.json` in, `scripts/dead_code_report.sample.html` out.
+
+## 16. Wiring dead-code detection into an AI agent
+
+If you want an agent (Copilot, Claude, etc.) to run this rather than doing
+it by hand, instruct it explicitly to:
+
+1. Detect the stack per section 11 and actually **run** the matching
+   tool(s) from section 12 via the terminal — not just read source and
+   guess.
+2. Perform the Track B cross-checks in section 11 steps 4–5 / section 13
+   before proposing any deletion.
+3. Never touch anything matching section 14's exclusion list.
+4. Categorize every finding per section 11 step 6, writing results into
+   the `dead_code_findings.json` schema from section 15b as it goes.
+5. Run `scripts/dead_code_graph.py` on the resulting file and attach
+   `report.html` to the sweep's summary.
+6. Only remove High-confidence items directly; Medium-confidence items get
+   marked and tracked, never deleted outright.
+
+This is a different job from the codebase sweep protocol in Part I,
+section 7: that protocol simplifies code that's still used but
+over-engineered; this one removes code nothing uses at all. Run this
+workflow first — it shrinks what the ladder sweep has to consider.
+
+## 17. Dead-code PR verification checklist
+
+- [ ] Full test suite passes.
+- [ ] Build passes.
+- [ ] Lints pass.
+- [ ] Grep confirms zero remaining references to removed symbols/files.
+- [ ] PR description states which tool(s) flagged it and which confidence
+      tier it was.
+- [ ] `report.html` (section 15) attached or linked.
+- [ ] Staging deploy + smoke test completed, if applicable.
+- [ ] Rollback path is a plain `git revert` (no follow-up migrations
+      needed to undo).
+
+## 18. Cadence and ownership
+
+- Run a full dead-code sweep quarterly, and always before a major version
+  bump or a large refactor.
+- Assign one owner per sweep who signs off on the final report and graph.
+- Keep a running "Medium confidence" backlog (tracking label or project
+  board column) instead of leaving borderline calls undecided indefinitely.
+- Track a simple metric over time — lines removed, files removed,
+  dependencies dropped — to show the sweep is paying for itself.
