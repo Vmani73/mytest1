@@ -1,0 +1,1244 @@
+# LangGraph Mastery Playbook — Complete Copilot Reference
+
+Single-file, production-grade reference for GitHub Copilot (or any coding agent) working in
+[`leslieo2/LangGraph-Mastery-Playbook`](https://github.com/leslieo2/LangGraph-Mastery-Playbook).
+
+**Provenance note:** every claim in this document was produced by cloning the actual repository
+(`git clone https://github.com/leslieo2/LangGraph-Mastery-Playbook`) and reading every `.py`
+file in `src/langgraph_learning/` line by line, plus `pyproject.toml`, `langgraph.json`, and
+`.env.example`. File paths, function names, signatures, and line-level behavior described below
+were read directly from source, not inferred from the README or assumed from conventions in
+other LangGraph projects. Where a claim depends on something that could drift (e.g. "no CI
+workflow exists"), it was verified with a direct filesystem check at audit time
+(`ls .github/workflows` → not found; `grep` checks for specific symbols — see §0.7). Nothing
+below is speculative; every "gap" or "bug" cited names the exact function and file it lives in.
+
+Repo root package: `src/langgraph_learning/`. Python `>=3.10`. Dependency manager: `uv`.
+
+## Table of contents
+
+- [Section 0 — Repo-wide conventions](#section-0--repo-wide-conventions)
+- [Section 1 — Stage 01: Foundations](#section-1--stage-01-foundations)
+- [Section 2 — Stage 02: Memory Basics](#section-2--stage-02-memory-basics)
+- [Section 3 — Stage 03: State Management](#section-3--stage-03-state-management)
+- [Section 4 — Stage 04: Operational Control](#section-4--stage-04-operational-control)
+- [Section 5 — Stage 05: Advanced Memory Systems](#section-5--stage-05-advanced-memory-systems)
+- [Section 6 — Stage 06: Production Systems](#section-6--stage-06-production-systems)
+- [Section 7 — Repo-wide production checklist (rollup)](#section-7--repo-wide-production-checklist-rollup)
+
+---
+
+## Section 0 — Repo-wide conventions
+
+Read this section before working in any stage below — every stage section assumes this context
+and does not repeat it.
+
+### 0.1 Directory layout
+
+```
+src/langgraph_learning/
+  stage01_foundations/
+  stage02_memory_basics/
+  stage03_state_management/
+  stage04_operational_control/
+  stage05_advanced_memory_systems/
+  stage06_production_systems/
+  utils/                # shared helpers, imported by every lesson
+scripts/
+  production_memory_smoke.py   # manual smoke test for Postgres/Mongo/Redis backends
+langgraph.json           # registers every lesson's studio_graph() for LangGraph Studio
+pyproject.toml           # dependency list, uv package config
+.env.example             # canonical list of environment variables
+```
+
+Every stage directory is a plain Python package (`__init__.py` present, usually empty). Every
+lesson file is independently runnable via `python -m src.langgraph_learning.<stage>.<lesson>`
+and independently importable by Studio via `langgraph.json`.
+
+### 0.2 The five-part lesson skeleton
+
+Nearly every lesson file (`agent_with_*.py`, `quickstart.py`) follows this shape. When adding or
+extending a lesson, preserve this shape so it stays consistent with the rest of the curriculum
+and keeps working with `langgraph dev` (LangGraph Studio).
+
+1. **Module docstring** — fixed template: `PROBLEM STATEMENT`, `CORE SOLUTION`, `KEY
+   INNOVATION`, a comparison table against a related lesson, `What You'll Learn` (numbered),
+   `Lesson Flow` (numbered).
+2. **`_assemble_<lesson>_graph(llm, ...)` (private, underscore-prefixed)** — pure graph
+   construction. Takes already-constructed dependencies (an LLM instance, a checkpointer, a
+   store) as arguments and returns a **compiled** graph. Never reads environment variables or
+   calls `create_llm()` itself — this keeps it reusable from both `build_*` (CLI) and
+   `studio_graph` (Studio) without duplicating construction logic.
+3. **`build_<lesson>_graph(...)` (public)** — the CLI-facing constructor. Calls `create_llm()`
+   (or accepts a model override), builds any checkpointer/store the lesson needs, calls
+   `_assemble_*`, then calls `save_graph_image(...)` to persist a PNG under `artifacts/`.
+4. **`run_demo(...)` / `main()`** — `main()` calls `require_llm_provider_api_key()` (and
+   `require_env("TAVILY_API_KEY")` for any lesson touching Tavily) before doing anything else,
+   then builds the graph and runs a scripted demo conversation, printing via
+   `pretty_print_messages`. Guarded by `if __name__ == "__main__":`.
+5. **`studio_graph(config: RunnableConfig | None = None)`** — the LangGraph Studio entry point,
+   referenced by `langgraph.json`. Uses `llm_from_config(config)` to let Studio callers override
+   provider/model/temperature/api_key/base_url at runtime via `config["configurable"]`, then
+   calls the same `_assemble_*` function used by `build_*`.
+
+**Rule:** if you add a new lesson file, you must add a `studio_graph` entry to `langgraph.json`
+(`"stageXX_your_lesson": "./src/langgraph_learning/stageXX_.../your_file.py:studio_graph"`) or
+it will be invisible to `langgraph dev`.
+
+### 0.3 Shared utilities (`src/langgraph_learning/utils/`)
+
+Import these instead of reimplementing equivalents.
+
+- **`create_llm(*, provider=None, model=None, temperature=None, api_key=None, base_url=None, **overrides) -> ChatOpenAI`**
+  (`utils/llm.py`). Resolves provider config in priority order: explicit args → env vars → built-in
+  defaults. Supported providers: `openai` (default), `openrouter`, `deepseek` — all wrapped
+  through `ChatOpenAI` because they expose OpenAI-compatible chat-completions APIs. Adding a
+  **new provider that isn't OpenAI-compatible** requires branching logic here; adding one that IS
+  OpenAI-compatible only requires a new entry in `_PROVIDER_SETTINGS`.
+- **`llm_from_config(config, *, default_provider=None, default_model=None, default_temperature=None, ...) -> tuple[ChatOpenAI, dict]`**
+  — used inside `studio_graph()` functions to read `config["configurable"]` overrides
+  (`provider`, `model`, `temperature`, `api_key`, `base_url`, plus lesson-specific keys like
+  `db_path`, `variant`, `mode`, `max_length`) and return `(llm, overrides_dict)`.
+- **`require_llm_provider_api_key(provider=None)`** — raises `RuntimeError` if no API key is
+  configured for the active provider. Call at the top of every `main()`.
+- **`require_env(var_name, *, message=None)`** — generic env-var preflight check (used for
+  `TAVILY_API_KEY`).
+- **`maybe_enable_langsmith(project="langchain-academy")`** — opt-in tracing; only activates if
+  `LANGSMITH_API_KEY` is set.
+- **`save_graph_image(app, filename="graph.png", *, xray=False) -> Path | None`** and
+  **`save_png(png_bytes, filename)`** (`utils/graph_viz.py`) — render a compiled graph via
+  `app.get_graph(xray=xray).draw_mermaid_png()`, write to `artifacts/...png`, and **degrade
+  gracefully** (`ValueError` caught, prints a skip message, returns `None`) when the Mermaid
+  rendering web service is unreachable — important for CI/offline runs. Always call this through
+  the helper, never call `draw_mermaid_png()` directly without a try/except.
+- **`pretty_print_messages(messages, *, header=None)`** (`utils/messages.py`) — thin wrapper over
+  `BaseMessage.pretty_print()`; use for all console demo output.
+- **`structure_output`, `create_structured_agent`, `extract_structured_response`**
+  (`utils/structured_output.py`) — wrap LangChain's `create_agent(..., response_format=ToolStrategy(schema=...))`
+  pattern. `extract_structured_response(state)` does `state.get("structured_response")`. Prefer
+  `create_structured_agent(model, schema, tools=[], handle_errors=True)` for new
+  structured-extraction nodes — it's the convenience wrapper used throughout stage05/06.
+- **`add`, `multiply`, `divide`** (`utils/tools.py`) — trivial arithmetic tools used across
+  stage01/02/04 to demonstrate tool-calling without needing network access.
+
+### 0.4 State & schema conventions
+
+- Conversation-shaped state extends `langgraph.graph.MessagesState` (which provides
+  `messages: Annotated[list[AnyMessage], add_messages]`). Extra fields are added as plain class
+  attributes, e.g. `class State(MessagesState): summary: str`.
+- Non-conversation state uses `typing_extensions.TypedDict`. Reducer-bearing list fields use
+  `Annotated[list[T], operator.add]`.
+- Structured extraction schemas (personas, memory facts, profiles, todos) are Pydantic
+  `BaseModel` subclasses with `Field(description=...)` on every field — the description is what
+  the LLM sees during structured output, so treat it as prompt text, not just documentation.
+- `TypedDict` is also used for lightweight decision payloads bound as pseudo-tools, e.g.
+  `class UpdateMemory(TypedDict): update_type: Literal["user", "todo", "instructions"]` in
+  stage05's multi-memory router.
+
+### 0.5 Environment variables (`.env`, see `.env.example`)
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `LLM_PROVIDER` | all | `openai` \| `openrouter` \| `deepseek`, default `openai` |
+| `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` | matching provider | checked by `require_llm_provider_api_key()` |
+| `OPENAI_MODEL` / `OPENROUTER_MODEL` / `DEEPSEEK_MODEL` | optional | defaults: `gpt-5-nano`, `anthropic/claude-haiku-4.5`, `deepseek-chat` |
+| `TAVILY_API_KEY` | quickstart, stage06 parallel retrieval + deep research | checked via `require_env` |
+| `LANGSMITH_API_KEY` | optional tracing | enables via `maybe_enable_langsmith` |
+| `BACKEND_KIND`, `BACKEND_URI`, `BACKEND_INITIALIZE` | stage06 production memory | `postgres`\|`mongodb`\|`redis` |
+
+### 0.6 Running & verifying lessons
+
+```bash
+uv venv && source .venv/bin/activate && uv pip install .
+python -m src.langgraph_learning.stageNN_xxx.agent_with_yyy
+langgraph dev   # opens all studio_graph() entries in LangGraph Studio
+```
+
+Current CI-equivalent checks per the README's contributing section:
+```bash
+black .
+python -m compileall src
+```
+
+**There is no pytest suite in this repo at all**, verified by inspection of the cloned tree.
+This is the single biggest production gap across the whole repo. Treat "add pytest coverage for
+this lesson" as a standing, always-valid task for any lesson touched below.
+
+### 0.7 Verified facts used throughout this document
+
+These specific claims were independently checked against the cloned source (not assumed) and
+are referenced by file/section below:
+
+- `grep -i "structured_output" langgraph.json` → **no match**. `agent_with_structured_output.py`
+  (stage01) has a working `studio_graph` function but is **not** registered in `langgraph.json`,
+  unlike every other lesson in stage01.
+- `ls .github/workflows` → **directory does not exist**. The README's "CI Friendly" badge is not
+  backed by a visible GitHub Actions workflow in this clone.
+- `grep -rn "HAS_SDK"` in `agent_with_interruption.py` and `agent_with_stream_interruption.py`
+  (stage04) → the flag is **set but never read/branched on** anywhere else in either file — dead
+  code guarding an unused optional import (`langgraph_sdk.get_client`).
+- `grep -rn "reduce_list"` in `agent_with_state_reducer.py` (stage03) → the function is
+  **defined once and never referenced again** — it is not wired into any `Annotated[...]` state
+  field or graph.
+
+### 0.8 Cross-cutting production gaps (apply to all six stages)
+
+When asked to "enhance/harden/productionize" any lesson, check this list first — these gaps
+recur across every stage's current code, not just one:
+
+1. **No automated tests.** Add `pytest` unit tests per lesson: mock `create_llm`/tool calls,
+   assert graph topology (`app.get_graph().nodes`), assert state transitions with fixed inputs.
+   Add an integration marker for tests that hit real providers, skipped by default.
+2. **No retry/backoff.** LLM calls (`llm.invoke(...)`) and tool calls (`TavilySearch`,
+   `WikipediaLoader`) have no retry, timeout, or circuit breaker. Wrap with
+   `langchain_core.runnables`' `.with_retry()` or `tenacity` for anything claimed
+   production-ready.
+3. **No structured logging/observability.** Output is `print()`. For production, replace with
+   `logging` (structured JSON) and rely on `maybe_enable_langsmith` / OpenTelemetry rather than
+   stdout.
+4. **Dev-only persistence by default.** `MemorySaver()` and `InMemoryStore()` are used even in
+   lessons that conceptually need durability (stage02, stage05). Only stage06
+   (`agent_with_external_short_term_memory.py`'s SQLite variant lives in stage02 actually — see
+   §2.3 — and `agent_with_production_memory.py` for Postgres/Mongo/Redis) shows durable backends.
+   When productionizing a memory lesson from an earlier stage, port it onto
+   `SqliteSaver`/`PostgresSaver` following the stage06 pattern rather than inventing a new one.
+5. **No rate-limit/concurrency control on fan-out (`Send`).** `agent_with_parallel_nodes.py`
+   (stage03) and `agent_with_deep_research.py` (stage06) fan out one LLM+tool call per
+   subject/analyst with no concurrency cap. Add a semaphore or `RunnableConfig(max_concurrency=N)`
+   when hardening.
+6. **Minimal input validation.** Only `agent_with_pydantic_schema_constrain.py` demonstrates
+   validation deliberately; most lessons trust caller input. Add Pydantic validation at graph
+   boundaries (`input_schema`) for anything exposed externally.
+7. **Secrets via plain `.env`.** Fine for local dev; recommend a secrets-manager integration
+   point in `utils/llm.py`'s `_resolve_value` chain if asked to productionize deployment.
+8. **No Dockerfile / IaC / CI workflow visible in the tree** (verified §0.7). Add one
+   (`black --check`, `python -m compileall src`, `pytest`) if asked to close this gap.
+
+---
+
+## Section 1 — Stage 01: Foundations
+
+Package: `src/langgraph_learning/stage01_foundations/`. Studio graph IDs:
+`stage01_tool_call`, `stage01_router`, `stage01_tool_router`, `stage01_reactive_router`.
+
+Theme: the absolute basics of LangGraph — state schemas, conditional edges, tool binding, the
+assistant↔tool loop, and LangChain's structured output. No memory/persistence yet (stage02); no
+parallelism yet (stage03).
+
+### 1.1 `quickstart.py` — environment smoke test
+
+Not a graph lesson — a linear preflight script.
+
+- `run_basic_chat(model: str | None = None) -> None` — `create_llm(model=model).invoke([HumanMessage(...)])`, prints `.content`.
+- `run_tavily_search(query: str = "What is LangGraph?") -> None` — `TavilySearch(max_results=3).invoke(query)`, prints raw results.
+- `main()` calls both. The `if __name__ == "__main__"` guard calls
+  `require_llm_provider_api_key()` **and** `require_env("TAVILY_API_KEY")` before `main()`.
+- No `studio_graph` — this lesson has no graph, so it's absent from `langgraph.json` by design.
+
+**Enhancement tasks:**
+- Add a `--skip-tavily` CLI flag so the LLM-only half can run without a Tavily key (useful in CI
+  where only `OPENAI_API_KEY` is provisioned).
+- Wrap `TavilySearch.invoke` in a try/except that prints a clear "Tavily unreachable" message
+  instead of letting a raw `HTTPError` propagate.
+
+### 1.2 `agent_with_tool_call.py` — MessagesState warm-up (bind_tools ≠ execute)
+
+Teaches: `bind_tools()` only *informs* the model of a tool; it does not execute it.
+
+- `inspect_tool_binding() -> None` — binds `multiply` to a fresh LLM, invokes with a math
+  question, pretty-prints the raw tool-call response (model asks to call `multiply`, nothing
+  actually multiplies).
+- `build_tool_calling_app(*, model: str | None = None)` — single-node graph:
+  `START → tool_calling_llm → END`. No `ToolNode`, no loop — the tool call surfaces in the output
+  message but is never executed. This is intentional; the next two lessons fix it.
+- `run_app_demo(app) -> None` — invokes with a plain `HumanMessage(content="hello", name="Leslie")`.
+- `studio_graph(config)` — duplicates `build_tool_calling_app`'s inner logic inline rather than
+  calling a shared `_assemble_*` helper. This file is the **one exception** in the whole repo to
+  the `_assemble_*`/`build_*` split described in §0.2 — both `build_tool_calling_app` and
+  `studio_graph` independently redefine an `llm_node` closure.
+
+**Enhancement tasks:**
+- Refactor to match the standard `_assemble_tool_calling_graph(llm)` pattern used elsewhere in
+  the repo (extract the duplicated `llm_node` closure into one private helper called by both
+  `build_tool_calling_app` and `studio_graph`) — this is real, verified duplication.
+- Confirm the `stage01_tool_call` entry in `langgraph.json` points at this file (it does), not
+  `agent_with_tool_router.py`, if renaming either file.
+
+### 1.3 `agent_with_router.py` — conditional routing on a `TypedDict` state
+
+Teaches: `add_conditional_edges`, minimal `TypedDict` state, no LLM involved — the gentlest
+possible introduction to branching.
+
+- `class State(TypedDict): graph_state: str`.
+- Three node functions (`introduce`, `happy_path`, `sad_path`) each return a partial state update
+  (string concatenation).
+- `decide_mood(_: State) -> Literal["happy", "sad"]` — `random.choice(...)`, used directly as the
+  conditional-edge selector function (returns a node name string, matched by convention rather
+  than an explicit mapping dict).
+- `build_graph()` — `introduce → {happy|sad} → END`.
+- `studio_graph(config)` just calls `build_graph()` (no config use — nothing to override since
+  there's no LLM).
+
+**Enhancement tasks:**
+- Replace `random.choice` with a deterministic, testable decision function behind a seam (e.g.
+  accept an injectable `random.Random` instance) so unit tests can assert both branches.
+- Best lesson in the repo for a first pytest example: three pure functions, zero I/O, zero API
+  keys required — assert `build_graph().invoke({"graph_state": "X"})["graph_state"]` ends in
+  `" happy!"` or `" sad!"` once randomness is seeded/injected.
+
+### 1.4 `agent_with_tool_router.py` — tool detection → execution → resume
+
+Teaches: `tools_condition` + `ToolNode`, the canonical "detect tool call, execute it, return"
+loop (single pass, not reactive).
+
+- `TOOLS = [multiply]`.
+- `_assemble_tool_router_graph(llm)` — binds `multiply`, node `tool_calling_llm` →
+  `add_conditional_edges("tool_calling_llm", tools_condition)` → node `tools` (prebuilt
+  `ToolNode(TOOLS)`) → `END`. **One-shot**: after the tool executes, the graph ends (no edge back
+  to `tool_calling_llm`), so the tool's result is in state but never shown to the model for a
+  natural-language follow-up.
+- `build_tool_calling_graph(*, model=None)` / `run_demo(graph)` / `studio_graph(config)` follow
+  the standard skeleton exactly — this file is the canonical example to imitate.
+
+**Enhancement tasks:**
+- The "model summarizes the tool result" variant is exactly `agent_with_reactive_router.py`
+  (§1.5) — point users there rather than duplicating.
+- Add a second tool to demonstrate `tools_condition` routing between "no tool needed → END" and
+  "tool needed → tools" more visibly (currently only one tool exists).
+
+### 1.5 `agent_with_reactive_router.py` — the reactive assistant↔tool loop
+
+Teaches: the actual production pattern — the model can call tools repeatedly until it decides
+it's done.
+
+- `TOOLS = [add, multiply, divide]`, `parallel_tool_calls=False` (deterministic sequencing —
+  important since the tools depend on each other's outputs, e.g. "add 3 and 4, multiply by 2,
+  divide by 5").
+- `_assemble_reactive_tool_graph(llm)` — `assistant` node ↔ `tools` node in a genuine loop:
+  `add_conditional_edges("assistant", tools_condition)` then `add_edge("tools", "assistant")` —
+  the loop `agent_with_tool_router.py` deliberately omits.
+- `run_demo(app)` sends a **chained** arithmetic instruction requiring 3 sequential tool calls.
+- `main()` saves an `xray=True` graph image (shows the loop edges explicitly).
+
+**Enhancement tasks:**
+- **No max-iteration guard exists** — if the model gets stuck calling tools indefinitely, this
+  loop has no cutoff. Add a `recursion_limit` via `graph.invoke(..., config={"recursion_limit": N})`,
+  or add an explicit turn counter in state as defense-in-depth. Top production concern for this
+  lesson.
+- `divide` in `utils/tools.py` does not guard against division by zero — `a / b` raises
+  `ZeroDivisionError` uncaught inside `ToolNode` if the model calls it with `b=0`. Fix at the
+  tool level (`utils/tools.py`) since `divide` is shared across stages 01/02/04.
+
+### 1.6 `agent_with_structured_output.py` — LangChain native structured output
+
+Teaches: `ToolStrategy` vs `ProviderStrategy` (auto-selected), the `@structure_output` decorator,
+`create_structured_agent`, `extract_structured_response`.
+
+- Three Pydantic schemas: `ContactInfo`, `ProductReview` (has `rating: int | None = Field(ge=1, le=5)`
+  + `Literal["positive","negative"]` sentiment), `MeetingAction`.
+- Three agent constructors demonstrating three ways to reach the same outcome:
+  `create_contact_extractor_agent()` (decorator style), `create_review_analyzer_agent()`
+  (explicit `ToolStrategy` with `handle_errors=<custom message string>`),
+  `create_meeting_parser_agent()` (`create_structured_agent` convenience wrapper).
+- Four `demo_*` functions exercise each agent plus one dedicated `demo_error_handling()` that
+  intentionally omits the rating field to show automatic retry (`handle_errors=True`).
+- **Verified gap:** not registered in `langgraph.json` (§0.7). `studio_graph(config)` calls
+  `llm_from_config(config)` but discards the returned llm, then calls
+  `create_contact_extractor_agent()`, which builds its own fresh `create_llm()` internally —
+  config overrides for provider/model are silently ignored in Studio.
+
+**Enhancement tasks:**
+- Fix `studio_graph`: thread the resolved `llm` from `llm_from_config` into
+  `create_contact_extractor_agent`, which currently takes no arguments and always calls
+  `create_llm()` fresh — needs a `llm: ChatOpenAI | None = None` parameter.
+- Register this file in `langgraph.json`
+  (`"stage01_structured_output": "./src/langgraph_learning/stage01_foundations/agent_with_structured_output.py:studio_graph"`).
+- `ProductReview.rating` allows `None` even though the field has `ge=1, le=5` — Pydantic only
+  enforces bounds on non-`None` values, so a model that omits the rating bypasses validation. If
+  strict rating capture matters, make it required (`rating: int = Field(...)`) and rely on
+  `handle_errors` to force a retry when missing.
+
+### 1.7 Stage 01 production checklist
+
+- Add `pytest` coverage starting with `agent_with_router.py` (pure logic, no API key) then
+  `agent_with_tool_router.py` / `agent_with_reactive_router.py` with a **mocked** LLM.
+- Add a recursion/iteration cap to `agent_with_reactive_router.py`'s loop (§1.5).
+- Fix `divide`'s zero-division and `agent_with_tool_call.py`'s code duplication (§1.2, §1.5).
+- Close the two `agent_with_structured_output.py` gaps (§1.6) before calling this stage
+  "complete" for Studio parity with the rest of the repo.
+
+---
+
+## Section 2 — Stage 02: Memory Basics
+
+Package: `src/langgraph_learning/stage02_memory_basics/`. Studio graph IDs:
+`stage02_short_term_memory`, `stage02_chat_summary`, `stage02_external_memory`.
+
+Theme: checkpointing conversation state within/across threads — `MemorySaver` (RAM,
+per-process), summarization to bound token growth, and `SqliteSaver` for durability. This stage
+is entirely about the **checkpointer** (thread-scoped state), not the **store** (user-scoped
+state, which is stage05's territory).
+
+### 2.1 `agent_with_short_term_memory.py` — checkpointing the reactive tool loop
+
+Extends stage01's `agent_with_reactive_router.py` with a `MemorySaver` checkpointer so follow-up
+turns can reference prior results without restating them.
+
+- Reuses `TOOLS = [add, multiply, divide]`, same assistant↔tools loop as stage01's reactive
+  router, but `_assemble_short_term_memory_graph(llm, memory: MemorySaver)` compiles with
+  `graph.compile(checkpointer=memory)`.
+- `run_demo(app)` — both turns share one `config = {"configurable": {"thread_id": "memory-demo"}}`.
+  First turn: "Add 3 and 4." Second turn: "Multiply the result by 2." — the second call has no
+  idea what "the result" means except via the replayed message history the checkpointer supplies.
+- `build_agent_graph(*, model=None)` constructs its own `MemorySaver()` — a fresh `MemorySaver()`
+  per call means state does **not** persist across separate `build_agent_graph()` calls or
+  process restarts. RAM-only, single-process memory.
+
+**Enhancement tasks:**
+- Same reactive-loop iteration-cap gap as stage01 §1.5 — the graph topology is identical.
+- If asked to make this lesson durable, don't modify this file in place — point at
+  `agent_with_external_short_term_memory.py` (§2.3 below), the SQLite-backed sibling of this
+  exact lesson.
+- Add a test asserting that a second `graph.invoke(...)` under the **same** `thread_id` contains
+  the first turn's `HumanMessage`/`AIMessage` in `graph.get_state(config).values["messages"]`,
+  and that a **different** `thread_id` does not.
+
+### 2.2 `agent_with_chat_summary.py` — rolling summarization to bound context
+
+Introduces the summarize-and-prune pattern that reappears in stage04
+(`agent_with_stream_interruption.py`) and stage02's own SQLite variant.
+
+- `class State(MessagesState): summary: str`.
+- `conversation(state)` — if `state.get("summary")` is truthy, prepends a `SystemMessage` with
+  the summary before the existing messages; otherwise passes messages through unchanged.
+- `summarize_conversation(state)` — builds a summary-extension prompt (wording differs depending
+  on whether a prior summary exists), invokes the LLM, then
+  `delete_messages = [RemoveMessage(id=msg.id) for msg in state["messages"][:-2]]` — **keeps only
+  the last 2 messages**, deletes everything older via LangGraph's `RemoveMessage` reducer
+  contract (the `add_messages` reducer recognizes `RemoveMessage` as a deletion instruction, not
+  an append).
+- `should_summary(state) -> Literal["summarize_conversation", END]` — triggers summarization once
+  `len(state["messages"]) > 6`. **This is a hardcoded magic number.**
+- Compiled with `MemorySaver()`.
+
+**Enhancement tasks:**
+- Make the `6`-message threshold and the `[:-2]` retention window configurable rather than
+  hardcoded.
+- Message-count is a poor proxy for token count given variable message lengths. Switch the
+  trigger to a token-count check — see `trim_messages(..., token_counter=llm)` in stage04's
+  `agent_with_message_filter.py` (§4.3) for the established pattern already used elsewhere in
+  this repo.
+- Add a test asserting `summary` is empty after ≤6 messages and non-empty (with stale messages
+  removed) after >6.
+
+### 2.3 `agent_with_external_short_term_memory.py` — SQLite-backed durability
+
+The durable sibling of `agent_with_chat_summary.py` — **structurally identical node logic**,
+swapping only the checkpointer.
+
+- `_create_sqlite_saver(db_path: Path) -> SqliteSaver` — `db_path.parent.mkdir(parents=True, exist_ok=True)`,
+  `sqlite3.connect(db_path, check_same_thread=False)`, wraps in `SqliteSaver(conn)`.
+  `check_same_thread=False` is required because LangGraph may invoke the checkpointer from a
+  different thread than the one that opened the connection — do not remove this flag.
+- `_assemble_external_memory_graph(model, saver)` — byte-for-byte the same
+  conversation/summarize_conversation/should_summary nodes as `agent_with_chat_summary.py`
+  (duplicated, not shared).
+- `build_chatbot_graph(model, db_path: Path)` — default path used by `main()`:
+  `artifacts/state_db/example.db`.
+- `studio_graph(config)` reads `overrides.get("db_path", "artifacts/chatbot.db")` — **verified
+  inconsistency**: the default path differs from `main()`'s default
+  (`artifacts/state_db/example.db` vs `artifacts/chatbot.db`).
+
+**Enhancement tasks:**
+- **De-duplicate**: extract the shared conversation/summarize_conversation/should_summary node
+  logic (copy-pasted verbatim between this file and `agent_with_chat_summary.py`) into a shared
+  helper in `utils/` (e.g. `utils/summarizing_graph.py` exposing
+  `build_summarizing_conversation_graph(llm, checkpointer)`), then have both lessons call it with
+  a different checkpointer. Highest-value refactor in stage02.
+- Reconcile the `db_path` default mismatch between `main()` and `studio_graph()`.
+- `sqlite3.connect` opens the DB file but nothing ever closes the connection — a long-running
+  service leaks a file handle per graph build. Wrap in a context manager or expose an explicit
+  `close()`/teardown hook, following the `contextmanager` pattern used in stage06's
+  `agent_with_production_memory.py` (§6.3).
+- Add a test that builds a graph against a temp-dir SQLite path, runs a turn, tears the graph
+  down, rebuilds against the same path, and asserts the prior thread's state is still there.
+
+### 2.4 Stage 02 production checklist
+
+- De-duplicate the summarization node logic shared between `agent_with_chat_summary.py` and
+  `agent_with_external_short_term_memory.py` (§2.3).
+- Replace the hardcoded `6`-message / `[:-2]` thresholds with configurable, ideally token-aware,
+  limits (§2.2).
+- Fix the SQLite connection lifecycle (no close/teardown) and the `db_path` default mismatch (§2.3).
+- All three lessons lack tests; `agent_with_short_term_memory.py` (§2.1) is easiest to test
+  cheaply with a mocked model since it has no LLM-summarization step.
+
+---
+
+## Section 3 — Stage 03: State Management
+
+Package: `src/langgraph_learning/stage03_state_management/`. Studio graph IDs:
+`stage03_parallel_nodes`, `stage03_subgraph`, `stage03_subgraph_memory`,
+`stage03_multiple_state`, `stage03_schema_validation`, `stage03_state_reducer`.
+
+Theme: typed state, reducer semantics, `Send`-based fan-out, subgraph composition and isolation.
+Several lessons are pure `StateGraph` mechanics demos with **no LLM**
+(`agent_with_multiple_state.py`, most of `agent_with_state_reducer.py`, most of
+`agent_with_pydantic_schema_constrain.py`), making them the cheapest lessons in the repo to unit
+test (no API key required).
+
+### 3.1 `agent_with_multiple_state.py` — schema visibility per node (no LLM)
+
+Three independent demonstrations, each with its own `_build_*_graph()` helper:
+
+- **`_build_private_state_graph()`** — `OverallState{foo:int}` → `node_1` returns
+  `PrivateState{baz:int}` → `node_2(state: PrivateState) -> OverallState` (declared via
+  `add_node("node_2", node_2, input_schema=PrivateState)`). Shows a node can temporarily "hop" to
+  a narrower schema than the graph's overall schema.
+- **`_build_single_schema_graph()`** — one `OverallState{question,answer,notes}` shared by all
+  nodes; each node returns only the subset of keys it updates (partial dict updates are merged,
+  not replaced, by default `StateGraph` behavior for un-annotated keys — last-write-wins per key).
+- **`_build_explicit_io_graph()`** — `StateGraph(OverallState, input_schema=InputState,
+  output_schema=OutputState)` — the graph's **public** contract (`{question}` in, `{answer}` out)
+  is narrower than its **internal** working schema (which also carries `notes`). Reach for this
+  pattern whenever a service needs to hide internal scratch fields from external callers.
+- `studio_graph(config)` reads `overrides.get("variant")` (`"private"` / `"single"` / default
+  explicit-IO) to let Studio pick which of the three demos to load.
+
+**Enhancement tasks:**
+- Zero API key, zero network calls — write pytest coverage for all three `_build_*` functions
+  first.
+
+### 3.2 `agent_with_parallel_nodes.py` — map-reduce fan-out with `Send`
+
+The canonical parallelism lesson.
+
+- `OverallState{topic, subjects, jokes: Annotated[list[str], operator.add], best_selected_joke}`,
+  `JokeState{subject}` (per-branch input schema for the fanned-out node).
+- `generate_topics` uses `llm.with_structured_output(Subjects)` to get exactly 3 subtopics.
+- `continue_to_jokes(state) -> list[Send]` — the fan-out mechanism: returns a
+  `Send("generate_joke", {"subject": s})` per subject instead of a static edge list, wired via
+  `builder.add_conditional_edges("generate_topics", continue_to_jokes, ["generate_joke"])`.
+- `generate_joke(state: JokeState)` runs once per `Send`, executed concurrently by LangGraph,
+  appending to `jokes` via the `operator.add` reducer. Without that reducer annotation,
+  concurrent writes to the same key raise `InvalidUpdateError` (deliberately demonstrated in
+  `agent_with_state_reducer.py`, §3.4).
+- `best_joke` uses `llm.with_structured_output(BestJoke)` to pick an index, with a defensive
+  `try/except IndexError` re-raising a clearer `ValueError` if the model hallucinates an
+  out-of-range index.
+
+**Enhancement tasks — verified as the most important lesson in the repo for the fan-out
+concurrency gap (§0.8 item 5):**
+- `continue_to_jokes` fans out one `generate_joke` (LLM call) per subject with **no cap**. Add
+  `RunnableConfig(max_concurrency=N)` when invoking, or validate `len(subjects) <= MAX_FANOUT`
+  before creating `Send`s.
+- The `IndexError` guard in `best_joke` is good defensive practice, but a wrong-but-in-range
+  index is undetectable and silently picks the wrong joke. If reusing this pattern for
+  higher-stakes selection, prefer returning the **content** of the choice via structured output
+  rather than a numeric index.
+- Add a test with a fake structured-output LLM stub asserting `jokes` accumulates one entry per
+  subject and `best_selected_joke` matches one of them.
+
+### 3.3 `agent_with_pydantic_schema_constrain.py` — TypedDict vs dataclass vs Pydantic (no LLM)
+
+- Same 3-node branching graph (`node_1 → {node_2|node_3}`) reused across three state
+  representations via a shared `build_graph(state_type, node_1_fn)` helper — the cleanest "one
+  graph shape, swap the schema" pattern in the repo.
+- `PydanticState` has a `@field_validator("mood")` enforcing `{"happy","sad"}` and
+  `demonstrate_pydantic_validation()` deliberately constructs an invalid instance (`mood="mad"`)
+  to catch and print the `ValidationError` — the only lesson intentionally exercising a
+  validation-failure path end-to-end.
+- `run_dataclass_example()` must pass a placeholder `mood="sad"` at construction time even though
+  the graph overwrites it immediately — dataclasses (unlike `TypedDict`) require all fields at
+  construction.
+
+**Enhancement tasks:**
+- Add an equivalent validation-failure demonstration for `TypedDictState` (there isn't one —
+  `TypedDict` performs no runtime validation at all; try invoking with
+  `{"name": "X", "mood": "furious"}` to show it's silently accepted, contrasting with the
+  Pydantic path's `ValidationError`).
+- Zero API key required — good second target for pytest coverage.
+
+### 3.4 `agent_with_state_reducer.py` — reducer conflict/merge semantics (no LLM)
+
+Four independent mini-graphs:
+
+- `_build_default_overwrite_graph()` — single writer, last-write-wins (trivial baseline).
+- `_build_branching_conflict_graph()` — `node_1 → {node_2, node_3}` **both** writing un-annotated
+  `foo: int` in parallel → `demonstrate_branching_conflict()` deliberately triggers and catches
+  `langgraph.errors.InvalidUpdateError`. Concrete proof for why parallel-writing nodes need
+  `Annotated[T, reducer]` fields.
+- `_build_reducer_append_graph()` using `Annotated[list[int], operator.add]`, plus a **custom**
+  reducer `reduce_list(left, right)` that tolerates `None` inputs — **defined but verified never
+  wired into a graph** (§0.7); `AppendReducerState` uses stdlib `operator.add` instead.
+  `demonstrate_reducer_append()` shows `operator.add` itself raising `TypeError` when invoked
+  with `{"foo": None}`, proving why `reduce_list`'s `None`-guard would be the safer choice.
+- `studio_graph(config)` picks a variant via `overrides.get("variant")` (`"branching"` /
+  `"append"` / default overwrite).
+
+**Enhancement tasks:**
+- The custom `reduce_list` function is defined but never used — wire it into a fourth demo graph
+  (`_build_null_safe_append_graph()`) so `AppendReducerState`'s `TypeError` failure mode has a
+  fixed counterpart in the same file.
+- Good target for pytest coverage — assert `InvalidUpdateError` is raised for the
+  branching-conflict graph and NOT raised for the append-reducer graph under identical topology.
+
+### 3.5 `agent_with_subgraph.py` — schema-isolated subgraph composition (no LLM)
+
+- `EntryGraphState{raw_logs, cleaned_logs, fa_summary, report, processed_logs: Annotated[list[str], operator.add]}`
+  is the parent; `FailureAnalysisState`/`FailureAnalysisOutputState` and
+  `QuestionSummarizationState`/`QuestionSummarizationOutputState` are private to each sub-graph,
+  sharing only `cleaned_logs` (input) and `processed_logs` (output, via the shared `operator.add`
+  reducer — both sub-graphs contribute without colliding).
+- `build_failure_analysis_subgraph()` / `build_question_summary_subgraph()` each use
+  `StateGraph(state_schema=X, output_schema=Y)` to publish only a subset of internal state back
+  to the parent.
+- `build_entry_app()` wires `clean_logs → {failure_analysis, question_summarization}` as two
+  parallel branches (static edges, not `Send`) both terminating at `END`.
+- **Verified: no LLM calls anywhere in this lesson** — `summarize_failures`/`summarize_questions`
+  are plain Python string-joining, not LLM calls, despite modeling a "summarization" pipeline.
+
+**Enhancement tasks:**
+- If asked to make this "production-grade," the natural extension is swapping in an actual
+  `llm.invoke(...)` call inside `generate_summary`, which also then requires adding
+  `require_llm_provider_api_key()` to `main()` (currently absent since no LLM is used today).
+- Zero API key currently required — good target for pytest coverage of the sub-graph wiring
+  itself (assert `processed_logs` contains entries from both sub-graphs after one `invoke`).
+
+### 3.6 `agent_with_subgraph_memory.py` — memory isolation between subgraph instances
+
+- `_assemble_agent_subgraph(llm, isolated: bool)` — the **same** subgraph builder produces two
+  different memory behaviors depending on the flag: `sub_builder.compile(checkpointer=True)`
+  (subgraph manages its own checkpoint namespace, isolated per invocation) vs
+  `sub_builder.compile()` (no checkpointer of its own — inherits/shares the parent graph's
+  checkpointer).
+- `analyst(state, config: RunnableConfig)` reads `config["configurable"]["agent_id"]` and echoes
+  joined prior message contents back — a deliberately simple cross-talk probe.
+- `_assemble_parent_graph(agent, memory)` — parent compiled with `checkpointer=memory`
+  (`MemorySaver`) regardless of the child's isolation setting; `delegate` node is a no-op
+  passthrough.
+- `run_agents(graph, agent_sequence)` — invokes the **same** `thread_id=("shared-ticket")` for
+  two different `agent_id`s in sequence, then prints what each "sees."
+
+**Enhancement tasks:**
+- `compile(checkpointer=True)` (isolated subgraph): passing the literal boolean `True` (not an
+  instance) tells LangGraph "use the parent's checkpointer implementation but scope it to this
+  subgraph's own namespace" — it is NOT the same as passing no checkpointer, and NOT the same as
+  passing a fresh `MemorySaver()` instance. Get this wrong and isolation silently breaks.
+- Add a test asserting that under `isolated=True`, agent "beta"'s state does not contain agent
+  "alpha"'s prior message content, and that under `isolated=False` it does — currently only
+  verified by eyeballing console output.
+
+### 3.7 Stage 03 production checklist
+
+- Add the missing concurrency cap to `agent_with_parallel_nodes.py`'s `Send` fan-out (§3.2) —
+  highest priority in this stage.
+- Wire the unused `reduce_list` custom reducer into an actual demo graph in
+  `agent_with_state_reducer.py` (§3.4).
+- Five of six lessons in this stage require no LLM and no API key — this stage should be the
+  first place pytest coverage lands repo-wide.
+- If `agent_with_subgraph.py`'s placeholder summarizers are ever swapped for real LLM calls
+  (§3.5), remember to add the now-required `require_llm_provider_api_key()` preflight.
+
+---
+
+## Section 4 — Stage 04: Operational Control
+
+Package: `src/langgraph_learning/stage04_operational_control/`. Studio graph IDs:
+`stage04_interruption`, `stage04_validation_loop`, `stage04_tool_approval`,
+`stage04_stream_interruption`, `stage04_time_travel`, `stage04_durable_execution`,
+`stage04_message_filter`, `stage04_dynamic_interruption`.
+
+Theme: pausing, inspecting, resuming, forking, and rate-limiting a running graph — the
+human-in-the-loop and durability primitives (`interrupt`, `Command(resume=...)`,
+`interrupt_before`, checkpoint history, `@task`). This stage requires distinguishing **three
+different interrupt mechanisms** before modifying any lesson here.
+
+**The three interrupt mechanisms, disambiguated:**
+
+| Mechanism | Where it's raised | Lesson | Resume shape |
+|---|---|---|---|
+| `interrupt_before=[node_name]` at compile time | Graph-level, before a whole node runs | `agent_with_interruption.py` | `graph.stream(None, config, ...)` — plain continuation, no payload |
+| `raise interrupt(payload)` inside a node body | Node-level, mid-execution | `agent_with_dynamic_interruption.py`, `agent_with_durable_execution.py` | `graph.update_state(...)` then re-stream with `None` |
+| `interrupt(payload)` inside a **tool** implementation | Tool-level, mid-tool-call | `agent_with_tool_approval_interrupt.py`, `agent_with_validation_loop.py` | `graph.invoke(Command(resume=value), config)` — resume value flows back as `interrupt()`'s return value |
+
+### 4.1 `agent_with_interruption.py` — static graph-level breakpoint
+
+- `_assemble_tool_agent_graph(llm, memory, *, interrupt_before: list[str])` — arithmetic
+  assistant↔tools loop (same shape as stage01/02's reactive router) compiled with
+  `builder.compile(interrupt_before=interrupt_before, checkpointer=memory)`.
+  `build_tool_agent_graph_with_breakpoint()` hardcodes `interrupt_before=["tools"]`.
+- `stream_until_interrupt` / `resume_from_breakpoint` — resume is
+  `graph.stream(None, thread, stream_mode="values")`: passing `None` as input tells LangGraph
+  "continue from the last checkpoint," which only works because a checkpointer is attached.
+- `approval_flow(graph)` — uses a blocking `input()` CLI prompt to simulate human approval. This
+  is CLI-only; a service/API context needs to persist the `thread` config somewhere (DB, queue)
+  and expose a separate "resume this thread" endpoint instead of blocking on stdin.
+- **Verified (§0.7):** optional `langgraph_sdk.get_client` import guarded by `HAS_SDK`, but the
+  flag is never read after being set — dead code.
+
+**Enhancement tasks:**
+- Either implement the SDK-based hosted-approval-flow example the docstring promises ("mirrors
+  the same approval dance through the LangGraph SDK client") using the imported `get_client`, or
+  remove the dead `HAS_SDK`/import if out of scope.
+- Replace the blocking `input()` in `approval_flow` with an async/queue-based resume path if this
+  pattern is lifted into a real service.
+
+### 4.2 `agent_with_dynamic_interruption.py` — mid-node `interrupt()` for guardrails
+
+- `step_2(state)` raises `interrupt(f"...longer than {max_length} characters...")` when
+  `len(state["input"]) > max_length` (default `max_length=5`, deliberately tiny so the demo input
+  `"hello world"` trips it immediately).
+- `run_until_interrupt` → `retry_without_change` (resumes with unmodified state — still fails,
+  proving `interrupt` re-raises on every resume until the condition is actually fixed) →
+  `update_state_and_resume` (calls `graph.update_state(thread, {"input": "hi"})` to shrink the
+  input, then resumes successfully).
+- `state.tasks` / `state.next` inspected via `graph.get_state(thread)`.
+
+**Enhancement tasks:**
+- No retry cap exists — an operator (or a buggy caller) could resume-without-fixing indefinitely.
+  Add a retry-count field to `State` and force escalation/abort after N failed resumes.
+- Pattern to reuse for any new "validate and halt" node: `if <bad condition>: raise
+  interrupt(<message>)` — note the codebase consistently **raises** interrupt, not `return`s it.
+
+### 4.3 `agent_with_message_filter.py` — three strategies for bounding history sent to the model
+
+Covers reducer-based deletion, invocation-time slicing, and token-aware trimming, run in
+sequence against progressively longer transcripts:
+
+- `demonstrate_basic_messages` — baseline, no filtering.
+- `_build_reducer_graph` — `filter_messages` node returns `[RemoveMessage(id=m.id) for m in
+  state["messages"][:-2]]` before the chat node runs — **permanently** prunes state (same
+  mechanism as stage02's summarizer).
+- `_build_filtered_invocation_graph` — `llm.invoke(state["messages"][-1:])` — state keeps
+  everything; only the **model call** sees a narrow slice.
+- `_build_trim_messages_graph` — `trim_messages(state["messages"], max_tokens=100,
+  strategy="last", token_counter=llm, allow_partial=False)` — the only **token-aware** (vs.
+  message-count-aware) strategy in the repo, using the actual model's tokenizer via LangChain.
+- `studio_graph(config)` picks a mode (`"reduce"`/`"filter"`/`"trim"`/default-basic) via
+  `overrides.get("mode")`.
+
+**Enhancement tasks:**
+- This file is the canonical reference for fixing stage02's magic-number summarization threshold
+  (§2.2) — port `trim_messages(..., token_counter=llm)` there instead of raw message count.
+- No test coverage; `_build_trim_messages_graph` is the highest-value target (does it actually
+  stay under 100 tokens? does `allow_partial=False` never split a message?).
+
+### 4.4 `agent_with_stream_interruption.py` — streaming modes, not really "interruption"
+
+Misleadingly named — actually a **streaming-modes** tour built on the same summarizing
+conversation graph as stage02:
+
+- `stream_updates_raw` (`stream_mode="updates"`, raw per-node dict chunks) vs
+  `stream_updates_messages` (same mode, prints only the `conversation` node's message) vs
+  `stream_values` (`stream_mode="values"`, full state snapshot after each step) vs
+  `stream_event_overview`/`stream_chat_model_tokens`/`stream_chat_model_chunks`
+  (`astream_events`, `version="v2"`, filtered by `event["event"] == "on_chat_model_stream"` and
+  `event["metadata"]["langgraph_node"] == node_to_stream` for token-level streaming).
+- **This is the reference implementation for token-by-token streaming** in the repo — copy the
+  `astream_events` filter pattern from `stream_chat_model_tokens` verbatim if adding streaming UI
+  support elsewhere.
+- **Verified (§0.7):** `HAS_SDK` guard present again, also dead code.
+
+**Enhancement tasks:**
+- Consider splitting streaming-modes content from any future genuine interruption content if
+  this file grows further (don't rename without updating `langgraph.json`'s
+  `stage04_stream_interruption` key).
+- `stream_chat_model_tokens`/`stream_chat_model_chunks` hardcode `node_to_stream="conversation"`
+  as a default — fine for the demo, but validate the node name exists in the graph first if
+  reused as a library function.
+
+### 4.5 `agent_with_time_travel.py` — checkpoint replay and fork
+
+- `run_initial_execution` seeds checkpoints by running the arithmetic tool agent once.
+- `list_checkpoints(graph, config)` — `graph.get_state_history(config)` returns snapshots
+  newest-first; `_extract_checkpoint_id` pulls `snapshot.config["configurable"]["checkpoint_id"]`.
+- `_pick_checkpoint` — chooses the **first snapshot that still has pending work**
+  (`snapshot.next` non-empty), not simply the latest or earliest.
+- `replay_from_snapshot` — streams from `snapshot.config` with `None` input: **read-only**, does
+  not create new checkpoints.
+- `fork_from_snapshot` — `graph.update_state(checkpoint_config, {"messages": [HumanMessage(...)]},
+  as_node="__start__")` — the fork operation: injecting a new message `as_node="__start__"` at an
+  old checkpoint creates a **new branch** in the same thread's history rather than mutating the
+  original. Uses a fresh `HumanMessage` (no reused `id`) so it's an addition, not an in-place edit.
+
+**Enhancement tasks:**
+- `as_node="__start__"` is a load-bearing, easy-to-get-wrong detail — if a future lesson needs to
+  fork mid-graph (not at the entry point), `as_node` must name the actual node whose output is
+  being overridden, not always `"__start__"`.
+- Add a regression test: seed one checkpoint, fork it, assert `graph.get_state_history(config)`
+  now contains both the original and forked branches with a shared prefix but divergent tails.
+
+### 4.6 `agent_with_durable_execution.py` — `@task`-cached non-determinism + SQLite
+
+- `@task`-decorated `_allocate_campaign_id(brand)` and `_draft_campaign_plan(prompt)` — wrapping
+  side-effecting/non-deterministic work (`random.randint`, an LLM call) in `langgraph.func.task`
+  means their results are **cached in the checkpoint** on first run; on resume after an
+  interrupt, LangGraph replays the cached result instead of re-executing.
+- **Verified bug worth flagging explicitly:** `LLM_SINGLETON` is a **module-level global**, set
+  inside `_assemble_durable_graph` via `global LLM_SINGLETON`. This works for the single-graph
+  demo but is unsafe for multiple concurrent graph instances with different LLMs in the same
+  process (e.g. multi-tenant Studio sessions) — the last-constructed graph's LLM silently wins
+  for all `@task`-wrapped calls. Must become a closure-captured or state-threaded dependency
+  instead of a global before this pattern is reused elsewhere.
+- `await_approval` raises `interrupt(...)` (node-level mechanism) when `not
+  state.get("approved")`; `approve_and_resume` calls `graph.update_state(thread, {"approved":
+  True})` then re-streams with `durability="sync"` — ensures checkpoints flush to SQLite before
+  the stream yields the next event.
+- `_create_sqlite_saver` duplicated verbatim from `agent_with_external_short_term_memory.py`
+  (§2.3) — same `check_same_thread=False` requirement, same connection-lifecycle gap.
+
+**Enhancement tasks:**
+- **Fix the `LLM_SINGLETON` global** before this pattern is reused anywhere else — thread the LLM
+  through `@task` calls via `functools.partial` or a class-based task wrapper.
+- Same SQLite connection-lifecycle gap as §2.3 — fix once, reuse here.
+- Add a test proving the cache actually works: run to the interrupt, capture the allocated
+  `campaign_id`, resume, assert the **same** `campaign_id` persists (i.e. `_allocate_campaign_id`
+  was not re-invoked).
+
+### 4.7 `agent_with_tool_approval_interrupt.py` — approval gate inside a tool body
+
+- `transfer_funds` tool calls `interrupt(pending_dict)` **from inside its own implementation**
+  (tool-level mechanism). The `decision = interrupt(pending)` return value is whatever the caller
+  supplies via `Command(resume=decision)` on the next `graph.invoke(...)` — the only lesson
+  demonstrating a resume payload that **overrides the tool's original arguments**
+  (`final_amount = decision.get("amount", amount)`), not just approve/reject.
+- `start_transfer_request` reads `result.get("__interrupt__", [])` — the interrupt payload
+  surfaces under this special key in `graph.invoke`'s result (as opposed to `graph.stream`, which
+  the graph-level-breakpoint lesson uses).
+- Two parallel demo threads: `approve_transfer(..., edited_amount=110)` (approve **and** edit) vs
+  `reject_transfer` (`Command(resume={"approved": False})`).
+
+**Enhancement tasks:**
+- No validation on the resume payload shape — `decision.get("amount", amount)` silently accepts a
+  malformed or negative amount from whoever calls `Command(resume=...)`. Since this models a
+  **financial transfer**, add explicit bounds/type validation on the resume payload before
+  treating it as authoritative — the resume caller might be a different service than the one that
+  started the run.
+- Good template for any "tool needs inline human approval with editable args" feature — copy this
+  file's `interrupt()`-inside-tool pattern rather than the graph-level `interrupt_before` pattern
+  when the ask is specifically about editing arguments, not just approve/deny.
+
+### 4.8 `agent_with_validation_loop.py` — looping `interrupt()` until valid input
+
+- `collect_age(state)` — a `while True:` loop **inside a single node** that calls
+  `interrupt({"prompt": prompt})` repeatedly, adjusting the prompt message each iteration based on
+  the previous invalid answer, until `isinstance(answer, int) and answer > 0`.
+- **LangGraph mechanic worth explaining explicitly:** each `interrupt()` call inside the same
+  node execution, on resume, picks up exactly where it left off in the `while` loop (LangGraph
+  replays the node function from the top on resume but returns cached interrupt values for calls
+  already resolved — this is why the loop doesn't restart from scratch each retry).
+- `retry_with_invalid_input` resumes with `Command(resume="twenty")` (a string, fails the
+  `isinstance(answer, int)` check) before `supply_valid_age` resumes with `Command(resume=27)`.
+
+**Enhancement tasks:**
+- No maximum retry count — could loop forever. Add a retry ceiling that eventually routes to a
+  fallback/error node instead of looping indefinitely.
+- Cleanest, most reusable pattern in stage04 for "keep asking until the human gives valid input"
+  — prefer copying this over building a custom retry loop with graph-level edges.
+
+### 4.9 Stage 04 production checklist
+
+- Fix the `LLM_SINGLETON` global in `agent_with_durable_execution.py` (§4.6) — the most
+  significant correctness bug found in the entire repo audit.
+- Add a retry/attempt ceiling to both `agent_with_dynamic_interruption.py` (§4.2) and
+  `agent_with_validation_loop.py` (§4.8) — both loops are currently unbounded.
+- Resolve or remove the dead `HAS_SDK`/`get_client` imports in `agent_with_interruption.py` and
+  `agent_with_stream_interruption.py` (§4.1, §4.4).
+- Validate the resume payload in `agent_with_tool_approval_interrupt.py` before trusting it for a
+  simulated financial action (§4.7).
+- Reuse the shared SQLite-connection-lifecycle fix across `agent_with_durable_execution.py` and
+  `agent_with_external_short_term_memory.py` (§2.3) once implemented in one place.
+
+---
+
+## Section 5 — Stage 05: Advanced Memory Systems
+
+Package: `src/langgraph_learning/stage05_advanced_memory_systems/`. Studio graph IDs:
+`stage05_structured_memory`, `stage05_fact_collection`, `stage05_long_term_memory`,
+`stage05_multi_memory`. Shared file: `configuration.py`.
+
+Theme: the LangGraph **store** (cross-thread, user-scoped memory — distinct from the
+checkpointer used in stage02/04, which is thread-scoped). All four lessons pair `InMemoryStore`
+(long-term, keyed by `user_id`) with `MemorySaver` (short-term, keyed by `thread_id`)
+simultaneously, via `builder.compile(store=store, checkpointer=checkpointer)`.
+
+### 5.1 `configuration.py` — shared config dataclass
+
+```python
+@dataclass(kw_only=True)
+class MemoryConfiguration:
+    user_id: str = "default-user"
+
+    @classmethod
+    def from_runnable_config(cls, config=None) -> "MemoryConfiguration": ...
+```
+
+Resolves `user_id` from (in order) an environment variable named after the field in upper case
+(`USER_ID`), then `config["configurable"]["user_id"]`, then the dataclass default. Used by
+`agent_with_fact_collection.py`, `agent_with_long_term_memory.py`, and
+`agent_with_multi_memory_coordination.py` (NOT `agent_with_structured_memory.py` — see §5.2).
+Passed to `StateGraph(MessagesState, config_schema=MemoryConfiguration)` so LangGraph/Studio know
+to expose `user_id` as a configurable field in the UI.
+
+**Enhancement task:** this dataclass has exactly one field today. If any lesson needs a second
+cross-cutting config value (e.g. a `memory_limit` or `namespace_prefix`), add it here rather than
+inventing a parallel config mechanism.
+
+### 5.2 `agent_with_structured_memory.py` — single structured user profile
+
+- `UserProfile(BaseModel)`: `name`, `location`, `job` (all `Optional[str] = None`), `interests:
+  List[str] = Field(default_factory=list)`.
+- `_call_model_with_memory` reads `store.get(("profile", user_id), "user_profile")` — **one
+  document per user, fixed key `"user_profile"`** — overwritten wholesale on every update (the
+  merge happens because the extractor LLM is shown the existing profile as context and asked to
+  "update" it — the merge logic lives in the prompt, not in code).
+- `_update_profile_with_structured_output` uses a **separate** `extractor_llm` from the
+  response-generating `llm` (`_assemble_profile_graph(llm, extractor_llm, ...)`) — allows using a
+  cheaper/faster model for structured extraction than for conversational replies, a legitimate
+  production cost-optimization pattern already baked in.
+- **Verified inconsistency:** `_call_model_with_memory` and
+  `_update_profile_with_structured_output` both do `config["configurable"]["user_id"]` directly
+  (raw dict indexing), unlike the other three stage05 lessons which go through
+  `MemoryConfiguration.from_runnable_config(config)`. This lesson raises a raw `KeyError` (not a
+  clean validation error) if a caller forgets to supply `user_id`.
+- `studio_graph(config)` supports **separate override namespaces** for the extractor model
+  (`extractor_provider`, `extractor_model`, `extractor_temperature`, `extractor_api_key`,
+  `extractor_base_url`, each falling back to the non-prefixed key) — good pattern to copy for any
+  future independently-configurable dual-model setup.
+
+**Enhancement tasks:**
+- Switch to `MemoryConfiguration.from_runnable_config(config)` like the other three lessons, for
+  consistent error behavior when `user_id` is missing.
+- Add a test proving the two-model split works: stub `extractor_llm` and `llm` separately,
+  assert only the extractor model's structured-output path is invoked by the update node.
+
+### 5.3 `agent_with_fact_collection.py` — flexible multi-fact collection (vs. single profile)
+
+- `Memory(BaseModel)`: single field `content: str`. Deliberately unstructured/flexible — the
+  opposite design choice from `agent_with_structured_memory.py`'s fixed-field `UserProfile`.
+- `_create_update_facts_node` builds `structured_agent = create_agent(model=llm, tools=[],
+  response_format=ToolStrategy(schema=Memory, handle_errors=True))` **once**, at node-factory
+  time (not per-invocation) — correct/efficient.
+- **Storage model:** each fact gets `store.put(namespace, str(uuid.uuid4()), ...)` — a **new
+  document per turn**, never overwritten, never deduplicated. Contrast directly with
+  `agent_with_structured_memory.py`'s single fixed-key document. Facts can accumulate
+  near-duplicates indefinitely — there is no consolidation step.
+- `inspect_saved_facts(graph, user_id)` — demo-only helper reaching into `graph.store` directly
+  (exposed on the compiled graph object) to enumerate everything under `("memories", user_id)`.
+
+**Enhancement tasks:**
+- **Unbounded growth is the real production gap here:** add either (a) a periodic
+  consolidation/dedup node (LLM-driven merge of near-duplicate facts), or (b) a cap on stored
+  facts per user with LRU or relevance-based eviction.
+- Add a test asserting N distinct `store.put` calls after N distinct fact-bearing turns (proves
+  no accidental overwrite), and a second test proving near-duplicate facts are NOT automatically
+  merged today (documents the current limitation).
+
+### 5.4 `agent_with_long_term_memory.py` — cross-thread bullet-list reflection
+
+- Two-node graph: `call_model` (reads `store.get(("memory", user_id), "user_memory")`, injects as
+  system prompt) → `write_memory` (regenerates the **entire** bullet-list summary from scratch
+  each turn via `CREATE_MEMORY_INSTRUCTION`, then `store.put`s the whole thing back).
+- **Key architectural note vs. `agent_with_fact_collection.py`:** this lesson **fully
+  regenerates** memory text every turn (LLM shown old memory + new conversation, asked to produce
+  a merged bullet list) rather than appending new documents. Token cost scales with total memory
+  size on every single turn since the whole memory blob is both read and rewritten each time.
+- `demo_conversation` uses one fixed `thread_id="thread-1"` + `user_id="leslie"` — **verified:
+  the cross-thread claim in the docstring** ("knowledge survives across conversations") **is not
+  actually demonstrated in `main()`'s demo**, which never uses a second thread_id. It's an
+  architectural capability shown only by the state design (`user_id`-keyed store, separate from
+  `thread_id`-keyed checkpointer), not exercised by the scripted demo.
+
+**Enhancement tasks:**
+- Add a second demo thread (`thread_id="thread-2"`, same `user_id="leslie"`) to
+  `demo_conversation`/`main()` to actually demonstrate the cross-thread claim — currently
+  unverified by the code itself.
+- The full-regeneration-every-turn cost profile is the main optimization target: consider
+  switching to `agent_with_fact_collection.py`'s append-only model, or a hybrid (append facts,
+  periodically consolidate into the bullet summary) if both recency and cost matter.
+
+### 5.5 `agent_with_multi_memory_coordination.py` — intelligent routing across 3 memory types
+
+The most sophisticated lesson in this stage — coordinates **three** memory namespaces
+(`("profile", user_id)`, `("todo", user_id)`, `("instructions", user_id)`) via a router node.
+
+- `UpdateMemory(TypedDict): update_type: Literal["user", "todo", "instructions"]` bound as a
+  **pseudo-tool** (`llm.bind_tools([UpdateMemory], parallel_tool_calls=False)`) — the model
+  doesn't call a real function; it emits a structured "which memory type should I update"
+  decision, which `route_message` (the conditional-edge function) reads out of
+  `message.tool_calls[0]["args"]["update_type"]` to pick the next node. This "bind a TypedDict as
+  a fake tool purely for routing" pattern is unique to this lesson in the repo.
+- Graph topology: `task_orchestra` (router) → conditional edge → one of `{update_profile,
+  update_todos, update_instructions}` → **back to `task_orchestra`** (loop, not `END`) — control
+  returns to the router after any memory update, which returns `END` once the latest message has
+  no more tool calls.
+- `Profile` and `ToDo` Pydantic schemas both use `create_structured_agent` independently per
+  updater node — a single "add a todo" turn costs at least 2 LLM calls (router decision + todo
+  extraction), sometimes 3 including the final confirmation pass.
+- `update_profile`/`update_todos` both call `store.put(namespace, str(uuid.uuid4()), ...)` —
+  **same unbounded-accumulation gap as `agent_with_fact_collection.py`** (§5.3), applied here to
+  profile and todo documents too.
+- Each updater node returns a synthetic **tool message** (`{"role": "tool", "content": "...",
+  "tool_call_id": ...}`) to satisfy the OpenAI tool-calling protocol's requirement that every
+  `tool_calls` entry gets a matching tool response before the next assistant turn — removing this
+  would break the conversation for OpenAI-compatible providers on the next turn.
+
+**Enhancement tasks:**
+- Same unbounded per-user document accumulation as §5.3 — apply the same consolidation/cap fix
+  here for `profile`/`todo` namespaces. `ToDo.status` already models lifecycle (`"not
+  started"|"in progress"|"done"|"archived"`) — a natural first fix is a periodic node that
+  archives/prunes `"done"`/`"archived"` todos older than N days.
+- Highest per-turn LLM-call-count lesson in the repo — if latency/cost is a concern, this is the
+  first lesson to instrument with per-node latency logging.
+- Add a test asserting `route_message` returns the correct next-node string for each of the three
+  `update_type` literal values plus the `END` fallback when no tool call is present — this
+  routing function is pure and trivially testable without any LLM.
+
+### 5.6 Stage 05 production checklist
+
+- Fix the `KeyError`-prone raw `config["configurable"]["user_id"]` access in
+  `agent_with_structured_memory.py` to match its siblings' use of `MemoryConfiguration` (§5.2).
+- Address unbounded per-user document growth in both `agent_with_fact_collection.py` (§5.3) and
+  `agent_with_multi_memory_coordination.py`'s profile/todo namespaces (§5.5) — the single biggest
+  structural gap in this stage for any lesson meant to run against real, long-lived users.
+- Actually demonstrate the cross-thread memory claim in `agent_with_long_term_memory.py`'s demo
+  (§5.4) — currently asserted only in the docstring.
+- `route_message` in `agent_with_multi_memory_coordination.py` (§5.5) is the best pure-logic
+  unit-test target in this stage.
+
+---
+
+## Section 6 — Stage 06: Production Systems
+
+Package: `src/langgraph_learning/stage06_production_systems/`. Studio graph IDs:
+`stage06_parallel_retrieval`, `stage06_semantic_memory`, `stage06_production_memory`,
+`stage06_deep_research`. Related script (not a lesson, a manual ops tool):
+`scripts/production_memory_smoke.py`.
+
+Theme: real external retrieval (Tavily + Wikipedia in parallel), embedding-backed semantic
+search, durable multi-backend persistence (Postgres/MongoDB/Redis), and a full multi-agent
+research pipeline combining structured output, human-in-the-loop, sub-graphs, and parallel
+fan-out from every earlier stage. Despite the name, these lessons still carry the same
+production gaps called out in §0.8 (no tests, no retries, no rate limiting) — "production
+systems" describes the *architectural patterns taught* (durable backends, semantic recall), not
+that the code itself is deployment-hardened.
+
+### 6.1 `agent_with_parallel_retrieval.py` — Tavily + Wikipedia fan-in
+
+- `RetrievalState{question, answer, context: Annotated[list[str], operator.add]}`.
+- `search_web` and `search_wikipedia` both write to `context` via the `operator.add` reducer,
+  wired as **static parallel edges** (`add_edge(START, "search_web")` and `add_edge(START,
+  "search_wikipedia")`, both feeding into `generate_answer`) — not `Send`-based dynamic fan-out
+  (contrast with §3.2), because the fan-out here is fixed (always exactly these 2 sources), not
+  data-dependent.
+- `_extract_tavily_results(raw)` — defensive normalization: handles `ToolMessage`, JSON string,
+  dict-with-`"results"` key, or already-a-list, returning `[]` on any unrecognized shape. Most
+  defensive parsing function in the repo — good template for wrapping any third-party tool whose
+  return shape isn't strictly typed.
+- `generate_answer` builds one big context string and asks the LLM to answer strictly from
+  provided context (grounding instruction in the system prompt, not enforced structurally).
+- Requires both `require_llm_provider_api_key()` and `require_env("TAVILY_API_KEY")`.
+
+**Enhancement tasks:**
+- Neither `search_web` nor `search_wikipedia` has a timeout or try/except around the network
+  call — a slow/failing Tavily or Wikipedia request blocks or crashes the whole graph. Since
+  `context` uses an additive reducer, catch exceptions in each search node and return
+  `{"context": []}` on failure (same shape as "no results"), letting `generate_answer` work with
+  whatever context did arrive.
+- Add a test for `_extract_tavily_results` covering all four input shapes it claims to handle
+  plus at least one it doesn't (assert `[]` rather than raising).
+
+### 6.2 `agent_with_semantic_memory.py` — embedding-indexed `InMemoryStore`
+
+- `create_semantic_store(model_name="openai:text-embedding-3-small") -> InMemoryStore` —
+  `init_embeddings(model_name)` then `InMemoryStore(index={"embed": embeddings, "dims": 1536})`.
+  **Explicit constraint documented in the code comment:** `init_embeddings` only succeeds when
+  the configured provider is OpenAI — this lesson does **not** honor `LLM_PROVIDER=openrouter` or
+  `LLM_PROVIDER=deepseek` for the embedding step even if the chat model is switched via those
+  providers, because embeddings are hardcoded to `"openai:..."`.
+- `write_memory` only stores a memory when `"remember" in text.lower()` — a trivial keyword gate,
+  not an LLM-driven decision about what's worth remembering (contrast with §5.3's
+  structured-output extraction on every turn).
+- `conversation` node calls `store.search(namespace, query=query, limit=3)` and surfaces
+  `item.score` (cosine-similarity-derived distance) inline in the injected memory text — the only
+  lesson in the repo that surfaces retrieval scores to the model/operator.
+
+**Enhancement tasks:**
+- If asked to make this provider-agnostic, fix `create_semantic_store` to accept an explicit
+  `embeddings` object (or resolve via `utils/llm.py`-style provider settings) instead of
+  hardcoding `init_embeddings("openai:...")`.
+- The `"remember" in text.lower()` gate misses implicit facts ("I live in Austin now") that don't
+  use the trigger word. For richer capture, compose §5.3's structured-output fact-extraction
+  pattern with this lesson's embedding-search retrieval — extraction determines *what* to store;
+  `store.search` determines *what's relevant* to retrieve.
+- Add a test with a stubbed embeddings object asserting semantically-tagged writes are retrievable
+  by paraphrase-adjacent queries (mock the embedding function to return fixed vectors — no real
+  API call needed).
+
+### 6.3 `agent_with_production_memory.py` — Postgres / MongoDB / Redis backends
+
+The most directly "production" file in the repo.
+
+- Three `@contextmanager` factories (`postgres_memory`, `mongodb_memory`, `redis_memory`), each
+  importing its optional dependency **lazily inside the function** (guarded by
+  `try/except ModuleNotFoundError`, raising a clear `RuntimeError` telling the user which pip
+  extra to install) — the correct pattern for optional backend support. Copy this import-guard
+  structure for any future optional-dependency integration in this repo.
+- `BACKENDS: dict[str, Backend]` registry maps `"postgres"|"mongodb"|"redis"` → a `Backend`
+  dataclass carrying the sync factory plus a **documented-only** async factory dotted-path string
+  (`async_factory` field is never actually imported/used in this file — pure inline documentation
+  pointing at e.g. `langgraph.checkpoint.postgres.aio.AsyncPostgresSaver`).
+- `main()` reads `BACKEND_KIND`/`BACKEND_URI`/`BACKEND_INITIALIZE` from the environment —
+  env-var-only configuration, consistent with the rest of the repo's `.env`-driven philosophy.
+- `_assemble_personalization_graph(llm, store, saver)` is intentionally backend-agnostic — the
+  exact same graph logic (two nodes: `assistant`, `write_memory`) works unmodified against any of
+  the three backends because they all implement the same `BaseStore`/checkpointer interfaces.
+  This is the strongest evidence in the repo for keeping `_assemble_*` functions pure and
+  dependency-injected (§0.2) — this lesson is the payoff for that discipline.
+- `studio_graph(config)` always uses `InMemoryStore()`/`MemorySaver()` regardless of
+  `BACKEND_KIND` — Studio sessions never actually exercise Postgres/Mongo/Redis; a deliberate
+  simplification so Studio doesn't require live infra just to preview the graph shape.
+- `scripts/production_memory_smoke.py` (sibling file) is the actual connectivity verifier — reads
+  `POSTGRES_URI`/`MONGODB_URI`/`REDIS_URI`, reports which backends connected successfully.
+
+**Enhancement tasks:**
+- Implement at least one of the documented `async_factory` paths for real (e.g.
+  `AsyncPostgresSaver`) if async graph execution is ever needed elsewhere in the repo — right now
+  it's documentation with no working code behind it.
+- None of the three `@contextmanager` factories handle connection-level errors (auth failure,
+  network unreachable, wrong URI scheme) beyond whatever the underlying driver raises natively —
+  wrap with a clearer error message identifying which backend and URI (credentials redacted)
+  failed.
+- If this repo ever gains a CI pipeline, prefer a real (ephemeral) Postgres instance (e.g.
+  `testcontainers`) over mocks for testing this specific lesson — mocking away the backend
+  defeats the point of testing it.
+
+### 6.4 `agent_with_deep_research.py` — the capstone multi-agent research pipeline (704 lines)
+
+The largest and most architecturally complete lesson in the repo — combines sub-graphs (§3.5/3.6),
+human-in-the-loop interrupts (§4.1), structured output (§1.6/§5), and `Send`-based fan-out (§3.2)
+into one pipeline. Two graphs, composed:
+
+**A. Interview sub-graph** (`_assemble_interview_app`, one instance conducts one analyst's
+interview): `InterviewState(MessagesState)` adds `max_num_turns`, `context: Annotated[list[str],
+operator.add]`, `analyst: Analyst`, `interview: str`, `sections: Annotated[list[str], operator.add]`.
+
+- `ask_question → {search_tavily, search_wikipedia} → answer_question →` conditional
+  `route_messages` (loops back to `ask_question`, or exits to `save_interview → write_section →
+  END` once `max_num_turns` reached **or** the analyst's question message contains the literal
+  string `"Thank you so much for your help"`, which the persona prompt is instructed to emit as a
+  natural stopping signal — a soft, string-matched termination condition, not a hard structural
+  one).
+- `_resolve_search_query` reuses **one shared** `search_extractor` (structured-output agent
+  producing a `SearchQuery`) for **both** `search_tavily` and `search_wikipedia` — both retrieval
+  sources search on the same derived query per turn, but the query is **invoked twice** (once per
+  search node) rather than cached/shared across the two parallel branches — a real, easily-fixed
+  redundant-LLM-call inefficiency.
+- Compiled with its own `MemorySaver()` checkpointer, `.with_config(run_name="conduct_interview")`
+  (names this sub-graph clearly in tracing/observability tools like LangSmith).
+
+**B. Research assistant parent graph** (`_assemble_research_assistant_graph`):
+`ResearchGraphState(TypedDict, total=False)`: `topic`, `max_analysts`, `human_analyst_feedback`,
+`analysts`, `sections: Annotated[..., operator.add]`, `introduction`, `content`, `conclusion`,
+`final_report`.
+
+- `create_analysts` — structured-output call producing `Perspectives.analysts: list[Analyst]`.
+- `human_feedback` node is a **deliberate no-op** (`return None`) — its only purpose is to be the
+  interrupt target: `builder.compile(interrupt_before=["human_feedback"], checkpointer=...)`
+  (graph-level breakpoint mechanism, same as §4.1). Editors resume by calling
+  `graph.update_state(thread, {"human_analyst_feedback": feedback}, as_node="human_feedback")`.
+- `initiate_all_interviews` is the conditional-edge function **and** the `Send` fan-out point: if
+  `human_analyst_feedback` is set, routes back to `create_analysts` (regenerate personas
+  incorporating the feedback); otherwise returns one `Send("conduct_interview", {...})` per
+  analyst — exactly §3.2's map-reduce pattern, here fanning out full sub-graph invocations rather
+  than single nodes.
+- After all interviews complete, three nodes run in parallel from `conduct_interview`
+  (`write_report`, `write_introduction`, `write_conclusion`, all reading the accumulated
+  `sections` list), converging at `finalize_report`, which does **string surgery** (splitting out
+  `"## Sources"` from the report body via `body.split("\n## Sources\n", maxsplit=1)`) to
+  reassemble introduction + body + conclusion + sources into the final markdown — a fragile
+  string-based assembly step.
+- `run_demo` in `main()` demonstrates the full interrupt→edit→resume cycle live: run to the
+  `human_feedback` breakpoint, inject feedback, resume to regenerate analysts, clear feedback,
+  resume again to actually run interviews.
+
+**Enhancement tasks — the highest concentration of real fixable issues in the repo:**
+- **Redundant search-query extraction:** `_resolve_search_query` is called independently inside
+  both `search_tavily` and `search_wikipedia`, each triggering a full structured-output LLM call
+  for what should be the same query — cache the resolved query once per turn (e.g. compute it in
+  `ask_question` or a dedicated node and store it in state) rather than recomputing it twice per
+  interview turn. Roughly halves the extraction-LLM-call volume for this lesson.
+- **Soft string-matched interview termination** (`"Thank you so much for your help"`) is brittle
+  — a paraphrase or a different model's phrasing could fail to match, leaving `route_messages` to
+  fall through to the `max_num_turns` hard cap instead of ending gracefully. Prefer a structured
+  "are we done?" boolean from a small classifier call, or have the persona prompt request a
+  specific closing token unlikely to be paraphrased.
+- **Fragile string-based report assembly** in `finalize_report` will silently produce a malformed
+  report if the LLM formats the sources header even slightly differently. Prefer asking the
+  report-writer LLM for structured output (a schema with `body: str` and `sources: list[str]`
+  fields) over parsing markdown headers by exact string match.
+- **No fan-out cap** on `initiate_all_interviews`'s `Send` list — `max_analysts` is user-supplied
+  and unbounded; a large value launches that many full interview sub-graphs (each itself making
+  several LLM + search calls per turn) concurrently. **This is the single highest
+  rate-limit/cost-risk point in the entire repo** — apply a hard ceiling and/or `max_concurrency`
+  before treating this pipeline as production-ready.
+- Same network-failure resilience gap as §6.1 applies here too, at higher blast radius since a
+  failure here can waste an entire multi-turn interview's worth of LLM calls.
+- Add tests for the pure/structural pieces first: `route_messages`' turn-counting and
+  string-match branches (no LLM needed if fed synthetic `AIMessage` lists), and
+  `finalize_report`'s string-splitting logic (feed synthetic report bodies with/without a
+  `"## Sources"` section, assert correct assembly in both cases).
+
+### 6.5 Stage 06 production checklist
+
+- Add basic error handling / graceful degradation to both retrieval lessons (§6.1, the interview
+  sub-graph in §6.4) for network/tool failures — currently any Tavily/Wikipedia hiccup crashes
+  the whole run.
+- Decouple `agent_with_semantic_memory.py`'s embeddings from the hardcoded OpenAI provider if
+  multi-provider support matters (§6.2).
+- Cap `max_analysts`/interview fan-out concurrency in `agent_with_deep_research.py` before
+  calling this pipeline production-ready (§6.4) — the single most important open item in this
+  stage.
+- Fix the redundant duplicate search-query extraction and the fragile markdown-splitting report
+  assembly in `agent_with_deep_research.py` (§6.4).
+- `agent_with_production_memory.py` (§6.3) is the strongest existing example of the
+  dependency-injection discipline described in §0.2 — when in doubt about how a new
+  production-grade lesson should be structured, imitate this file's `_assemble_*(llm, store,
+  saver)` shape over any other lesson's.
+
+---
+
+## Section 7 — Repo-wide production checklist (rollup)
+
+Ordered roughly by blast radius / how many lessons the fix touches:
+
+1. **Zero automated tests anywhere in the repo** (§0.6). Start with the no-LLM, no-API-key
+   lessons in stage03 (§3.1, §3.3, §3.4, §3.5) — they're free to test. Then move to
+   pure-logic functions embedded in LLM-backed lessons (`agent_with_router.py`'s `decide_mood`
+   with injected randomness §1.3; `route_message` in §5.5; `route_messages`/`finalize_report` in
+   §6.4).
+2. **`LLM_SINGLETON` global bug in `agent_with_durable_execution.py`** (§4.6) — the most
+   significant correctness bug verified in this audit; breaks under concurrent graph instances.
+3. **Unbounded `Send` fan-out with no concurrency cap** in `agent_with_parallel_nodes.py` (§3.2)
+   and `agent_with_deep_research.py` (§6.4) — the top cost/rate-limit risk in the repo.
+4. **Unbounded per-user document growth** in the store-based memory lessons
+   (`agent_with_fact_collection.py` §5.3, `agent_with_multi_memory_coordination.py` §5.5) — no
+   consolidation or eviction policy exists today.
+5. **No retry/timeout around any external call** — every `llm.invoke(...)`, `TavilySearch.invoke(...)`,
+   and `WikipediaLoader.load()` call in the repo is unguarded. Highest-value targets: §6.1, §6.4
+   (network calls), and any lesson's `llm.invoke` if wrapping LLM calls generally.
+6. **Two unbounded `while`/retry loops with no ceiling**: `agent_with_dynamic_interruption.py`
+   (§4.2) and `agent_with_validation_loop.py` (§4.8).
+7. **SQLite connection lifecycle never closed**, duplicated in two places
+   (`agent_with_external_short_term_memory.py` §2.3, `agent_with_durable_execution.py` §4.6) —
+   fix once, apply to both.
+8. **Dead code**: `HAS_SDK`/`get_client` imports in `agent_with_interruption.py` (§4.1) and
+   `agent_with_stream_interruption.py` (§4.4); the never-wired `reduce_list` reducer in
+   `agent_with_state_reducer.py` (§3.4).
+9. **Studio parity gaps**: `agent_with_structured_output.py` unregistered in `langgraph.json`
+   and its `studio_graph` silently ignoring config overrides (§1.6); `agent_with_structured_memory.py`
+   bypassing `MemoryConfiguration` and risking a raw `KeyError` (§5.2); the `db_path` default
+   mismatch in `agent_with_external_short_term_memory.py` (§2.3).
+10. **No CI workflow** verified present in the tree despite the README's badge (§0.7, §0.8 item
+    8) — add `black --check` / `python -m compileall src` / `pytest` once tests exist.
