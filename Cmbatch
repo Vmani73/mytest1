@@ -1,0 +1,1810 @@
+#!/usr/bin/env python3
+"""
+codemind_batch.py — production batch runner for the CodeMind orchestrator API.
+
+Single file. No package. Drives:
+    POST /api/v1/orchestrator/run          -> returns a run/job id
+    GET  /api/v1/orchestrator/runs/{id}    -> poll until terminal
+
+Design guarantees
+-----------------
+crash-safe      every state transition is committed to SQLite (WAL) before the
+                next network call; an interrupted process re-attaches to live
+                run_ids on restart instead of resubmitting work
+idempotent      a task key is sha256(repo|branch|playbooks|goal|cd_*); completed
+                keys are skipped on re-run
+bounded         N parallel orchestrator runs (default 2), a global submit gap,
+                a shared circuit breaker, and a hard per-run deadline
+observable      live terminal dashboard, rolling HTML snapshot, per-run JSON
+                artifacts, CSV export, and a queryable state.db
+shardable       --shard i/N partitions any input deterministically across
+                independent instances
+
+Quick start
+-----------
+    export ORCH_BASE_URL="https://<orchestrator-host>"     # no host is hardcoded
+
+    python codemind_batch.py run \
+        --base-url "$ORCH_BASE_URL" \
+        --input repos.csv \
+        --playbooks <playbook_1>,<playbook_2> \
+        --goal "generate report" \
+        --state ./cm_state
+
+    python codemind_batch.py status --state ./cm_state
+    python codemind_batch.py report --state ./cm_state --open
+    python codemind_batch.py retry  --state ./cm_state --include failed,timeout
+    python codemind_batch.py export --state ./cm_state --out runs.csv
+    python codemind_batch.py demo                      # end-to-end self test
+
+Dependencies: httpx (required), rich (optional, falls back to plain logging).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import csv
+import hashlib
+import json
+import os
+import platform
+import random
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# --------------------------------------------------------------------------
+# optional / required third party
+# --------------------------------------------------------------------------
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    sys.stderr.write(
+        "codemind_batch requires httpx.\n"
+        "    pip install httpx        (add --index-url <internal mirror> if needed)\n"
+    )
+    raise SystemExit(2)
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+    RICH = True
+except ImportError:  # pragma: no cover
+    RICH = False
+    Console = None  # type: ignore
+
+
+APP = "codemind_batch"
+VERSION = "1.3.0"
+
+# --------------------------------------------------------------------------
+# status vocabulary — extend at runtime with --success-states / --failure-states
+# --------------------------------------------------------------------------
+
+SUCCESS_STATES = {
+    "completed", "complete", "success", "succeeded", "successful",
+    "finished", "done", "passed", "ok", "pass",
+}
+FAILURE_STATES = {
+    "failed", "failure", "error", "errored", "cancelled", "canceled",
+    "aborted", "terminated", "killed", "rejected", "crashed",
+}
+RUNNING_STATES = {
+    "running", "in_progress", "in-progress", "inprogress", "pending", "queued",
+    "started", "starting", "processing", "created", "new", "submitted",
+    "active", "waiting", "scheduled", "accepted", "initializing",
+}
+
+RUN_ID_KEYS = ("run_id", "runid", "job_id", "jobid", "execution_id", "task_id", "id")
+STATUS_KEYS = ("status", "state", "run_status", "job_status", "phase", "run_state")
+
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504, 522, 524}
+
+# task states persisted in sqlite
+PENDING, RUNNING, SUCCEEDED, FAILED, TIMEOUT, DEAD = (
+    "PENDING", "RUNNING", "SUCCEEDED", "FAILED", "TIMEOUT", "DEAD"
+)
+TERMINAL = {SUCCEEDED, FAILED, TIMEOUT, DEAD}
+ACTIONABLE = {PENDING, RUNNING}
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def human_dt(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def deep_find(obj: Any, keys: tuple[str, ...], want_str: bool = True) -> Optional[str]:
+    """Breadth-first search for the first matching key in a nested structure."""
+    queue: list[Any] = [obj]
+    seen = 0
+    while queue and seen < 2000:
+        cur = queue.pop(0)
+        seen += 1
+        if isinstance(cur, dict):
+            for k in keys:
+                for real in cur:
+                    if isinstance(real, str) and real.lower() == k:
+                        v = cur[real]
+                        if v is None:
+                            continue
+                        if want_str and isinstance(v, (str, int)):
+                            return str(v)
+                        if not want_str:
+                            return v
+            queue.extend(cur.values())
+        elif isinstance(cur, list):
+            queue.extend(cur[:50])
+    return None
+
+
+# ==========================================================================
+# configuration
+# ==========================================================================
+
+
+@dataclass
+class Config:
+    base_url: str = ""
+    state_dir: Path = Path("./cm_state")
+    concurrency: int = 2
+    input_path: Optional[Path] = None
+
+    # payload defaults (per-row CSV values win)
+    playbooks: list[str] = field(default_factory=list)
+    goal: str = ""
+    branch: str = "main"
+    cd_repo_url: str = ""
+    cd_branch: str = ""
+    repo_path: str = ""
+    user_id: str = ""
+    mirror_mode: Optional[bool] = None
+
+    # timing
+    first_poll_delay: float = 60.0
+    poll_interval: float = 30.0
+    max_wall: float = 1800.0          # 30 min hard deadline per run
+    submit_gap: float = 2.0           # min seconds between submits, global
+    http_timeout: float = 60.0
+
+    # resilience
+    max_http_attempts: int = 6
+    backoff_base: float = 2.0
+    backoff_cap: float = 60.0
+    max_submit_retries: int = 3       # whole-task resubmits before DEAD
+    breaker_threshold: int = 8
+    breaker_cooldown: float = 120.0
+    poll_404_grace: int = 5
+
+    # transport
+    token: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    verify: bool = True
+
+    # sharding / selection
+    shard: int = 0
+    shards: int = 1
+    limit: int = 0
+    include_states: set[str] = field(default_factory=set)
+
+    # ui
+    no_ui: bool = False
+    snapshot_every: float = 60.0
+    keep_awake: bool = True
+
+    @property
+    def db_path(self) -> Path:
+        return self.state_dir / "state.db"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.state_dir / "reports"
+
+    @property
+    def snapshot_path(self) -> Path:
+        return self.state_dir / "dashboard.html"
+
+    @property
+    def log_path(self) -> Path:
+        return self.state_dir / "runner.log"
+
+
+# ==========================================================================
+# task model
+# ==========================================================================
+
+
+@dataclass
+class Task:
+    repo_url: str
+    branch: str = "main"
+    playbooks: list[str] = field(default_factory=list)
+    goal: str = ""
+    cd_repo_url: str = ""
+    cd_branch: str = ""
+    repo_path: str = ""
+    user_id: str = ""
+    mirror_mode: Optional[bool] = None
+
+    @property
+    def key(self) -> str:
+        raw = "|".join([
+            self.repo_url.strip().rstrip("/").lower(),
+            self.branch.strip(),
+            ",".join(self.playbooks),
+            self.goal.strip(),
+            self.cd_repo_url.strip(),
+            self.cd_branch.strip(),
+        ])
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+    @property
+    def short(self) -> str:
+        return self.repo_url.rstrip("/").rsplit("/", 1)[-1] or self.repo_url
+
+    def payload(self) -> dict[str, Any]:
+        """Only repo_url + playbook_names + branch are sent unconditionally.
+        Optional fields are omitted when empty so the API keeps its defaults."""
+        body: dict[str, Any] = {
+            "repo_url": self.repo_url,
+            "branch": self.branch or "main",
+            "playbook_names": self.playbooks,
+        }
+        if self.goal:
+            body["goal"] = self.goal
+        if self.cd_repo_url:
+            body["cd_repo_url"] = self.cd_repo_url
+        if self.cd_branch:
+            body["cd_branch"] = self.cd_branch
+        if self.repo_path:
+            body["repo_path"] = self.repo_path
+        if self.user_id:
+            body["user_id"] = self.user_id
+        if self.mirror_mode is not None:
+            body["mirror_mode"] = self.mirror_mode
+        return body
+
+
+# ==========================================================================
+# persistence
+# ==========================================================================
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    key           TEXT PRIMARY KEY,
+    repo_url      TEXT NOT NULL,
+    branch        TEXT,
+    playbooks     TEXT,
+    goal          TEXT,
+    cd_repo_url   TEXT,
+    cd_branch     TEXT,
+    repo_path     TEXT,
+    user_id       TEXT,
+    mirror_mode   INTEGER,
+    state         TEXT NOT NULL,
+    run_id        TEXT,
+    attempt       INTEGER DEFAULT 0,
+    polls         INTEGER DEFAULT 0,
+    api_status    TEXT,
+    error         TEXT,
+    report_path   TEXT,
+    enqueued_at   TEXT,
+    submitted_at  REAL,
+    finished_at   REAL,
+    duration_s    REAL,
+    updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_state ON tasks(state);
+
+CREATE TABLE IF NOT EXISTS events (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts    TEXT,
+    key   TEXT,
+    level TEXT,
+    msg   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);
+
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+class Store:
+    """Thread-safe SQLite wrapper. Every write is committed immediately —
+    the DB is the source of truth, memory is only a cache."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+        self.db.row_factory = sqlite3.Row
+        with self._lock:
+            self.db.executescript(SCHEMA)
+            self.db.commit()
+
+    def close(self) -> None:
+        with self._lock, contextlib.suppress(Exception):
+            self.db.close()
+
+    # -- writes ----------------------------------------------------------
+    def enqueue(self, tasks: Iterable[Task]) -> tuple[int, int]:
+        new = dup = 0
+        with self._lock:
+            for t in tasks:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(key,repo_url,branch,playbooks,goal,cd_repo_url,cd_branch,"
+                    " repo_path,user_id,mirror_mode,state,enqueued_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (t.key, t.repo_url, t.branch, json.dumps(t.playbooks), t.goal,
+                     t.cd_repo_url, t.cd_branch, t.repo_path, t.user_id,
+                     None if t.mirror_mode is None else int(t.mirror_mode),
+                     PENDING, utcnow(), utcnow()),
+                )
+                if cur.rowcount:
+                    new += 1
+                else:
+                    dup += 1
+            self.db.commit()
+        return new, dup
+
+    def update(self, key: str, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = utcnow()
+        cols = ",".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self.db.execute(f"UPDATE tasks SET {cols} WHERE key=?",
+                            (*fields.values(), key))
+            self.db.commit()
+
+    def event(self, key: str, level: str, msg: str) -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO events (ts,key,level,msg) VALUES (?,?,?,?)",
+                (utcnow(), key, level, msg[:2000]),
+            )
+            self.db.commit()
+
+    def reset_states(self, states: set[str]) -> int:
+        with self._lock:
+            qs = ",".join("?" * len(states))
+            cur = self.db.execute(
+                f"UPDATE tasks SET state=?, run_id=NULL, error=NULL, attempt=0 "
+                f"WHERE state IN ({qs})", (PENDING, *states))
+            self.db.commit()
+            return cur.rowcount
+
+    def set_meta(self, k: str, v: str) -> None:
+        with self._lock:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
+            self.db.commit()
+
+    # -- reads -----------------------------------------------------------
+    def actionable(self, limit: int = 0) -> list[sqlite3.Row]:
+        q = ("SELECT * FROM tasks WHERE state IN (?,?) "
+             "ORDER BY CASE state WHEN 'RUNNING' THEN 0 ELSE 1 END, rowid")
+        if limit:
+            q += f" LIMIT {int(limit)}"
+        with self._lock:
+            return list(self.db.execute(q, (RUNNING, PENDING)))
+
+    def counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT state, COUNT(*) c FROM tasks GROUP BY state")
+            return {r["state"]: r["c"] for r in rows}
+
+    def all_rows(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.db.execute("SELECT * FROM tasks ORDER BY rowid"))
+
+    def recent_events(self, n: int = 12) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.db.execute(
+                "SELECT * FROM events ORDER BY id DESC LIMIT ?", (n,)))
+
+    def durations(self) -> list[float]:
+        with self._lock:
+            return [r[0] for r in self.db.execute(
+                "SELECT duration_s FROM tasks WHERE duration_s IS NOT NULL")]
+
+
+def row_to_task(r: sqlite3.Row) -> Task:
+    return Task(
+        repo_url=r["repo_url"], branch=r["branch"] or "main",
+        playbooks=json.loads(r["playbooks"] or "[]"), goal=r["goal"] or "",
+        cd_repo_url=r["cd_repo_url"] or "", cd_branch=r["cd_branch"] or "",
+        repo_path=r["repo_path"] or "", user_id=r["user_id"] or "",
+        mirror_mode=None if r["mirror_mode"] is None else bool(r["mirror_mode"]),
+    )
+
+
+# ==========================================================================
+# process-level guards: single instance + keep awake
+# ==========================================================================
+
+
+class InstanceLock:
+    """Prevents two runners sharing one state dir (which would double-submit)."""
+
+    def __init__(self, state_dir: Path):
+        self.path = state_dir / ".runner.lock"
+        self.fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            stale = self._stale()
+            if not stale:
+                owner = self.path.read_text(errors="ignore").strip()
+                raise SystemExit(
+                    f"Another runner owns {self.path.parent} ({owner}).\n"
+                    f"If that process is gone, delete {self.path} and retry.")
+            self.path.unlink(missing_ok=True)
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(self.fd, f"pid={os.getpid()} host={platform.node()} at={utcnow()}"
+                          .encode())
+
+    def _stale(self) -> bool:
+        try:
+            txt = self.path.read_text()
+            pid = int(txt.split("pid=")[1].split()[0])
+        except Exception:
+            return True
+        if platform.node() not in txt:
+            return False          # another host: never assume stale
+        try:
+            os.kill(pid, 0)
+            return False
+        except OSError:
+            return True
+
+    def release(self) -> None:
+        with contextlib.suppress(Exception):
+            if self.fd is not None:
+                os.close(self.fd)
+            self.path.unlink(missing_ok=True)
+
+
+class KeepAwake:
+    """Blocks system sleep. Screen lock never stops a process; sleep does."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc = None
+        self.mode = "off"
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        sysname = platform.system()
+        if sysname == "Windows":
+            self.mode = "windows/SetThreadExecutionState"
+            self._thread = threading.Thread(target=self._win_loop, daemon=True)
+            self._thread.start()
+        elif sysname == "Darwin":
+            import subprocess
+            with contextlib.suppress(Exception):
+                self._proc = subprocess.Popen(
+                    ["caffeinate", "-i", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.mode = "macos/caffeinate"
+        else:
+            self.mode = "n/a (linux: use systemd-run or a server)"
+
+    def _win_loop(self) -> None:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        while not self._stop.is_set():
+            k32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
+            self._stop.wait(30)
+        k32.SetThreadExecutionState(ES_CONTINUOUS)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc:
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+
+
+# ==========================================================================
+# HTTP layer: retry, backoff, circuit breaker
+# ==========================================================================
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int, cooldown: float):
+        self.threshold, self.cooldown = threshold, cooldown
+        self.failures = 0
+        self.open_until = 0.0
+        self.trips = 0
+        self._lock = asyncio.Lock()
+
+    async def gate(self, stop: asyncio.Event) -> None:
+        while now_ts() < self.open_until and not stop.is_set():
+            await interruptible_sleep(min(2.0, self.open_until - now_ts()), stop)
+
+    async def record(self, ok: bool) -> None:
+        async with self._lock:
+            if ok:
+                self.failures = 0
+                return
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.open_until = now_ts() + self.cooldown
+                self.failures = 0
+                self.trips += 1
+
+    @property
+    def is_open(self) -> bool:
+        return now_ts() < self.open_until
+
+
+class TransientError(Exception):
+    pass
+
+
+class PermanentError(Exception):
+    pass
+
+
+async def interruptible_sleep(seconds: float, stop: asyncio.Event) -> None:
+    """Sleep that reacts to shutdown within ~0.25s."""
+    end = now_ts() + max(0.0, seconds)
+    while now_ts() < end:
+        if stop.is_set():
+            return
+        await asyncio.sleep(min(0.25, end - now_ts()))
+
+
+class ApiClient:
+    def __init__(self, cfg: Config, breaker: CircuitBreaker, stop: asyncio.Event,
+                 log):
+        self.cfg = cfg
+        self.breaker = breaker
+        self.stop = stop
+        self.log = log
+        headers = {"accept": "application/json",
+                   "content-type": "application/json",
+                   "user-agent": f"{APP}/{VERSION}"}
+        headers.update(cfg.headers)
+        if cfg.token:
+            headers["Authorization"] = f"Bearer {cfg.token}"
+        limits = httpx.Limits(max_connections=cfg.concurrency * 4,
+                              max_keepalive_connections=cfg.concurrency * 2)
+        self.client = httpx.AsyncClient(
+            base_url=cfg.base_url.rstrip("/"), headers=headers,
+            timeout=httpx.Timeout(cfg.http_timeout, connect=20.0),
+            verify=cfg.verify, limits=limits, follow_redirects=True)
+        self._submit_lock = asyncio.Lock()
+        self._last_submit = 0.0
+        self.requests = 0
+        self.retries = 0
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+    async def _request(self, method: str, url: str,
+                       json_body: Optional[dict] = None) -> httpx.Response:
+        attempt = 0
+        while True:
+            attempt += 1
+            await self.breaker.gate(self.stop)
+            if self.stop.is_set():
+                raise TransientError("shutdown requested")
+            try:
+                self.requests += 1
+                resp = await self.client.request(method, url, json=json_body)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                await self.breaker.record(False)
+                if attempt >= self.cfg.max_http_attempts:
+                    raise TransientError(f"{type(exc).__name__}: {exc}") from exc
+                self.retries += 1
+                await self._backoff(attempt, None)
+                continue
+
+            if resp.status_code < 400:
+                await self.breaker.record(True)
+                return resp
+
+            if resp.status_code in RETRYABLE_HTTP:
+                await self.breaker.record(False)
+                if attempt >= self.cfg.max_http_attempts:
+                    raise TransientError(
+                        f"HTTP {resp.status_code} after {attempt} attempts: "
+                        f"{resp.text[:200]}")
+                self.retries += 1
+                await self._backoff(attempt, resp.headers.get("retry-after"))
+                continue
+
+            # 4xx that will never succeed on retry (400/401/403/404/422)
+            await self.breaker.record(True)
+            raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+    async def _backoff(self, attempt: int, retry_after: Optional[str]) -> None:
+        if retry_after:
+            with contextlib.suppress(ValueError):
+                await interruptible_sleep(
+                    min(float(retry_after), self.cfg.backoff_cap), self.stop)
+                return
+        delay = min(self.cfg.backoff_base ** attempt, self.cfg.backoff_cap)
+        await interruptible_sleep(delay * (0.5 + random.random()), self.stop)
+
+    async def submit(self, task: Task) -> tuple[str, dict]:
+        async with self._submit_lock:          # global pacing
+            gap = self.cfg.submit_gap - (now_ts() - self._last_submit)
+            if gap > 0:
+                await interruptible_sleep(gap, self.stop)
+            self._last_submit = now_ts()
+        resp = await self._request("POST", "/api/v1/orchestrator/run",
+                                   task.payload())
+        data = _safe_json(resp)
+        run_id = deep_find(data, RUN_ID_KEYS)
+        if not run_id:
+            raise PermanentError(
+                f"no run/job id in submit response: {json.dumps(data)[:300]}")
+        return str(run_id), data
+
+    async def get_run(self, run_id: str) -> dict:
+        resp = await self._request(
+            "GET", f"/api/v1/orchestrator/runs/{run_id}")
+        return _safe_json(resp)
+
+
+def _safe_json(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+    except Exception:
+        return {"_raw": resp.text[:4000]}
+    return data if isinstance(data, dict) else {"_data": data}
+
+
+def classify(payload: dict, cfg_success: set[str], cfg_failure: set[str]
+             ) -> tuple[str, str]:
+    """-> (bucket, raw_status) where bucket in {SUCCEEDED, FAILED, RUNNING, ?}"""
+    raw = deep_find(payload, STATUS_KEYS) or ""
+    norm = raw.strip().lower().replace(" ", "_")
+    if norm in cfg_success:
+        return SUCCEEDED, raw
+    if norm in cfg_failure:
+        return FAILED, raw
+    if norm in RUNNING_STATES:
+        return RUNNING, raw
+    return "?", raw
+
+
+# ==========================================================================
+# stats for the dashboard
+# ==========================================================================
+
+
+@dataclass
+class Live_Run:
+    key: str
+    repo: str
+    run_id: str
+    started: float
+    polls: int = 0
+    status: str = "submitting"
+
+
+class Stats:
+    def __init__(self, total: int, already_done: int):
+        self.total = total
+        self.start = now_ts()
+        self.done = 0
+        self.succeeded = 0
+        self.failed = 0
+        self.timeout = 0
+        self.dead = 0
+        self.resumed = 0
+        self.already_done = already_done
+        self.active: dict[str, Live_Run] = {}
+        self.tail: list[tuple[str, str, str]] = []
+        self._lock = threading.Lock()
+
+    def note(self, level: str, repo: str, msg: str) -> None:
+        with self._lock:
+            self.tail.append((level, repo, msg))
+            del self.tail[:-40]
+
+    @property
+    def elapsed(self) -> float:
+        return now_ts() - self.start
+
+    @property
+    def rate_per_hour(self) -> float:
+        e = self.elapsed
+        return (self.done / e * 3600) if e > 5 and self.done else 0.0
+
+    @property
+    def eta(self) -> Optional[float]:
+        r = self.rate_per_hour
+        if not r:
+            return None
+        return (self.total - self.done) / r * 3600
+
+
+# ==========================================================================
+# the worker
+# ==========================================================================
+
+
+class Runner:
+    def __init__(self, cfg: Config, store: Store, log):
+        self.cfg = cfg
+        self.store = store
+        self.log = log
+        self.stop = asyncio.Event()
+        self.breaker = CircuitBreaker(cfg.breaker_threshold, cfg.breaker_cooldown)
+        self.api = ApiClient(cfg, self.breaker, self.stop, log)
+        self.success_states = SUCCESS_STATES | cfg.include_states  # placeholder
+        self.stats: Optional[Stats] = None
+
+    # -- lifecycle -------------------------------------------------------
+    async def run(self, rows: list[sqlite3.Row], already_done: int) -> None:
+        self.stats = Stats(len(rows), already_done)
+        queue: asyncio.Queue = asyncio.Queue()
+        for r in rows:
+            queue.put_nowait(r)
+
+        workers = [asyncio.create_task(self._worker(i + 1, queue))
+                   for i in range(self.cfg.concurrency)]
+        snap = asyncio.create_task(self._snapshotter())
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            self.stop.set()
+            snap.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await snap
+            await self.api.aclose()
+
+    async def _snapshotter(self) -> None:
+        while not self.stop.is_set():
+            await interruptible_sleep(self.cfg.snapshot_every, self.stop)
+            with contextlib.suppress(Exception):
+                write_html(self.cfg, self.store, live=True)
+
+    async def _worker(self, wid: int, queue: asyncio.Queue) -> None:
+        while not self.stop.is_set():
+            try:
+                row = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await self._process(row)
+            except Exception as exc:                      # never kill a worker
+                self.log(f"worker{wid} unexpected: {type(exc).__name__}: {exc}")
+                self.store.update(row["key"], state=FAILED,
+                                  error=f"runner:{type(exc).__name__}: {exc}"[:900])
+                self._finish(row, FAILED)
+            finally:
+                queue.task_done()
+
+    # -- one task --------------------------------------------------------
+    async def _process(self, row: sqlite3.Row) -> None:
+        cfg, st = self.cfg, self.stats
+        assert st is not None
+        key = row["key"]
+        task = row_to_task(row)
+        live = Live_Run(key, task.short, row["run_id"] or "", now_ts())
+        st.active[key] = live
+
+        try:
+            run_id = row["run_id"]
+            submitted_at = row["submitted_at"]
+            attempt = row["attempt"] or 0
+
+            # ---- resume path: a run_id already exists, re-attach ----
+            if row["state"] == RUNNING and run_id:
+                st.resumed += 1
+                live.run_id, live.status = run_id, "re-attached"
+                st.note("info", task.short, f"re-attached to {run_id[:8]}")
+                self.store.event(key, "INFO", f"resume poll run_id={run_id}")
+            else:
+                # ---- submit with whole-task retry ----
+                while True:
+                    attempt += 1
+                    live.status = f"submit#{attempt}"
+                    self.store.update(key, state=RUNNING, attempt=attempt)
+                    try:
+                        run_id, raw = await self.api.submit(task)
+                        submitted_at = now_ts()
+                        self.store.update(key, run_id=run_id,
+                                          submitted_at=submitted_at,
+                                          error=None)
+                        self.store.event(key, "INFO", f"submitted run_id={run_id}")
+                        live.run_id = run_id
+                        break
+                    except PermanentError as exc:
+                        self.store.update(key, state=DEAD, error=str(exc)[:900],
+                                          finished_at=now_ts())
+                        self.store.event(key, "ERROR", f"submit rejected: {exc}")
+                        st.note("dead", task.short, str(exc)[:80])
+                        self._finish(row, DEAD)
+                        return
+                    except TransientError as exc:
+                        if self.stop.is_set():
+                            self.store.update(key, state=PENDING)
+                            return
+                        if attempt > cfg.max_submit_retries:
+                            self.store.update(key, state=FAILED,
+                                              error=f"submit: {exc}"[:900],
+                                              finished_at=now_ts())
+                            self.store.event(key, "ERROR", f"submit gave up: {exc}")
+                            st.note("fail", task.short, "submit exhausted")
+                            self._finish(row, FAILED)
+                            return
+                        await interruptible_sleep(
+                            min(cfg.backoff_cap, cfg.backoff_base ** attempt) *
+                            (0.5 + random.random()), self.stop)
+
+            # ---- poll ----
+            deadline = (submitted_at or now_ts()) + cfg.max_wall
+            first = True
+            polls = row["polls"] or 0
+            misses = 0
+            last_payload: dict = {}
+
+            while not self.stop.is_set():
+                wait = cfg.first_poll_delay if first else cfg.poll_interval
+                first = False
+                remaining = deadline - now_ts()
+                if remaining <= 0:
+                    break
+                await interruptible_sleep(
+                    min(wait * (0.85 + 0.3 * random.random()), remaining),
+                    self.stop)
+                if self.stop.is_set():
+                    break
+
+                try:
+                    last_payload = await self.api.get_run(str(run_id))
+                    misses = 0
+                except PermanentError as exc:
+                    misses += 1
+                    if "404" in str(exc) and misses <= cfg.poll_404_grace:
+                        self.store.event(key, "WARN", f"poll 404 x{misses}")
+                        continue
+                    self.store.update(key, state=FAILED,
+                                      error=f"poll: {exc}"[:900],
+                                      finished_at=now_ts())
+                    self.store.event(key, "ERROR", f"poll permanent: {exc}")
+                    st.note("fail", task.short, str(exc)[:80])
+                    self._finish(row, FAILED)
+                    return
+                except TransientError as exc:
+                    self.store.event(key, "WARN", f"poll transient: {exc}")
+                    continue
+
+                polls += 1
+                live.polls = polls
+                bucket, raw = classify(last_payload, SUCCESS_STATES, FAILURE_STATES)
+                live.status = raw or bucket
+                self.store.update(key, polls=polls, api_status=raw)
+
+                if bucket in (SUCCEEDED, FAILED):
+                    dur = now_ts() - (submitted_at or now_ts())
+                    path = self._write_report(key, task, str(run_id), bucket,
+                                              raw, last_payload, dur, polls)
+                    err = None
+                    if bucket == FAILED:
+                        err = (deep_find(last_payload, ("error", "message",
+                                                        "detail", "reason"))
+                               or raw)[:900]
+                    self.store.update(key, state=bucket, api_status=raw,
+                                      finished_at=now_ts(), duration_s=dur,
+                                      report_path=str(path), error=err)
+                    self.store.event(key, "INFO",
+                                     f"{bucket} status={raw} in {human_dt(dur)}")
+                    st.note("ok" if bucket == SUCCEEDED else "fail",
+                            task.short, f"{raw} · {human_dt(dur)}")
+                    self._finish(row, bucket)
+                    return
+
+                if bucket == "?" and raw:
+                    self.store.event(key, "WARN", f"unknown status '{raw}'")
+
+            if self.stop.is_set():
+                # leave state=RUNNING + run_id persisted -> resumed next start
+                self.store.event(key, "INFO", "interrupted, will resume")
+                return
+
+            # ---- deadline ----
+            dur = now_ts() - (submitted_at or now_ts())
+            path = self._write_report(key, task, str(run_id), TIMEOUT,
+                                      live.status, last_payload, dur, polls)
+            self.store.update(key, state=TIMEOUT, finished_at=now_ts(),
+                              duration_s=dur, report_path=str(path),
+                              error=f"no terminal status within "
+                                    f"{int(cfg.max_wall)}s (last={live.status})")
+            self.store.event(key, "WARN", f"timeout after {human_dt(dur)}")
+            st.note("timeout", task.short, f"30m deadline, last={live.status}")
+            self._finish(row, TIMEOUT)
+        finally:
+            self.stats.active.pop(key, None)  # type: ignore[union-attr]
+
+    def _finish(self, row: sqlite3.Row, state: str) -> None:
+        st = self.stats
+        assert st is not None
+        st.done += 1
+        if state == SUCCEEDED:
+            st.succeeded += 1
+        elif state == FAILED:
+            st.failed += 1
+        elif state == TIMEOUT:
+            st.timeout += 1
+        elif state == DEAD:
+            st.dead += 1
+
+    def _write_report(self, key: str, task: Task, run_id: str, state: str,
+                      raw_status: str, payload: dict, dur: float,
+                      polls: int) -> Path:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        d = self.cfg.reports_dir / day
+        d.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-._" else "_" for c in task.short)
+        path = d / f"{safe}__{run_id[:12]}.json"
+        doc = {
+            "task_key": key,
+            "repo_url": task.repo_url,
+            "branch": task.branch,
+            "playbooks": task.playbooks,
+            "goal": task.goal,
+            "cd_repo_url": task.cd_repo_url or None,
+            "cd_branch": task.cd_branch or None,
+            "run_id": run_id,
+            "outcome": state,
+            "api_status": raw_status,
+            "duration_seconds": round(dur, 1),
+            "polls": polls,
+            "collected_at": utcnow(),
+            "response": payload,
+        }
+        path.write_text(json.dumps(doc, indent=2, default=str))
+        return path
+
+
+# ==========================================================================
+# input loading
+# ==========================================================================
+
+CSV_ALIASES = {
+    "repo_url": {"repo_url", "repo", "url", "repository", "repo_link", "git_url"},
+    "branch": {"branch", "repo_branch", "ref"},
+    "cd_repo_url": {"cd_repo_url", "cd_repo", "ci_repo_url", "ci_repo", "cd_url"},
+    "cd_branch": {"cd_branch", "ci_branch"},
+    "playbooks": {"playbooks", "playbook_names", "playbook", "skills"},
+    "goal": {"goal", "objective"},
+    "repo_path": {"repo_path", "path", "module_path"},
+    "user_id": {"user_id", "user", "sso", "requester"},
+    "mirror_mode": {"mirror_mode", "mirror"},
+}
+
+
+def _canon(header: str) -> Optional[str]:
+    h = header.strip().lower().replace(" ", "_").lstrip("\ufeff")
+    for canon, names in CSV_ALIASES.items():
+        if h in names:
+            return canon
+    return None
+
+
+def _split_list(v: str) -> list[str]:
+    return [p.strip() for p in v.replace("|", ";").replace(",", ";").split(";")
+            if p.strip()]
+
+
+def load_tasks(cfg: Config) -> list[Task]:
+    path = cfg.input_path
+    assert path is not None
+    if not path.exists():
+        raise SystemExit(f"input not found: {path}")
+
+    rows: list[dict[str, str]] = []
+    if path.suffix.lower() in {".csv", ".tsv"}:
+        delim = "\t" if path.suffix.lower() == ".tsv" else ","
+        with path.open(newline="", encoding="utf-8-sig") as fh:
+            reader = csv.reader(fh, delimiter=delim)
+            try:
+                header = next(reader)
+            except StopIteration:
+                raise SystemExit("empty CSV")
+            canon = [_canon(h) for h in header]
+            if "repo_url" not in canon:
+                # headerless CSV: treat col0 as repo, col1 as branch
+                fh.seek(0)
+                for parts in csv.reader(fh, delimiter=delim):
+                    if parts and parts[0].strip():
+                        rows.append({"repo_url": parts[0].strip(),
+                                     "branch": parts[1].strip()
+                                     if len(parts) > 1 else ""})
+            else:
+                for parts in reader:
+                    if not parts or not any(p.strip() for p in parts):
+                        continue
+                    row = {}
+                    for c, val in zip(canon, parts):
+                        if c:
+                            row[c] = val.strip()
+                    if row.get("repo_url"):
+                        rows.append(row)
+    else:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            rows.append({"repo_url": parts[0],
+                         "branch": parts[1] if len(parts) > 1 else ""})
+
+    tasks: list[Task] = []
+    for r in rows:
+        pb = _split_list(r.get("playbooks", "")) or list(cfg.playbooks)
+        if not pb:
+            raise SystemExit(
+                "no playbooks: pass --playbooks or add a playbooks column")
+        if len(pb) > 2:
+            raise SystemExit(f"max 2 playbooks per run, got {len(pb)} for "
+                             f"{r['repo_url']}")
+        mm = r.get("mirror_mode", "")
+        tasks.append(Task(
+            repo_url=r["repo_url"],
+            branch=r.get("branch") or cfg.branch,
+            playbooks=pb,
+            goal=r.get("goal") or cfg.goal,
+            cd_repo_url=r.get("cd_repo_url") or cfg.cd_repo_url,
+            cd_branch=r.get("cd_branch") or cfg.cd_branch,
+            repo_path=r.get("repo_path") or cfg.repo_path,
+            user_id=r.get("user_id") or cfg.user_id,
+            mirror_mode=(mm.lower() in {"1", "true", "yes"}) if mm
+            else cfg.mirror_mode,
+        ))
+
+    # dedupe + shard
+    seen: set[str] = set()
+    out: list[Task] = []
+    for t in tasks:
+        if t.key in seen:
+            continue
+        seen.add(t.key)
+        if cfg.shards > 1:
+            bucket = int(hashlib.md5(t.key.encode()).hexdigest(), 16) % cfg.shards
+            if bucket != cfg.shard:
+                continue
+        out.append(t)
+    return out
+
+
+# ==========================================================================
+# dashboard (terminal)
+# ==========================================================================
+
+PALETTE = {
+    "ok": "bold green", "fail": "bold red", "timeout": "bold yellow",
+    "dead": "bold magenta", "info": "cyan", "warn": "yellow",
+}
+
+
+class Dashboard:
+    def __init__(self, cfg: Config, store: Store, runner: Runner):
+        self.cfg, self.store, self.runner = cfg, store, runner
+        self.console = Console() if RICH else None
+
+    def render(self) -> Any:
+        st = self.runner.stats
+        assert st is not None
+        cfg = self.cfg
+
+        host = cfg.base_url.split("//")[-1].split(".")[0:3]
+        head = Table.grid(expand=True)
+        head.add_column(ratio=1)
+        head.add_column(justify="right", ratio=1)
+        shard = f"shard {cfg.shard + 1}/{cfg.shards}" if cfg.shards > 1 else "single"
+        head.add_row(
+            Text(f"CODEMIND BATCH  ", style="bold cyan") +
+            Text(".".join(host), style="dim"),
+            Text(f"{shard}  ·  {cfg.concurrency} parallel  ·  "
+                 f"up {human_dt(st.elapsed)}", style="dim"))
+
+        pct = (st.done / st.total * 100) if st.total else 100.0
+        filled = int(pct / 2)
+        bar = Text("█" * filled + "░" * (50 - filled), style="cyan")
+        eta = human_dt(st.eta) if st.eta else "—"
+
+        kpi = Table.grid(expand=True, padding=(0, 2))
+        for _ in range(6):
+            kpi.add_column(justify="left")
+        kpi.add_row(
+            Text("done", style="dim"), Text("ok", style="dim"),
+            Text("failed", style="dim"), Text("timeout", style="dim"),
+            Text("rate/h", style="dim"), Text("eta", style="dim"))
+        kpi.add_row(
+            Text(f"{st.done}/{st.total}", style="bold white"),
+            Text(str(st.succeeded), style="bold green"),
+            Text(str(st.failed + st.dead), style="bold red"),
+            Text(str(st.timeout), style="bold yellow"),
+            Text(f"{st.rate_per_hour:.0f}", style="bold cyan"),
+            Text(eta, style="bold white"))
+
+        active = Table(expand=True, box=None, pad_edge=False)
+        active.add_column("slot", width=4, style="dim")
+        active.add_column("repo", overflow="fold", ratio=3)
+        active.add_column("run id", width=14, style="dim")
+        active.add_column("status", ratio=1)
+        active.add_column("polls", width=6, justify="right", style="dim")
+        active.add_column("elapsed", width=8, justify="right")
+        for i, lr in enumerate(list(st.active.values())[:cfg.concurrency], 1):
+            active.add_row(str(i), lr.repo, lr.run_id[:12] or "—",
+                           Text(lr.status, style="cyan"),
+                           str(lr.polls), human_dt(now_ts() - lr.started))
+        if not st.active:
+            active.add_row("—", Text("idle", style="dim"), "", "", "", "")
+
+        tail = Table.grid(expand=True, padding=(0, 1))
+        tail.add_column(width=8)
+        tail.add_column(ratio=2, overflow="ellipsis")
+        tail.add_column(ratio=3, overflow="ellipsis", style="dim")
+        for level, repo, msg in st.tail[-8:][::-1]:
+            tail.add_row(Text(level.upper(), style=PALETTE.get(level, "white")),
+                         repo, msg)
+
+        breaker = self.runner.breaker
+        foot = Text(
+            f"http {self.runner.api.requests} req · {self.runner.api.retries} retries"
+            f" · breaker {'OPEN' if breaker.is_open else 'closed'}"
+            f" ({breaker.trips} trips) · resumed {st.resumed}"
+            f" · skipped {st.already_done} · state {cfg.state_dir}",
+            style="dim")
+
+        return Group(
+            Panel(head, border_style="cyan", padding=(0, 1)),
+            Panel(Group(bar, Text(f"  {pct:5.1f}%", style="bold"), Text(""), kpi),
+                  title="progress", border_style="grey37", padding=(0, 1)),
+            Panel(active, title=f"active runs (max {cfg.concurrency})",
+                  border_style="grey37", padding=(0, 1)),
+            Panel(tail, title="events", border_style="grey37", padding=(0, 1)),
+            foot,
+        )
+
+
+# ==========================================================================
+# HTML dashboard — the "next morning" view
+# ==========================================================================
+
+HTML = r"""<!doctype html>
+<meta charset="utf-8">
+<title>CodeMind batch — __TITLE__</title>
+__REFRESH__
+<style>
+:root{
+  --bg:#0b0f14; --panel:#111820; --line:#1e2a36; --ink:#d7e3ee; --dim:#6f8296;
+  --ok:#3ddc97; --bad:#ff5c6c; --warn:#ffc857; --dead:#c792ea; --run:#4cc9f0;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+header{padding:22px 28px;border-bottom:1px solid var(--line);
+  display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+h1{margin:0;font-size:16px;letter-spacing:.18em;text-transform:uppercase;font-weight:700}
+h1 span{color:var(--run)}
+.meta{color:var(--dim);font-size:12px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+  gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
+.kpi{background:var(--panel);padding:16px 18px}
+.kpi b{display:block;font-size:26px;font-weight:600;letter-spacing:-.02em}
+.kpi small{color:var(--dim);text-transform:uppercase;letter-spacing:.12em;font-size:10px}
+.rail{display:flex;height:6px;background:var(--panel)}
+.rail i{display:block;height:100%}
+.controls{padding:14px 28px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input,select{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  padding:7px 11px;border-radius:4px;font:inherit;font-size:13px}
+input:focus,select:focus{outline:2px solid var(--run);outline-offset:-1px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer;
+  color:var(--dim);background:none;font:inherit;font-size:12px}
+.chip[aria-pressed=true]{color:var(--bg);background:var(--ink);border-color:var(--ink)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{position:sticky;top:0;background:var(--bg);text-align:left;padding:10px 14px;
+  color:var(--dim);font-weight:500;border-bottom:1px solid var(--line);
+  cursor:pointer;white-space:nowrap;text-transform:uppercase;letter-spacing:.1em;font-size:10px}
+td{padding:9px 14px;border-bottom:1px solid #131c25;vertical-align:top}
+tr:hover td{background:#0f161d}
+.s{font-weight:600}
+.SUCCEEDED{color:var(--ok)} .FAILED{color:var(--bad)} .TIMEOUT{color:var(--warn)}
+.DEAD{color:var(--dead)} .RUNNING{color:var(--run)} .PENDING{color:var(--dim)}
+.err{color:var(--bad);opacity:.85;max-width:460px;display:block;overflow-wrap:anywhere}
+a{color:var(--run)}
+footer{padding:18px 28px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
+</style>
+<header>
+  <h1>CodeMind <span>batch</span> · __TITLE__</h1>
+  <div class="meta">__ENDPOINT__ · generated __GENERATED__ · __STATEDIR__</div>
+</header>
+<div class="kpis" id="kpis"></div>
+<div class="rail" id="rail"></div>
+<div class="controls">
+  <input id="q" placeholder="filter repo, run id, status, error…" size="42">
+  <span id="chips"></span>
+  <span class="meta" id="shown"></span>
+  <button class="chip" onclick="dl()">Download CSV</button>
+</div>
+<table>
+  <thead><tr>
+    <th data-k="repo">repo</th><th data-k="branch">branch</th>
+    <th data-k="state">outcome</th><th data-k="api_status">api status</th>
+    <th data-k="run_id">run id</th><th data-k="duration_s">duration</th>
+    <th data-k="polls">polls</th><th data-k="finished">finished</th>
+    <th data-k="report">report</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<footer>Per-run JSON lives in reports/&lt;date&gt;/. Full history: sqlite3 state.db "select * from tasks".</footer>
+<script>
+const DATA = __DATA__;
+const ORDER = ["SUCCEEDED","FAILED","TIMEOUT","DEAD","RUNNING","PENDING"];
+const COLOR = {SUCCEEDED:"var(--ok)",FAILED:"var(--bad)",TIMEOUT:"var(--warn)",
+               DEAD:"var(--dead)",RUNNING:"var(--run)",PENDING:"#26313c"};
+let filter="", only=new Set(), sortK="repo", asc=true;
+
+const counts = () => DATA.reduce((a,r)=>(a[r.state]=(a[r.state]||0)+1,a),{});
+
+function head(){
+  const c=counts(), tot=DATA.length;
+  const done=(c.SUCCEEDED||0)+(c.FAILED||0)+(c.TIMEOUT||0)+(c.DEAD||0);
+  const durs=DATA.filter(r=>r.duration_s).map(r=>r.duration_s).sort((a,b)=>a-b);
+  const p50=durs.length?durs[Math.floor(durs.length*.5)]:0;
+  const p95=durs.length?durs[Math.floor(durs.length*.95)]:0;
+  const cards=[["total",tot],["succeeded",c.SUCCEEDED||0,"var(--ok)"],
+    ["failed",(c.FAILED||0)+(c.DEAD||0),"var(--bad)"],
+    ["timeout",c.TIMEOUT||0,"var(--warn)"],
+    ["in flight",c.RUNNING||0,"var(--run)"],["queued",c.PENDING||0],
+    ["success rate",done?((c.SUCCEEDED||0)/done*100).toFixed(1)+"%":"—"],
+    ["p50 / p95",fmt(p50)+" / "+fmt(p95)]];
+  kpis.innerHTML=cards.map(([l,v,col])=>
+    `<div class="kpi"><b style="color:${col||"var(--ink)"}">${v}</b><small>${l}</small></div>`).join("");
+  rail.innerHTML=ORDER.map(s=>{const n=c[s]||0;return n?
+    `<i style="width:${n/tot*100}%;background:${COLOR[s]}" title="${s}: ${n}"></i>`:""}).join("");
+  chips.innerHTML=ORDER.filter(s=>c[s]).map(s=>
+    `<button class="chip" data-s="${s}" aria-pressed="${only.has(s)}">${s.toLowerCase()} ${c[s]}</button>`).join(" ");
+  chips.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    const s=b.dataset.s; only.has(s)?only.delete(s):only.add(s); draw();});
+}
+const fmt = s => !s?"—":s<60?Math.round(s)+"s":Math.floor(s/60)+"m"+String(Math.round(s%60)).padStart(2,"0")+"s";
+
+function view(){
+  let rs=DATA.filter(r=>{
+    if(only.size&&!only.has(r.state))return false;
+    if(!filter)return true;
+    return JSON.stringify(r).toLowerCase().includes(filter);
+  });
+  rs.sort((a,b)=>{const x=a[sortK]??"",y=b[sortK]??"";
+    return (x>y?1:x<y?-1:0)*(asc?1:-1)});
+  return rs;
+}
+function draw(){
+  head();
+  const rs=view();
+  shown.textContent=`${rs.length} of ${DATA.length}`;
+  rows.innerHTML=rs.map(r=>`<tr>
+    <td title="${r.repo_url}">${r.repo}${r.error?`<span class="err">${esc(r.error)}</span>`:""}</td>
+    <td>${r.branch||""}</td>
+    <td class="s ${r.state}">${r.state.toLowerCase()}</td>
+    <td>${esc(r.api_status||"")}</td>
+    <td>${(r.run_id||"").slice(0,12)}</td>
+    <td>${fmt(r.duration_s)}</td><td>${r.polls||0}</td>
+    <td>${r.finished||""}</td>
+    <td>${r.report?`<a href="${r.report}">json</a>`:""}</td></tr>`).join("")
+    || `<tr><td colspan="9" style="padding:36px;color:var(--dim)">
+        No runs match this filter. Clear the search or state chips to see everything.</td></tr>`;
+}
+const esc=s=>String(s).replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+q.oninput=e=>{filter=e.target.value.toLowerCase();draw()};
+document.querySelectorAll("th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k; asc = sortK===k ? !asc : true; sortK=k; draw();});
+function dl(){
+  const rs=view(), cols=["repo_url","branch","state","api_status","run_id",
+    "duration_s","polls","finished","error","report"];
+  const csv=[cols.join(",")].concat(rs.map(r=>cols.map(c=>
+    `"${String(r[c]??"").replace(/"/g,'""')}"`).join(","))).join("\n");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  a.download="codemind_runs.csv"; a.click();
+}
+draw();
+</script>
+"""
+
+
+def write_html(cfg: Config, store: Store, live: bool = False,
+               out: Optional[Path] = None) -> Path:
+    rows = store.all_rows()
+    base = cfg.state_dir.resolve()
+    data = []
+    for r in rows:
+        rp = ""
+        if r["report_path"]:
+            with contextlib.suppress(Exception):
+                rp = os.path.relpath(r["report_path"], base).replace(os.sep, "/")
+        fin = ""
+        if r["finished_at"]:
+            fin = datetime.fromtimestamp(r["finished_at"]).strftime("%m-%d %H:%M")
+        data.append({
+            "repo": r["repo_url"].rstrip("/").rsplit("/", 1)[-1],
+            "repo_url": r["repo_url"], "branch": r["branch"], "state": r["state"],
+            "api_status": r["api_status"], "run_id": r["run_id"],
+            "duration_s": round(r["duration_s"], 1) if r["duration_s"] else 0,
+            "polls": r["polls"], "finished": fin,
+            "error": (r["error"] or "")[:300], "report": rp,
+        })
+    title = "live" if live else "summary"
+    html = (HTML
+            .replace("__DATA__", json.dumps(data))
+            .replace("__TITLE__", title)
+            .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            .replace("__ENDPOINT__", cfg.base_url or "—")
+            .replace("__STATEDIR__", str(cfg.state_dir))
+            .replace("__REFRESH__",
+                     '<meta http-equiv="refresh" content="30">' if live else ""))
+    path = out or cfg.snapshot_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+# ==========================================================================
+# commands
+# ==========================================================================
+
+
+def make_logger(cfg: Config):
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    fh = cfg.log_path.open("a", encoding="utf-8")
+
+    def log(msg: str) -> None:
+        line = f"{utcnow()} {msg}"
+        fh.write(line + "\n")
+        fh.flush()
+        if cfg.no_ui or not RICH:
+            print(line, flush=True)
+    return log
+
+
+async def cmd_run(cfg: Config) -> int:
+    lock = InstanceLock(cfg.state_dir)
+    lock.acquire()
+    awake = KeepAwake(cfg.keep_awake)
+    awake.start()
+    log = make_logger(cfg)
+    store = Store(cfg.db_path)
+    store.set_meta("base_url", cfg.base_url)
+    store.set_meta("last_start", utcnow())
+
+    try:
+        if cfg.input_path:
+            tasks = load_tasks(cfg)
+            new, dup = store.enqueue(tasks)
+            log(f"input {cfg.input_path}: {len(tasks)} tasks "
+                f"({new} new, {dup} already tracked)")
+
+        counts = store.counts()
+        already = sum(v for k, v in counts.items() if k in TERMINAL)
+        rows = store.actionable(cfg.limit)
+        resumable = sum(1 for r in rows if r["state"] == RUNNING and r["run_id"])
+        log(f"queue: {len(rows)} actionable ({resumable} resumable), "
+            f"{already} already terminal, concurrency={cfg.concurrency}, "
+            f"keep_awake={awake.mode}")
+
+        if not rows:
+            print("Nothing to run. All tasks are in a terminal state.")
+            print(f"See the report:  python {Path(sys.argv[0]).name} report "
+                  f"--state {cfg.state_dir} --open")
+            return 0
+
+        runner = Runner(cfg, store, log)
+
+        loop = asyncio.get_running_loop()
+
+        def request_stop(*_: Any) -> None:
+            if not runner.stop.is_set():
+                log("shutdown requested — finishing current polls, "
+                    "in-flight run_ids are saved and will resume")
+                runner.stop.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, AttributeError):
+                loop.add_signal_handler(sig, request_stop)
+        if platform.system() == "Windows":
+            signal.signal(signal.SIGINT, lambda *_: request_stop())
+
+        if RICH and not cfg.no_ui:
+            dash = Dashboard(cfg, store, runner)
+            task = asyncio.create_task(runner.run(rows, already))
+            with Live(console=dash.console, refresh_per_second=4,
+                      screen=False) as live_ui:
+                while not task.done():
+                    if runner.stats:
+                        live_ui.update(dash.render())
+                    await asyncio.sleep(0.25)
+                if runner.stats:
+                    live_ui.update(dash.render())
+            await task
+        else:
+            await runner.run(rows, already)
+
+        st = runner.stats
+        path = write_html(cfg, store, live=False)
+        final = store.counts()
+        print("\n" + "─" * 62)
+        print(f"batch finished in {human_dt(st.elapsed if st else 0)}")
+        for k in (SUCCEEDED, FAILED, TIMEOUT, DEAD, RUNNING, PENDING):
+            if final.get(k):
+                print(f"  {k.lower():<10} {final[k]}")
+        print(f"\n  dashboard  {path}")
+        print(f"  reports    {cfg.reports_dir}")
+        print(f"  state      {cfg.db_path}")
+        if final.get(FAILED) or final.get(TIMEOUT):
+            print(f"\n  retry:  python {Path(sys.argv[0]).name} retry "
+                  f"--state {cfg.state_dir} --include failed,timeout")
+        return 0
+    finally:
+        awake.stop()
+        store.close()
+        lock.release()
+
+
+def cmd_status(cfg: Config) -> int:
+    store = Store(cfg.db_path)
+    counts = store.counts()
+    total = sum(counts.values())
+    durs = sorted(store.durations())
+    print(f"\nstate: {cfg.state_dir}   tasks: {total}")
+    for k in (PENDING, RUNNING, SUCCEEDED, FAILED, TIMEOUT, DEAD):
+        n = counts.get(k, 0)
+        if n:
+            bar = "█" * int(n / max(total, 1) * 34)
+            print(f"  {k.lower():<10} {n:>7}  {bar}")
+    if durs:
+        p50 = durs[len(durs) // 2]
+        p95 = durs[min(len(durs) - 1, int(len(durs) * 0.95))]
+        print(f"\n  duration  p50 {human_dt(p50)}   p95 {human_dt(p95)}")
+    ev = store.recent_events(8)
+    if ev:
+        print("\n  recent events")
+        for e in ev:
+            print(f"    {e['ts']}  {e['level']:<5} {e['msg'][:90]}")
+    store.close()
+    return 0
+
+
+def cmd_report(cfg: Config, open_it: bool, out: Optional[Path]) -> int:
+    store = Store(cfg.db_path)
+    path = write_html(cfg, store, live=False, out=out)
+    store.close()
+    print(f"dashboard written: {path.resolve()}")
+    if open_it:
+        with contextlib.suppress(Exception):
+            webbrowser.open(path.resolve().as_uri())
+    return 0
+
+
+def cmd_export(cfg: Config, out: Path) -> int:
+    store = Store(cfg.db_path)
+    rows = store.all_rows()
+    cols = ["repo_url", "branch", "playbooks", "state", "api_status", "run_id",
+            "duration_s", "polls", "attempt", "error", "report_path",
+            "enqueued_at", "updated_at"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r[c] for c in cols])
+    store.close()
+    print(f"{len(rows)} rows -> {out.resolve()}")
+    return 0
+
+
+def cmd_retry(cfg: Config, include: set[str]) -> int:
+    store = Store(cfg.db_path)
+    n = store.reset_states(include)
+    store.close()
+    print(f"{n} tasks reset to PENDING ({', '.join(sorted(include))}). "
+          f"Re-run the same 'run' command to process them.")
+    return 0
+
+
+# ==========================================================================
+# demo / self-test: mock API on localhost, full pipeline
+# ==========================================================================
+
+
+def cmd_demo() -> int:
+    import http.server
+    import socketserver
+    import tempfile
+
+    runs: dict[str, dict] = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def _send(self, code: int, body: dict) -> None:
+            raw = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if random.random() < 0.15:          # exercise retry path
+                return self._send(503, {"detail": "upstream busy"})
+            rid = str(uuid.uuid4())
+            runs[rid] = {"polls": 0, "repo": body.get("repo_url", "")}
+            self._send(200, {"run_id": rid, "status": "queued"})
+
+        def do_GET(self):
+            rid = self.path.rstrip("/").rsplit("/", 1)[-1]
+            r = runs.get(rid)
+            if not r:
+                return self._send(404, {"detail": "not found"})
+            r["polls"] += 1
+            if r["polls"] < 2:
+                return self._send(200, {"run_id": rid, "status": "running"})
+            bad = random.random() < 0.2
+            self._send(200, {
+                "run_id": rid,
+                "status": "failed" if bad else "completed",
+                "error": "playbook assertion failed" if bad else None,
+                "report": {"findings": random.randint(0, 9),
+                           "repo": r["repo"]}})
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    tmp = Path(tempfile.mkdtemp(prefix="cm_demo_"))
+    inp = tmp / "repos.csv"
+    inp.write_text(
+        "repo_url,branch,cd_repo_url\n" + "\n".join(
+            f"https://github.com/org/svc-{i:03d},main," for i in range(1, 13)))
+
+    cfg = Config(
+        base_url=f"http://127.0.0.1:{port}", state_dir=tmp / "state",
+        input_path=inp, playbooks=["demo_playbook"],
+        goal="generate report", concurrency=2,
+        first_poll_delay=0.4, poll_interval=0.4, max_wall=12,
+        submit_gap=0.05, snapshot_every=3, keep_awake=False,
+        backoff_base=1.2, backoff_cap=2, http_timeout=10)
+
+    print(f"demo: mock orchestrator on {cfg.base_url}, state {cfg.state_dir}\n")
+    rc = asyncio.run(cmd_run(cfg))
+    srv.shutdown()
+    cmd_status(cfg)
+    print(f"\ndemo artifacts: {tmp}")
+    return rc
+
+
+# ==========================================================================
+# CLI
+# ==========================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP,
+        description="Batch runner for the CodeMind orchestrator API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  run     %(prog)s run --base-url "$ORCH_BASE_URL" \\
+              --input repos.csv --playbooks scan,scan_evaluation --goal "generate report"
+  shard   %(prog)s run ... --shard 3/20 --state ./state_03
+  watch   %(prog)s status --state ./cm_state
+  read    %(prog)s report --state ./cm_state --open
+  redo    %(prog)s retry  --state ./cm_state --include failed,timeout
+""")
+    p.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--state", type=Path, default=Path("./cm_state"),
+                        help="state directory (db + reports + dashboard)")
+
+    r = sub.add_parser("run", help="submit and poll a batch")
+    common(r)
+    r.add_argument("--base-url", default=os.environ.get("ORCH_BASE_URL", ""),
+                   help="orchestrator base URL, or set ORCH_BASE_URL")
+    r.add_argument("--input", type=Path,
+                   help="CSV or newline-delimited repo list (omit to resume)")
+    r.add_argument("--playbooks", default="",
+                   help="comma separated, 1 or 2, default for rows without one")
+    r.add_argument("--goal", default="")
+    r.add_argument("--branch", default="main")
+    r.add_argument("--cd-repo-url", default="", help="optional")
+    r.add_argument("--cd-branch", default="", help="optional")
+    r.add_argument("--repo-path", default="")
+    r.add_argument("--user-id", default=os.environ.get("CODEMIND_USER", ""))
+    r.add_argument("--mirror-mode", choices=["true", "false"], default=None)
+    r.add_argument("--concurrency", type=int, default=2,
+                   help="parallel orchestrator runs (default 2)")
+    r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--shard", default="1/1", metavar="i/N",
+                   help="process shard i of N (1-based)")
+    r.add_argument("--first-poll-delay", type=float, default=60.0)
+    r.add_argument("--poll-interval", type=float, default=30.0)
+    r.add_argument("--max-wall", type=float, default=1800.0,
+                   help="per-run deadline in seconds (default 1800 = 30 min)")
+    r.add_argument("--submit-gap", type=float, default=2.0)
+    r.add_argument("--http-timeout", type=float, default=60.0)
+    r.add_argument("--max-http-attempts", type=int, default=6)
+    r.add_argument("--max-submit-retries", type=int, default=3)
+    r.add_argument("--breaker-threshold", type=int, default=8)
+    r.add_argument("--breaker-cooldown", type=float, default=120.0)
+    r.add_argument("--token", default=os.environ.get("CODEMIND_TOKEN", ""))
+    r.add_argument("--header", action="append", default=[], metavar="K=V")
+    r.add_argument("--insecure", action="store_true",
+                   help="skip TLS verification (internal CA)")
+    r.add_argument("--success-states", default="")
+    r.add_argument("--failure-states", default="")
+    r.add_argument("--no-ui", action="store_true", help="plain logs, for OCP/nohup")
+    r.add_argument("--no-keep-awake", action="store_true")
+    r.add_argument("--snapshot-every", type=float, default=60.0)
+
+    s = sub.add_parser("status", help="print a state snapshot")
+    common(s)
+
+    rep = sub.add_parser("report", help="build the HTML dashboard")
+    common(rep)
+    rep.add_argument("--open", action="store_true")
+    rep.add_argument("--out", type=Path)
+
+    e = sub.add_parser("export", help="export every run to CSV")
+    common(e)
+    e.add_argument("--out", type=Path, default=Path("codemind_runs.csv"))
+
+    rt = sub.add_parser("retry", help="reset terminal states back to PENDING")
+    common(rt)
+    rt.add_argument("--include", default="failed,timeout",
+                    help="failed,timeout,dead")
+
+    sub.add_parser("demo", help="run an end-to-end self test against a mock API")
+    return p
+
+
+def cfg_from_args(a: argparse.Namespace) -> Config:
+    headers = {}
+    for h in getattr(a, "header", []):
+        if "=" not in h:
+            raise SystemExit(f"--header expects K=V, got {h!r}")
+        k, v = h.split("=", 1)
+        headers[k.strip()] = v.strip()
+
+    shard, shards = 0, 1
+    if getattr(a, "shard", None):
+        try:
+            i, n = a.shard.split("/")
+            shard, shards = int(i) - 1, int(n)
+        except Exception:
+            raise SystemExit("--shard expects i/N, e.g. 3/20")
+        if not (0 <= shard < shards):
+            raise SystemExit(f"--shard out of range: {a.shard}")
+
+    pb = [p.strip() for p in (a.playbooks or "").split(",") if p.strip()]
+    if len(pb) > 2:
+        raise SystemExit("max 2 playbooks per run")
+
+    for extra, target in ((a.success_states, SUCCESS_STATES),
+                          (a.failure_states, FAILURE_STATES)):
+        for tok in (extra or "").split(","):
+            if tok.strip():
+                target.add(tok.strip().lower())
+
+    return Config(
+        base_url=a.base_url, state_dir=a.state, input_path=a.input,
+        playbooks=pb, goal=a.goal, branch=a.branch,
+        cd_repo_url=a.cd_repo_url, cd_branch=a.cd_branch,
+        repo_path=a.repo_path, user_id=a.user_id,
+        mirror_mode=None if a.mirror_mode is None else a.mirror_mode == "true",
+        concurrency=max(1, a.concurrency), limit=a.limit,
+        shard=shard, shards=shards,
+        first_poll_delay=a.first_poll_delay, poll_interval=a.poll_interval,
+        max_wall=a.max_wall, submit_gap=a.submit_gap,
+        http_timeout=a.http_timeout, max_http_attempts=a.max_http_attempts,
+        max_submit_retries=a.max_submit_retries,
+        breaker_threshold=a.breaker_threshold,
+        breaker_cooldown=a.breaker_cooldown,
+        token=a.token, headers=headers, verify=not a.insecure,
+        no_ui=a.no_ui, keep_awake=not a.no_keep_awake,
+        snapshot_every=a.snapshot_every,
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.cmd == "run":
+        cfg = cfg_from_args(args)
+        if not cfg.base_url:
+            raise SystemExit("--base-url is required (or set ORCH_BASE_URL)")
+        if not cfg.input_path and not cfg.db_path.exists():
+            raise SystemExit("--input is required the first time (no state yet)")
+        try:
+            return asyncio.run(cmd_run(cfg))
+        except KeyboardInterrupt:
+            print("\ninterrupted — state saved, re-run the same command to resume")
+            return 130
+
+    if args.cmd == "demo":
+        return cmd_demo()
+
+    cfg = Config(state_dir=args.state)
+    if not cfg.db_path.exists():
+        raise SystemExit(f"no state db at {cfg.db_path}")
+
+    if args.cmd == "status":
+        return cmd_status(cfg)
+    if args.cmd == "report":
+        return cmd_report(cfg, args.open, args.out)
+    if args.cmd == "export":
+        return cmd_export(cfg, args.out)
+    if args.cmd == "retry":
+        inc = {s.strip().upper() for s in args.include.split(",") if s.strip()}
+        bad = inc - {FAILED, TIMEOUT, DEAD, RUNNING}
+        if bad:
+            raise SystemExit(f"cannot retry: {', '.join(bad)}")
+        return cmd_retry(cfg, inc)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:          # piped into head/less
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
