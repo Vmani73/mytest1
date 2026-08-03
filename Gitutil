@@ -1,0 +1,22 @@
+Build a deterministic SD (static dependency) element analyzer using Git utilities.
+
+Goal: Create a tool that identifies and catalogs code elements across a repository, with deterministic, reproducible output tied to Git provenance.
+
+Requirements:
+
+1. Element Discovery: Use Git and static analysis to identify code elements (functions, classes, methods) and mark their boundaries deterministically
+2. Canonical Keys: Assign each element a stable, sortable key: {remote_url, commit_sha, file_path, element_name, line_number}
+3. Git Integration:
+   - git rev-parse HEAD for commit SHA
+   - git config --get remote.origin.url for repo identity
+   - git ls-files for deterministic file inventory
+   - git blame for element provenance (author, commit)
+   - git log -p for element history/lineage
+4. Determinism: All output must be sorted consistently (by file path, then line number) to eliminate run-to-run variance
+5. Cross-Repo Awareness: Detect when elements reference code outside the current repo using git remote data
+6. Output Format: JSON or structured log with canonical keys, enabling deduplication and aggregation across multiple repos
+
+Constraints:
+- No ML/embeddings (pure git + AST parsing)
+- Deterministic ordering (sort all collections)
+- Commit-level provenance (no branch-level fuzziness)
