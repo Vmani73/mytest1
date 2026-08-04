@@ -1,0 +1,397 @@
+# detect_resilience_patterns
+
+**Version:** 1.0.0  
+**Status:** Production  
+**Owner:** Platform Automation (Codemind)  
+**Last Updated:** 2026-08-04  
+
+---
+
+## 1. Objective
+
+Detect and catalog resilience accelerators across a codebase: circuit breakers, bulkheads (isolation patterns), timeouts, retries, fallbacks, rate limiters, and health checks. Produce evidence-based findings with code locations, severity levels, and architectural implications for microservices and distributed systems.
+
+---
+
+## 2. Context & Scope
+
+### Problem Statement
+Microservices architectures require resilience patterns to prevent cascading failures. Teams often implement these patterns inconsistently, leaving gaps where systemic failures can propagate. This playbook surfaces resilience coverage and identifies anti-patterns (e.g., missing timeouts, missing fallbacks on critical paths).
+
+### Scope
+- **In Scope:** Java/Kotlin (Resilience4j, Spring Cloud Circuit Breaker, Hystrix), Python (pybreaker, tenacity), Node.js (opossum, p-retry), Go (go-resilience), C# (.NET Polly)
+- **Out of Scope:** Infrastructure-level resilience (Istio, K8s policies); database-specific patterns (connection pooling)
+- **Cross-Repo:** Via graphifyy global graph; identifies patterns spanning multiple repos
+
+### Key Questions Answered
+- Which critical paths lack circuit breakers?
+- Are bulkheads properly isolated (thread pools, semaphores)?
+- Do all external calls have timeouts?
+- Is fallback behavior defined for failures?
+- Are rate limits applied to shared resources?
+- Is health check infrastructure in place?
+
+---
+
+## 3. Methodology
+
+### 3.1 Detection Strategy
+
+**Phase 1: Pattern Inventory**
+- Scan imports/dependencies for resilience libraries
+- Index pattern annotations/configurations (e.g., `@CircuitBreaker`, `@Retry`, `@Timeout`)
+- Catalog all method calls to external services (via graphifyy call graph)
+
+**Phase 2: Evidence Collection**
+- For each pattern type: collect code location, configuration, scope, and fallback status
+- Cross-reference with MongoDB for known resilience defaults and anti-patterns
+- Rank patterns by criticality: critical paths (auth, payment, core services) vs. non-critical
+
+**Phase 3: Gap Analysis**
+- Identify unprotected external calls (HTTP, RPC, database query timeouts)
+- Detect missing fallbacks on resilience-protected methods
+- Surface inconsistent timeout values across similar call patterns
+- Flag synchronous vs. asynchronous execution contexts
+
+**Phase 4: Synthesis**
+- Aggregate findings by pattern type and criticality
+- Produce structured evidence report with code snippets
+- Recommend missing patterns and best-practice alignment
+
+### 3.2 LangGraph Orchestration
+
+```
+inventory_dependencies
+    ↓
+extract_pattern_evidence → build_call_graph → cross_ref_criticality
+    ↓
+analyze_gaps → synthesize_findings → dedup_and_rank
+    ↓
+output_report
+```
+
+---
+
+## 4. Execution
+
+### 4.1 Inputs
+
+```json
+{
+  "repo_path": "string (absolute path or git URL)",
+  "scan_depth": "shallow | standard | deep",
+  "focus_patterns": ["circuit_breaker", "bulkhead", "timeout", "retry", "fallback", "rate_limit", "health_check"],
+  "criticality_filter": "all | critical_only | non_critical",
+  "output_format": "json | markdown",
+  "mongodb_enabled": true
+}
+```
+
+### 4.2 Output
+
+```json
+{
+  "repo_id": "string",
+  "timestamp": "ISO 8601",
+  "summary": {
+    "total_patterns_detected": "int",
+    "pattern_breakdown": { "circuit_breaker": int, "bulkhead": int, ... },
+    "coverage_percentage": "float (0-100)",
+    "critical_gaps": "int",
+    "recommendation_count": "int"
+  },
+  "patterns": [
+    {
+      "id": "uuid",
+      "type": "circuit_breaker | bulkhead | timeout | retry | fallback | rate_limit | health_check",
+      "name": "string (e.g., 'PaymentServiceCircuitBreaker')",
+      "location": {
+        "file": "string",
+        "line": "int",
+        "method": "string",
+        "class": "string"
+      },
+      "configuration": {
+        "library": "string (e.g., 'Resilience4j', 'Polly')",
+        "version": "string",
+        "parameters": { /* pattern-specific config */ }
+      },
+      "scope": {
+        "applies_to": ["method", "class", "package"],
+        "affected_calls": "int"
+      },
+      "criticality": "critical | high | medium | low",
+      "evidence": "code snippet or annotation",
+      "fallback_status": "defined | missing | conditional",
+      "annotations_found": ["string"]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "uuid",
+      "type": "gap_type (missing_circuit_breaker | missing_timeout | missing_fallback | etc.)",
+      "location": {
+        "file": "string",
+        "method": "string (calling external service)",
+        "external_call": "string (target service/URL)"
+      },
+      "criticality": "critical | high | medium | low",
+      "evidence": "unprotected call snippet",
+      "recommendation": "string (specific remediation)"
+    }
+  ],
+  "anti_patterns": [
+    {
+      "id": "uuid",
+      "type": "string (e.g., 'synchronous_chain_without_timeout', 'missing_fallback_on_critical_path')",
+      "locations": ["string"],
+      "severity": "critical | high | medium",
+      "description": "string",
+      "remediation": "string"
+    }
+  ],
+  "recommendations": [
+    {
+      "priority": "p0 | p1 | p2",
+      "pattern": "string",
+      "scope": "string",
+      "rationale": "string",
+      "example_code": "string"
+    }
+  ]
+}
+```
+
+### 4.3 Pattern Detection Rules
+
+#### Circuit Breaker
+- **Libraries:** Resilience4j, Spring Cloud Circuit Breaker, Hystrix, Polly, pybreaker, opossum
+- **Annotations:** `@CircuitBreaker`, `@Retry`, `@Fallback`
+- **Config Keys:** `circuitBreaker.registerHealthIndicator`, `failure-threshold`, `success-threshold`
+- **Evidence:** Method wrapping external calls with state machine (CLOSED → OPEN → HALF_OPEN)
+
+#### Bulkhead (Isolation)
+- **Libraries:** Resilience4j Bulkhead, thread pool executors, semaphores, virtual threads (Java 19+)
+- **Patterns:** `ThreadPoolExecutor`, `BoundedElasticScheduler`, `@Bulkhead`, semaphore limits
+- **Evidence:** Thread pool size limits, queue depth limits, max concurrent calls
+
+#### Timeout
+- **Libraries:** Resilience4j Timeout, Spring `@Transactional(timeout)`, OkHttp/Retrofit, httpx `timeout=`, Polly timeout
+- **Patterns:** `Duration.ofMillis()`, `timeout=` configurations, deadline propagation
+- **Evidence:** Explicit timeout values on all I/O calls (HTTP, DB, RPC)
+
+#### Retry
+- **Libraries:** Resilience4j Retry, tenacity, Spring Retry, Polly
+- **Patterns:** `@Retry(maxAttempts)`, retry policies, backoff strategies
+- **Evidence:** Exponential backoff, jitter, idempotency keys
+
+#### Fallback
+- **Libraries:** Resilience4j Fallback, Hystrix fallback methods
+- **Patterns:** `recover()`, `fallback()`, default value returns, graceful degradation
+- **Evidence:** Method providing alternative behavior on failure
+
+#### Rate Limiting
+- **Libraries:** Resilience4j RateLimiter, Bucket4j, guava RateLimiter, Polly rate limit
+- **Patterns:** Token bucket, sliding window, lease-based
+- **Evidence:** Request/second limits, queue depth limits on shared resources
+
+#### Health Check
+- **Libraries:** Spring Boot Actuator, Micrometer, K8s probes
+- **Patterns:** `/health` endpoints, liveness/readiness probes, circuit breaker health indicators
+- **Evidence:** Structured health status endpoints
+
+---
+
+## 5. Implementation Notes
+
+### 5.1 Determinism & Consistency
+- **Temperature:** Always pinned to `0.0` for detection tasks (no sampling variance)
+- **Random Seed:** Fixed (e.g., `42`) for reproducible shuffling of large result sets
+- **Canonical Ordering:** Results sorted by (file path ASC, line number ASC, pattern type ASC)
+- **Deduplication:** Hash(location + pattern type + configuration) to remove duplicate findings
+
+### 5.2 MongoDB Schema (Reference Data)
+
+**Collection: `resilience_patterns.known_libraries`**
+```json
+{
+  "library_name": "string",
+  "language": "string",
+  "min_version": "string",
+  "key_classes": ["string"],
+  "default_timeout_ms": "int or null",
+  "supports_bulkhead": "boolean",
+  "supports_circuit_breaker": "boolean"
+}
+```
+
+**Collection: `resilience_patterns.anti_patterns`**
+```json
+{
+  "name": "string",
+  "description": "string",
+  "patterns": ["string (regex or code pattern)"],
+  "severity": "critical | high | medium",
+  "remediation": "string"
+}
+```
+
+**Collection: `resilience_patterns.critical_services`**
+```json
+{
+  "service_name": "string",
+  "min_required_patterns": ["circuit_breaker", "timeout", "fallback"],
+  "max_timeout_ms": "int",
+  "requires_bulkhead": "boolean"
+}
+```
+
+### 5.3 Graphifyy Integration
+- **Deep Mode:** Extract cross-repo call graph to surface inter-service resilience gaps
+- **Call Graph Traversal:** Follow external service calls through dependency graph
+- **Confidence:** Include confidence scores for pattern detection (e.g., 0.95 for direct annotation, 0.75 for inferred timeout)
+
+### 5.4 LLM Instructions (Gemini 2.5 Pro via Tachyon)
+```
+You are a resilience patterns expert analyzing Java/Kotlin/Python/Node.js microservice code.
+
+Task: Detect circuit breakers, bulkheads, timeouts, retries, fallbacks, rate limiters, and health checks.
+
+Rules:
+1. For EACH external call (HTTP, RPC, database), report if protected by:
+   - Circuit breaker (state machine for fault isolation)
+   - Timeout (explicit deadline)
+   - Retry (exponential backoff, idempotency)
+   - Fallback (alternative behavior on failure)
+
+2. Flag as CRITICAL any of:
+   - Unprotected external calls on critical paths (auth, payment, core logic)
+   - Missing timeouts on I/O operations
+   - Missing fallbacks on circuit-breaker-protected calls
+   - Synchronous chains exceeding 5 levels without bulkhead isolation
+
+3. Report evidence: exact code location, library version, configuration, and code snippet.
+
+4. Suggest specific patterns from Wells Fargo best practices:
+   - Circuit breaker: 50% failure threshold, 5-second open window
+   - Timeout: 2s for sync, 30s for async, 500ms for in-process RPCs
+   - Retry: 3 attempts with exponential backoff (100ms base, 2x multiplier)
+   - Bulkhead: thread pool size = (core + 1) * 2, queue size = pool size * 2
+
+5. Do NOT report false positives: confirm library presence via imports.
+```
+
+### 5.5 Handling Ambiguity
+- **Inferred Timeouts:** If timeout not explicit, check parent async context (e.g., Spring boot server timeout)
+- **Language-Specific Variance:** Python (context managers), Go (defer/panic), C# (Task.Wait with timeout)
+- **DSL Configurations:** YAML, properties files, code-gen; follow configuration hierarchy (code > annotation > config file)
+
+---
+
+## 6. Validation & Quality Gates
+
+### 6.1 Internal Validation
+- Verify circuit breaker state transitions (CLOSED → OPEN → HALF_OPEN → CLOSED)
+- Cross-check timeout values against service SLAs (via MongoDB)
+- Validate retry counts + backoff math against resilience4j best practices (avoid thundering herd)
+- Ensure fallback methods are side-effect free (idempotent)
+
+### 6.2 False Positive Mitigation
+- Confirm library presence in `pom.xml`, `build.gradle`, `requirements.txt`, `package.json`
+- Verify annotations are from resilience libraries, not custom stubs
+- Check that timeout values are reasonable (>10ms, <60s) to avoid timeouts set to 0 or invalid
+
+### 6.3 Output Quality Checks
+- **Deduplication:** Remove duplicate findings within same file (same line, same pattern type)
+- **Sorting:** Canonical ordering by (file, line, pattern type)
+- **Null Handling:** Omit null/empty fields in JSON output; use `null` only for intentional absence
+- **Coverage Score:** `(patterns_detected / theoretical_maximum) * 100` with theoretical max = external calls count * 4 patterns
+
+---
+
+## Example Findings
+
+### Finding 1: Missing Circuit Breaker on Critical Payment Path
+
+```json
+{
+  "id": "gap_001",
+  "type": "missing_circuit_breaker",
+  "location": {
+    "file": "src/main/java/com/wf/payment/PaymentService.java",
+    "line": 42,
+    "method": "processPayment",
+    "class": "PaymentService"
+  },
+  "external_call": "POST /api/external-processor/charge",
+  "criticality": "critical",
+  "evidence": "restTemplate.postForEntity(url, request, Response.class)",
+  "recommendation": "Wrap with @CircuitBreaker(name='payment-processor', failureThreshold=50, delayDuration=PT5S). Add @Fallback for refund/retry logic."
+}
+```
+
+### Finding 2: Missing Timeout on Database Query
+
+```json
+{
+  "id": "gap_002",
+  "type": "missing_timeout",
+  "location": {
+    "file": "src/main/java/com/wf/order/OrderRepository.java",
+    "line": 156,
+    "method": "queryOrdersByStatus",
+    "class": "OrderRepository"
+  },
+  "external_call": "SELECT * FROM orders WHERE status = ?",
+  "criticality": "high",
+  "evidence": "jdbcTemplate.query(sql, RowMapper)",
+  "recommendation": "Add @Transactional(timeout=5) or query.setMaxRows(timeout=5000). Ensure connection pool timeout ≤ query timeout."
+}
+```
+
+### Finding 3: Bulkhead Properly Isolated
+
+```json
+{
+  "id": "pattern_001",
+  "type": "bulkhead",
+  "name": "AsyncOrderProcessing",
+  "location": {
+    "file": "src/main/java/com/wf/order/AsyncOrderExecutor.java",
+    "line": 21,
+    "class": "AsyncOrderExecutor"
+  },
+  "configuration": {
+    "library": "Resilience4j",
+    "version": "2.1.0",
+    "parameters": {
+      "maxConcurrentCalls": 10,
+      "maxWaitDuration": "PT2S",
+      "executorService": "ThreadPoolExecutor(coreSize=5, maxSize=10, queue=50)"
+    }
+  },
+  "scope": {
+    "applies_to": ["method"],
+    "affected_calls": 3
+  },
+  "criticality": "high",
+  "evidence": "@Bulkhead(name='async-orders', type=THREAD) public void processOrderAsync(Order order)"
+}
+```
+
+---
+
+## Related Playbooks
+
+- `ccc_security_vulnerability_scan` - Security patterns (complements resilience)
+- `perf_analyze_thread_dump` - Thread pool utilization and deadlock detection
+- `generate_functional_tests` - Test coverage for resilience paths (happy path + failure modes)
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0.0 | 2026-08-04 | Initial production release; all 7 pattern types (CB, BH, TO, RT, FB, RL, HC) |
+
