@@ -1,0 +1,2636 @@
+#!/usr/bin/env python3
+"""
+CodeMind Batch Runner — click to run, set up in the browser.
+
+Double-click this file (or the launcher it creates next to itself). It opens a
+dashboard in your web browser, asks for the server address, the playbook(s) and
+the repositories the first time only, and then runs the batch. Everything after
+that is buttons.
+
+No installation. Python 3.9+ and nothing else — the whole app is this one file.
+
+Design guarantees
+-----------------
+crash-safe      every state change is written to SQLite before the next network
+                call; if the app is closed mid-batch, restarting re-attaches to
+                the runs already in flight instead of resubmitting them
+idempotent      a repository already finished is never run twice
+bounded         2 parallel runs by default, paced submits, circuit breaker, and
+                a hard 30-minute deadline per run
+observable      live dashboard, per-run JSON, CSV export, offline HTML report
+shardable       split one repo list across many machines with Advanced > Shard
+
+Advanced / server use:
+    python codemind_batch.py --headless        run from codemind.json, no browser
+    python codemind_batch.py --port 8080       pin the dashboard port
+    python codemind_batch.py --demo            self test against a built-in mock
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import csv
+import hashlib
+import io
+import json
+import os
+import platform
+import random
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import webbrowser
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# --------------------------------------------------------------------------
+# stdlib only — no pip install, so a plain Python installation can run this
+# --------------------------------------------------------------------------
+
+import http.server
+import socket
+import socketserver
+import ssl
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse, unquote
+
+
+APP = "CodeMind Batch Runner"
+VERSION = "2.0.0"
+
+# The two orchestrator endpoints. Change here only if yours differ.
+SUBMIT_PATH = "/api/v1/orchestrator/run"
+POLL_PATH = "/api/v1/orchestrator/runs/{run_id}"
+
+# --------------------------------------------------------------------------
+# status vocabulary — extend at runtime with --success-states / --failure-states
+# --------------------------------------------------------------------------
+
+SUCCESS_STATES = {
+    "completed", "complete", "success", "succeeded", "successful",
+    "finished", "done", "passed", "ok", "pass",
+}
+FAILURE_STATES = {
+    "failed", "failure", "error", "errored", "cancelled", "canceled",
+    "aborted", "terminated", "killed", "rejected", "crashed",
+}
+RUNNING_STATES = {
+    "running", "in_progress", "in-progress", "inprogress", "pending", "queued",
+    "started", "starting", "processing", "created", "new", "submitted",
+    "active", "waiting", "scheduled", "accepted", "initializing",
+}
+
+RUN_ID_KEYS = ("run_id", "runid", "job_id", "jobid", "execution_id", "task_id", "id")
+STATUS_KEYS = ("status", "state", "run_status", "job_status", "phase", "run_state")
+
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504, 522, 524}
+
+# task states persisted in sqlite
+PENDING, RUNNING, SUCCEEDED, FAILED, TIMEOUT, DEAD = (
+    "PENDING", "RUNNING", "SUCCEEDED", "FAILED", "TIMEOUT", "DEAD"
+)
+TERMINAL = {SUCCEEDED, FAILED, TIMEOUT, DEAD}
+ACTIONABLE = {PENDING, RUNNING}
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def human_dt(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def deep_find(obj: Any, keys: tuple[str, ...], want_str: bool = True) -> Optional[str]:
+    """Breadth-first search for the first matching key in a nested structure."""
+    queue: list[Any] = [obj]
+    seen = 0
+    while queue and seen < 2000:
+        cur = queue.pop(0)
+        seen += 1
+        if isinstance(cur, dict):
+            for k in keys:
+                for real in cur:
+                    if isinstance(real, str) and real.lower() == k:
+                        v = cur[real]
+                        if v is None:
+                            continue
+                        if want_str and isinstance(v, (str, int)):
+                            return str(v)
+                        if not want_str:
+                            return v
+            queue.extend(cur.values())
+        elif isinstance(cur, list):
+            queue.extend(cur[:50])
+    return None
+
+
+# ==========================================================================
+# configuration
+# ==========================================================================
+
+
+@dataclass
+class Config:
+    base_url: str = ""
+    state_dir: Path = Path("./cm_state")
+    concurrency: int = 2
+    input_path: Optional[Path] = None
+
+    # payload defaults (per-row CSV values win)
+    playbooks: list[str] = field(default_factory=list)
+    goal: str = ""
+    branch: str = "main"
+    cd_repo_url: str = ""
+    cd_branch: str = ""
+    repo_path: str = ""
+    user_id: str = ""
+    mirror_mode: Optional[bool] = None
+
+    # timing
+    first_poll_delay: float = 60.0
+    poll_interval: float = 30.0
+    max_wall: float = 1800.0          # 30 min hard deadline per run
+    submit_gap: float = 2.0           # min seconds between submits, global
+    http_timeout: float = 60.0
+
+    # resilience
+    max_http_attempts: int = 6
+    backoff_base: float = 2.0
+    backoff_cap: float = 60.0
+    max_submit_retries: int = 3       # whole-task resubmits before DEAD
+    breaker_threshold: int = 8
+    breaker_cooldown: float = 120.0
+    poll_404_grace: int = 5
+
+    # transport
+    token: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    verify: bool = True
+
+    # sharding / selection
+    shard: int = 0
+    shards: int = 1
+    limit: int = 0
+    include_states: set[str] = field(default_factory=set)
+
+    # ui
+    no_ui: bool = False
+    snapshot_every: float = 60.0
+    keep_awake: bool = True
+
+    @property
+    def db_path(self) -> Path:
+        return self.state_dir / "state.db"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.state_dir / "reports"
+
+    @property
+    def snapshot_path(self) -> Path:
+        return self.state_dir / "dashboard.html"
+
+    @property
+    def log_path(self) -> Path:
+        return self.state_dir / "runner.log"
+
+
+# ==========================================================================
+# task model
+# ==========================================================================
+
+
+@dataclass
+class Task:
+    repo_url: str
+    branch: str = "main"
+    playbooks: list[str] = field(default_factory=list)
+    goal: str = ""
+    cd_repo_url: str = ""
+    cd_branch: str = ""
+    repo_path: str = ""
+    user_id: str = ""
+    mirror_mode: Optional[bool] = None
+
+    @property
+    def key(self) -> str:
+        raw = "|".join([
+            self.repo_url.strip().rstrip("/").lower(),
+            self.branch.strip(),
+            ",".join(self.playbooks),
+            self.goal.strip(),
+            self.cd_repo_url.strip(),
+            self.cd_branch.strip(),
+        ])
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+    @property
+    def short(self) -> str:
+        return self.repo_url.rstrip("/").rsplit("/", 1)[-1] or self.repo_url
+
+    def payload(self) -> dict[str, Any]:
+        """Only repo_url + playbook_names + branch are sent unconditionally.
+        Optional fields are omitted when empty so the API keeps its defaults."""
+        body: dict[str, Any] = {
+            "repo_url": self.repo_url,
+            "branch": self.branch or "main",
+            "playbook_names": self.playbooks,
+        }
+        if self.goal:
+            body["goal"] = self.goal
+        if self.cd_repo_url:
+            body["cd_repo_url"] = self.cd_repo_url
+        if self.cd_branch:
+            body["cd_branch"] = self.cd_branch
+        if self.repo_path:
+            body["repo_path"] = self.repo_path
+        if self.user_id:
+            body["user_id"] = self.user_id
+        if self.mirror_mode is not None:
+            body["mirror_mode"] = self.mirror_mode
+        return body
+
+
+# ==========================================================================
+# persistence
+# ==========================================================================
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    key           TEXT PRIMARY KEY,
+    repo_url      TEXT NOT NULL,
+    branch        TEXT,
+    playbooks     TEXT,
+    goal          TEXT,
+    cd_repo_url   TEXT,
+    cd_branch     TEXT,
+    repo_path     TEXT,
+    user_id       TEXT,
+    mirror_mode   INTEGER,
+    state         TEXT NOT NULL,
+    run_id        TEXT,
+    attempt       INTEGER DEFAULT 0,
+    polls         INTEGER DEFAULT 0,
+    api_status    TEXT,
+    error         TEXT,
+    report_path   TEXT,
+    enqueued_at   TEXT,
+    submitted_at  REAL,
+    finished_at   REAL,
+    duration_s    REAL,
+    updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_state ON tasks(state);
+
+CREATE TABLE IF NOT EXISTS events (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts    TEXT,
+    key   TEXT,
+    level TEXT,
+    msg   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);
+
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    clean_exit  INTEGER DEFAULT 0
+);
+"""
+
+
+class Store:
+    """Thread-safe SQLite wrapper. Every write is committed immediately —
+    the DB is the source of truth, memory is only a cache."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+        self.db.row_factory = sqlite3.Row
+        with self._lock:
+            self.db.executescript(SCHEMA)
+            self.db.commit()
+
+    def close(self) -> None:
+        with self._lock, contextlib.suppress(Exception):
+            self.db.close()
+
+    # -- writes ----------------------------------------------------------
+    def enqueue(self, tasks: Iterable[Task]) -> tuple[int, int]:
+        new = dup = 0
+        with self._lock:
+            for t in tasks:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(key,repo_url,branch,playbooks,goal,cd_repo_url,cd_branch,"
+                    " repo_path,user_id,mirror_mode,state,enqueued_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (t.key, t.repo_url, t.branch, json.dumps(t.playbooks), t.goal,
+                     t.cd_repo_url, t.cd_branch, t.repo_path, t.user_id,
+                     None if t.mirror_mode is None else int(t.mirror_mode),
+                     PENDING, utcnow(), utcnow()),
+                )
+                if cur.rowcount:
+                    new += 1
+                else:
+                    dup += 1
+            self.db.commit()
+        return new, dup
+
+    def update(self, key: str, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = utcnow()
+        cols = ",".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self.db.execute(f"UPDATE tasks SET {cols} WHERE key=?",
+                            (*fields.values(), key))
+            self.db.commit()
+
+    def event(self, key: str, level: str, msg: str) -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO events (ts,key,level,msg) VALUES (?,?,?,?)",
+                (utcnow(), key, level, msg[:2000]),
+            )
+            self.db.commit()
+
+    def reset_states(self, states: set[str]) -> int:
+        with self._lock:
+            qs = ",".join("?" * len(states))
+            cur = self.db.execute(
+                f"UPDATE tasks SET state=?, run_id=NULL, error=NULL, attempt=0 "
+                f"WHERE state IN ({qs})", (PENDING, *states))
+            self.db.commit()
+            return cur.rowcount
+
+    def set_meta(self, k: str, v: str) -> None:
+        with self._lock:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
+            self.db.commit()
+
+    # -- sessions: how much time has actually been spent working ---------
+    def open_session(self) -> int:
+        """Call once per app launch. Closes any session left dangling by
+        an unclean exit (laptop powered off, crash) using the last known
+        activity as a best-effort end time, then opens a fresh one."""
+        with self._lock:
+            dangling = self.db.execute(
+                "SELECT id, started_at FROM sessions WHERE ended_at IS NULL")
+            for row in dangling:
+                last = self.db.execute(
+                    "SELECT MAX(updated_at) FROM tasks").fetchone()[0]
+                end = row["started_at"]
+                if last:
+                    with contextlib.suppress(Exception):
+                        end = max(end, datetime.fromisoformat(last).timestamp())
+                self.db.execute(
+                    "UPDATE sessions SET ended_at=?, clean_exit=0 WHERE id=?",
+                    (end, row["id"]))
+            cur = self.db.execute(
+                "INSERT INTO sessions (started_at) VALUES (?)", (now_ts(),))
+            self.db.commit()
+            return cur.lastrowid
+
+    def close_session(self, session_id: Optional[int]) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            self.db.execute(
+                "UPDATE sessions SET ended_at=?, clean_exit=1 "
+                "WHERE id=? AND ended_at IS NULL", (now_ts(), session_id))
+            self.db.commit()
+
+    def session_summary(self, open_id: Optional[int]) -> dict[str, Any]:
+        with self._lock:
+            rows = list(self.db.execute(
+                "SELECT started_at, ended_at FROM sessions ORDER BY id"))
+        total = 0.0
+        for r in rows:
+            end = r["ended_at"] if r["ended_at"] is not None else now_ts()
+            total += max(0.0, end - r["started_at"])
+        return {"sessions": len(rows), "total_seconds": round(total),
+                "current_started_at": next(
+                    (r["started_at"] for r in rows if r["ended_at"] is None
+                     and open_id), None)}
+
+    # -- reads -----------------------------------------------------------
+    def actionable(self, limit: int = 0) -> list[sqlite3.Row]:
+        q = ("SELECT * FROM tasks WHERE state IN (?,?) "
+             "ORDER BY CASE state WHEN 'RUNNING' THEN 0 ELSE 1 END, rowid")
+        if limit:
+            q += f" LIMIT {int(limit)}"
+        with self._lock:
+            return list(self.db.execute(q, (RUNNING, PENDING)))
+
+    def counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT state, COUNT(*) c FROM tasks GROUP BY state")
+            return {r["state"]: r["c"] for r in rows}
+
+    def all_rows(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.db.execute("SELECT * FROM tasks ORDER BY rowid"))
+
+    def recent_events(self, n: int = 12) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.db.execute(
+                "SELECT * FROM events ORDER BY id DESC LIMIT ?", (n,)))
+
+    def durations(self) -> list[float]:
+        with self._lock:
+            return [r[0] for r in self.db.execute(
+                "SELECT duration_s FROM tasks WHERE duration_s IS NOT NULL")]
+
+
+def row_to_task(r: sqlite3.Row) -> Task:
+    return Task(
+        repo_url=r["repo_url"], branch=r["branch"] or "main",
+        playbooks=json.loads(r["playbooks"] or "[]"), goal=r["goal"] or "",
+        cd_repo_url=r["cd_repo_url"] or "", cd_branch=r["cd_branch"] or "",
+        repo_path=r["repo_path"] or "", user_id=r["user_id"] or "",
+        mirror_mode=None if r["mirror_mode"] is None else bool(r["mirror_mode"]),
+    )
+
+
+# ==========================================================================
+# process-level guards: single instance + keep awake
+# ==========================================================================
+
+
+class InstanceLock:
+    """Prevents two runners sharing one state dir (which would double-submit)."""
+
+    def __init__(self, state_dir: Path):
+        self.path = state_dir / ".runner.lock"
+        self.fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            stale = self._stale()
+            if not stale:
+                owner = self.path.read_text(errors="ignore").strip()
+                raise SystemExit(
+                    f"Another runner owns {self.path.parent} ({owner}).\n"
+                    f"If that process is gone, delete {self.path} and retry.")
+            self.path.unlink(missing_ok=True)
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(self.fd, f"pid={os.getpid()} host={platform.node()} at={utcnow()}"
+                          .encode())
+
+    def _stale(self) -> bool:
+        try:
+            txt = self.path.read_text()
+            pid = int(txt.split("pid=")[1].split()[0])
+        except Exception:
+            return True
+        if platform.node() not in txt:
+            return False          # another host: never assume stale
+        try:
+            os.kill(pid, 0)
+            return False
+        except OSError:
+            return True
+
+    def release(self) -> None:
+        with contextlib.suppress(Exception):
+            if self.fd is not None:
+                os.close(self.fd)
+            self.path.unlink(missing_ok=True)
+
+
+class KeepAwake:
+    """Blocks system sleep. Screen lock never stops a process; sleep does."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc = None
+        self.mode = "off"
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        sysname = platform.system()
+        if sysname == "Windows":
+            self.mode = "windows/SetThreadExecutionState"
+            self._thread = threading.Thread(target=self._win_loop, daemon=True)
+            self._thread.start()
+        elif sysname == "Darwin":
+            import subprocess
+            with contextlib.suppress(Exception):
+                self._proc = subprocess.Popen(
+                    ["caffeinate", "-i", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.mode = "macos/caffeinate"
+        else:
+            self.mode = "n/a (linux: use systemd-run or a server)"
+
+    def _win_loop(self) -> None:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        while not self._stop.is_set():
+            k32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
+            self._stop.wait(30)
+        k32.SetThreadExecutionState(ES_CONTINUOUS)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc:
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+
+
+# ==========================================================================
+# HTTP layer: retry, backoff, circuit breaker
+# ==========================================================================
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int, cooldown: float):
+        self.threshold, self.cooldown = threshold, cooldown
+        self.failures = 0
+        self.open_until = 0.0
+        self.trips = 0
+        self._lock = asyncio.Lock()
+
+    async def gate(self, stop: asyncio.Event) -> None:
+        while now_ts() < self.open_until and not stop.is_set():
+            await interruptible_sleep(min(2.0, self.open_until - now_ts()), stop)
+
+    async def record(self, ok: bool) -> None:
+        async with self._lock:
+            if ok:
+                self.failures = 0
+                return
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.open_until = now_ts() + self.cooldown
+                self.failures = 0
+                self.trips += 1
+
+    @property
+    def is_open(self) -> bool:
+        return now_ts() < self.open_until
+
+
+class TransientError(Exception):
+    pass
+
+
+class PermanentError(Exception):
+    pass
+
+
+async def interruptible_sleep(seconds: float, stop: asyncio.Event) -> None:
+    """Sleep that reacts to shutdown within ~0.25s."""
+    end = now_ts() + max(0.0, seconds)
+    while now_ts() < end:
+        if stop.is_set():
+            return
+        await asyncio.sleep(min(0.25, end - now_ts()))
+
+
+@dataclass
+class Resp:
+    status: int
+    body: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def http_call(url: str, method: str, headers: dict[str, str],
+              body: Optional[dict], timeout: float, verify: bool) -> Resp:
+    """One blocking HTTP call on the stdlib. Runs in a worker thread."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    ctx = None
+    if url.lower().startswith("https"):
+        ctx = ssl.create_default_context()
+        if not verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return Resp(r.status, r.read().decode("utf-8", "replace"),
+                        {k.lower(): v for k, v in r.headers.items()})
+    except urllib.error.HTTPError as e:              # server answered 4xx/5xx
+        payload = ""
+        with contextlib.suppress(Exception):
+            payload = e.read().decode("utf-8", "replace")
+        return Resp(e.code, payload,
+                    {k.lower(): v for k, v in (e.headers or {}).items()})
+
+
+class ApiClient:
+    def __init__(self, cfg: Config, breaker: CircuitBreaker, stop: asyncio.Event,
+                 log):
+        self.cfg = cfg
+        self.breaker = breaker
+        self.stop = stop
+        self.log = log
+        self.headers = {"accept": "application/json",
+                        "content-type": "application/json",
+                        "user-agent": f"{APP}/{VERSION}"}
+        self.headers.update(cfg.headers)
+        if cfg.token:
+            self.headers["Authorization"] = f"Bearer {cfg.token}"
+        self._submit_lock = asyncio.Lock()
+        self._last_submit = 0.0
+        self.requests = 0
+        self.retries = 0
+
+    async def aclose(self) -> None:
+        return None
+
+    async def _request(self, method: str, path: str,
+                       json_body: Optional[dict] = None) -> Resp:
+        url = self.cfg.base_url.rstrip("/") + path
+        attempt = 0
+        while True:
+            attempt += 1
+            await self.breaker.gate(self.stop)
+            if self.stop.is_set():
+                raise TransientError("shutdown requested")
+            try:
+                self.requests += 1
+                resp = await asyncio.to_thread(
+                    http_call, url, method, self.headers, json_body,
+                    self.cfg.http_timeout, self.cfg.verify)
+            except (urllib.error.URLError, socket.timeout, OSError,
+                    ssl.SSLError) as exc:
+                await self.breaker.record(False)
+                reason = getattr(exc, "reason", exc)
+                if attempt >= self.cfg.max_http_attempts:
+                    raise TransientError(f"cannot reach server: {reason}") from exc
+                self.retries += 1
+                await self._backoff(attempt, None)
+                continue
+
+            if resp.status < 400:
+                await self.breaker.record(True)
+                return resp
+
+            if resp.status in RETRYABLE_HTTP:
+                await self.breaker.record(False)
+                if attempt >= self.cfg.max_http_attempts:
+                    raise TransientError(
+                        f"HTTP {resp.status} after {attempt} attempts: "
+                        f"{resp.body[:200]}")
+                self.retries += 1
+                await self._backoff(attempt, resp.headers.get("retry-after"))
+                continue
+
+            await self.breaker.record(True)    # 400/401/403/404/422: never retry
+            raise PermanentError(f"HTTP {resp.status}: {resp.body[:300]}")
+
+    async def _backoff(self, attempt: int, retry_after: Optional[str]) -> None:
+        if retry_after:
+            with contextlib.suppress(ValueError):
+                await interruptible_sleep(
+                    min(float(retry_after), self.cfg.backoff_cap), self.stop)
+                return
+        delay = min(self.cfg.backoff_base ** attempt, self.cfg.backoff_cap)
+        await interruptible_sleep(delay * (0.5 + random.random()), self.stop)
+
+    async def submit(self, task: Task) -> tuple[str, dict]:
+        async with self._submit_lock:          # global pacing
+            gap = self.cfg.submit_gap - (now_ts() - self._last_submit)
+            if gap > 0:
+                await interruptible_sleep(gap, self.stop)
+            self._last_submit = now_ts()
+        resp = await self._request("POST", SUBMIT_PATH, task.payload())
+        data = _safe_json(resp)
+        run_id = deep_find(data, RUN_ID_KEYS)
+        if not run_id:
+            raise PermanentError(
+                f"the server did not return a run id: {json.dumps(data)[:300]}")
+        return str(run_id), data
+
+    async def get_run(self, run_id: str) -> dict:
+        return _safe_json(await self._request("GET", POLL_PATH.format(run_id=run_id)))
+
+
+def _safe_json(resp: Resp) -> dict:
+    try:
+        data = json.loads(resp.body)
+    except Exception:
+        return {"_raw": resp.body[:4000]}
+    return data if isinstance(data, dict) else {"_data": data}
+
+
+def classify(payload: dict, cfg_success: set[str], cfg_failure: set[str]
+             ) -> tuple[str, str]:
+    """-> (bucket, raw_status) where bucket in {SUCCEEDED, FAILED, RUNNING, ?}"""
+    raw = deep_find(payload, STATUS_KEYS) or ""
+    norm = raw.strip().lower().replace(" ", "_")
+    if norm in cfg_success:
+        return SUCCEEDED, raw
+    if norm in cfg_failure:
+        return FAILED, raw
+    if norm in RUNNING_STATES:
+        return RUNNING, raw
+    return "?", raw
+
+
+# ==========================================================================
+# stats for the dashboard
+# ==========================================================================
+
+
+@dataclass
+class Live_Run:
+    key: str
+    repo: str
+    run_id: str
+    started: float
+    polls: int = 0
+    status: str = "submitting"
+
+
+class Stats:
+    def __init__(self, total: int, already_done: int):
+        self.total = total
+        self.start = now_ts()
+        self.done = 0
+        self.succeeded = 0
+        self.failed = 0
+        self.timeout = 0
+        self.dead = 0
+        self.resumed = 0
+        self.already_done = already_done
+        self.active: dict[str, Live_Run] = {}
+        self.tail: list[tuple[str, str, str]] = []
+        self._lock = threading.Lock()
+
+    def note(self, level: str, repo: str, msg: str) -> None:
+        with self._lock:
+            self.tail.append((level, repo, msg))
+            del self.tail[:-40]
+
+    @property
+    def elapsed(self) -> float:
+        return now_ts() - self.start
+
+    @property
+    def rate_per_hour(self) -> float:
+        e = self.elapsed
+        return (self.done / e * 3600) if e > 5 and self.done else 0.0
+
+    @property
+    def eta(self) -> Optional[float]:
+        r = self.rate_per_hour
+        if not r:
+            return None
+        return (self.total - self.done) / r * 3600
+
+
+# ==========================================================================
+# the worker
+# ==========================================================================
+
+
+class Runner:
+    def __init__(self, cfg: Config, store: Store, log):
+        self.cfg = cfg
+        self.store = store
+        self.log = log
+        self.stop = asyncio.Event()
+        self.breaker = CircuitBreaker(cfg.breaker_threshold, cfg.breaker_cooldown)
+        self.api = ApiClient(cfg, self.breaker, self.stop, log)
+        self.success_states = SUCCESS_STATES | cfg.include_states  # placeholder
+        self.stats: Optional[Stats] = None
+
+    # -- lifecycle -------------------------------------------------------
+    async def run(self, rows: list[sqlite3.Row], already_done: int) -> None:
+        self.stats = Stats(len(rows), already_done)
+        self._queued = {r["key"] for r in rows}
+        self._refill_lock = asyncio.Lock()
+        self._target = max(1, min(16, self.cfg.concurrency))
+        self._workers: set[asyncio.Task] = set()
+        self._next_wid = 1
+        queue: asyncio.Queue = asyncio.Queue()
+        for r in rows:
+            queue.put_nowait(r)
+
+        snap = asyncio.create_task(self._snapshotter())
+        self._top_up(queue)
+        try:
+            while self._workers:
+                done, _ = await asyncio.wait(
+                    self._workers, timeout=1.0,
+                    return_when=asyncio.FIRST_COMPLETED)
+                self._workers -= done
+                if not self.stop.is_set():
+                    self._top_up(queue)
+        finally:
+            self.stop.set()
+            snap.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await snap
+            await self.api.aclose()
+
+    def _top_up(self, queue: asyncio.Queue) -> None:
+        """Spawn workers up to the current target. Called after every
+        worker exit and whenever the target changes, so raising or
+        lowering concurrency takes effect without restarting anything."""
+        while len(self._workers) < self._target:
+            t = asyncio.create_task(self._worker(self._next_wid, queue))
+            self._next_wid += 1
+            self._workers.add(t)
+
+    def set_concurrency(self, n: int) -> None:
+        """Thread-safe: call via loop.call_soon_threadsafe from the HTTP
+        handler. Growing spawns workers immediately; shrinking lets extra
+        workers finish their current repo, then not be replaced."""
+        self._target = max(1, min(16, n))
+        self.cfg.concurrency = self._target
+
+    async def _snapshotter(self) -> None:
+        while not self.stop.is_set():
+            await interruptible_sleep(self.cfg.snapshot_every, self.stop)
+            with contextlib.suppress(Exception):
+                write_html(self.cfg, self.store, live=True)
+
+    async def _worker(self, wid: int, queue: asyncio.Queue) -> None:
+        while not self.stop.is_set() and len(self._workers) <= self._target:
+            try:
+                row = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if await self._refill(queue):     # repos added while running
+                    continue
+                return
+            try:
+                await self._process(row)
+            except Exception as exc:                      # never kill a worker
+                self.log(f"worker{wid} unexpected: {type(exc).__name__}: {exc}")
+                self.store.update(row["key"], state=FAILED,
+                                  error=f"runner:{type(exc).__name__}: {exc}"[:900])
+                self._finish(row, FAILED)
+            finally:
+                queue.task_done()
+
+    async def _refill(self, queue: asyncio.Queue) -> int:
+        async with self._refill_lock:
+            added = 0
+            for r in self.store.actionable():
+                if r["key"] in self._queued:
+                    continue
+                self._queued.add(r["key"])
+                queue.put_nowait(r)
+                added += 1
+            if added and self.stats:
+                self.stats.total += added
+            return added
+
+    # -- one task --------------------------------------------------------
+    async def _process(self, row: sqlite3.Row) -> None:
+        cfg, st = self.cfg, self.stats
+        assert st is not None
+        key = row["key"]
+        task = row_to_task(row)
+        live = Live_Run(key, task.short, row["run_id"] or "", now_ts())
+        st.active[key] = live
+
+        try:
+            run_id = row["run_id"]
+            submitted_at = row["submitted_at"]
+            attempt = row["attempt"] or 0
+
+            # ---- resume path: a run_id already exists, re-attach ----
+            if row["state"] == RUNNING and run_id:
+                st.resumed += 1
+                live.run_id, live.status = run_id, "re-attached"
+                st.note("info", task.short, f"re-attached to {run_id[:8]}")
+                self.store.event(key, "INFO", f"resume poll run_id={run_id}")
+            else:
+                # ---- submit with whole-task retry ----
+                while True:
+                    attempt += 1
+                    live.status = f"submit#{attempt}"
+                    self.store.update(key, state=RUNNING, attempt=attempt)
+                    try:
+                        run_id, raw = await self.api.submit(task)
+                        submitted_at = now_ts()
+                        self.store.update(key, run_id=run_id,
+                                          submitted_at=submitted_at,
+                                          error=None)
+                        self.store.event(key, "INFO", f"submitted run_id={run_id}")
+                        live.run_id = run_id
+                        break
+                    except PermanentError as exc:
+                        self.store.update(key, state=DEAD, error=str(exc)[:900],
+                                          finished_at=now_ts())
+                        self.store.event(key, "ERROR", f"submit rejected: {exc}")
+                        st.note("dead", task.short, str(exc)[:80])
+                        self._finish(row, DEAD)
+                        return
+                    except TransientError as exc:
+                        if self.stop.is_set():
+                            self.store.update(key, state=PENDING)
+                            return
+                        if attempt > cfg.max_submit_retries:
+                            self.store.update(key, state=FAILED,
+                                              error=f"submit: {exc}"[:900],
+                                              finished_at=now_ts())
+                            self.store.event(key, "ERROR", f"submit gave up: {exc}")
+                            st.note("fail", task.short, "submit exhausted")
+                            self._finish(row, FAILED)
+                            return
+                        await interruptible_sleep(
+                            min(cfg.backoff_cap, cfg.backoff_base ** attempt) *
+                            (0.5 + random.random()), self.stop)
+
+            # ---- poll ----
+            deadline = (submitted_at or now_ts()) + cfg.max_wall
+            first = True
+            polls = row["polls"] or 0
+            misses = 0
+            last_payload: dict = {}
+
+            while not self.stop.is_set():
+                wait = cfg.first_poll_delay if first else cfg.poll_interval
+                first = False
+                remaining = deadline - now_ts()
+                if remaining <= 0:
+                    break
+                await interruptible_sleep(
+                    min(wait * (0.85 + 0.3 * random.random()), remaining),
+                    self.stop)
+                if self.stop.is_set():
+                    break
+
+                try:
+                    last_payload = await self.api.get_run(str(run_id))
+                    misses = 0
+                except PermanentError as exc:
+                    misses += 1
+                    if "404" in str(exc) and misses <= cfg.poll_404_grace:
+                        self.store.event(key, "WARN", f"poll 404 x{misses}")
+                        continue
+                    self.store.update(key, state=FAILED,
+                                      error=f"poll: {exc}"[:900],
+                                      finished_at=now_ts())
+                    self.store.event(key, "ERROR", f"poll permanent: {exc}")
+                    st.note("fail", task.short, str(exc)[:80])
+                    self._finish(row, FAILED)
+                    return
+                except TransientError as exc:
+                    self.store.event(key, "WARN", f"poll transient: {exc}")
+                    continue
+
+                polls += 1
+                live.polls = polls
+                bucket, raw = classify(last_payload, SUCCESS_STATES, FAILURE_STATES)
+                live.status = raw or bucket
+                self.store.update(key, polls=polls, api_status=raw)
+
+                if bucket in (SUCCEEDED, FAILED):
+                    dur = now_ts() - (submitted_at or now_ts())
+                    path = self._write_report(key, task, str(run_id), bucket,
+                                              raw, last_payload, dur, polls)
+                    err = None
+                    if bucket == FAILED:
+                        err = (deep_find(last_payload, ("error", "message",
+                                                        "detail", "reason"))
+                               or raw)[:900]
+                    self.store.update(key, state=bucket, api_status=raw,
+                                      finished_at=now_ts(), duration_s=dur,
+                                      report_path=str(path), error=err)
+                    self.store.event(key, "INFO",
+                                     f"{bucket} status={raw} in {human_dt(dur)}")
+                    st.note("ok" if bucket == SUCCEEDED else "fail",
+                            task.short, f"{raw} · {human_dt(dur)}")
+                    self._finish(row, bucket)
+                    return
+
+                if bucket == "?" and raw:
+                    self.store.event(key, "WARN", f"unknown status '{raw}'")
+
+            if self.stop.is_set():
+                # leave state=RUNNING + run_id persisted -> resumed next start
+                self.store.event(key, "INFO", "interrupted, will resume")
+                return
+
+            # ---- deadline ----
+            dur = now_ts() - (submitted_at or now_ts())
+            path = self._write_report(key, task, str(run_id), TIMEOUT,
+                                      live.status, last_payload, dur, polls)
+            self.store.update(key, state=TIMEOUT, finished_at=now_ts(),
+                              duration_s=dur, report_path=str(path),
+                              error=f"no terminal status within "
+                                    f"{int(cfg.max_wall)}s (last={live.status})")
+            self.store.event(key, "WARN", f"timeout after {human_dt(dur)}")
+            st.note("timeout", task.short, f"30m deadline, last={live.status}")
+            self._finish(row, TIMEOUT)
+        finally:
+            self.stats.active.pop(key, None)  # type: ignore[union-attr]
+
+    def _finish(self, row: sqlite3.Row, state: str) -> None:
+        st = self.stats
+        assert st is not None
+        st.done += 1
+        if state == SUCCEEDED:
+            st.succeeded += 1
+        elif state == FAILED:
+            st.failed += 1
+        elif state == TIMEOUT:
+            st.timeout += 1
+        elif state == DEAD:
+            st.dead += 1
+
+    def _write_report(self, key: str, task: Task, run_id: str, state: str,
+                      raw_status: str, payload: dict, dur: float,
+                      polls: int) -> Path:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        d = self.cfg.reports_dir / day
+        d.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-._" else "_" for c in task.short)
+        path = d / f"{safe}__{run_id[:12]}.json"
+        doc = {
+            "task_key": key,
+            "repo_url": task.repo_url,
+            "branch": task.branch,
+            "playbooks": task.playbooks,
+            "goal": task.goal,
+            "cd_repo_url": task.cd_repo_url or None,
+            "cd_branch": task.cd_branch or None,
+            "run_id": run_id,
+            "outcome": state,
+            "api_status": raw_status,
+            "duration_seconds": round(dur, 1),
+            "polls": polls,
+            "collected_at": utcnow(),
+            "response": payload,
+        }
+        path.write_text(json.dumps(doc, indent=2, default=str))
+        return path
+
+
+# ==========================================================================
+# input loading
+# ==========================================================================
+
+CSV_ALIASES = {
+    "repo_url": {"repo_url", "repo", "url", "repository", "repo_link", "git_url"},
+    "branch": {"branch", "repo_branch", "ref"},
+    "cd_repo_url": {"cd_repo_url", "cd_repo", "ci_repo_url", "ci_repo", "cd_url"},
+    "cd_branch": {"cd_branch", "ci_branch"},
+    "playbooks": {"playbooks", "playbook_names", "playbook", "skills"},
+    "goal": {"goal", "objective"},
+    "repo_path": {"repo_path", "path", "module_path"},
+    "user_id": {"user_id", "user", "sso", "requester"},
+    "mirror_mode": {"mirror_mode", "mirror"},
+}
+
+
+def _canon(header: str) -> Optional[str]:
+    h = header.strip().lower().replace(" ", "_").lstrip("\ufeff")
+    for canon, names in CSV_ALIASES.items():
+        if h in names:
+            return canon
+    return None
+
+
+def _split_list(v: str) -> list[str]:
+    return [p.strip() for p in v.replace("|", ";").replace(",", ";").split(";")
+            if p.strip()]
+
+
+def parse_rows(text: str, as_csv: bool) -> list[dict[str, str]]:
+    """Accept a pasted list, a CSV with headers, or a headerless CSV."""
+    rows: list[dict[str, str]] = []
+    text = text.lstrip("\ufeff")
+    if as_csv:
+        delim = "\t" if text.count("\t") > text.count(",") else ","
+        lines = list(csv.reader(io.StringIO(text), delimiter=delim))
+        if not lines:
+            return rows
+        canon = [_canon(h) for h in lines[0]]
+        if "repo_url" in canon:
+            for parts in lines[1:]:
+                if not parts or not any(x.strip() for x in parts):
+                    continue
+                row = {c: v.strip() for c, v in zip(canon, parts) if c}
+                if row.get("repo_url"):
+                    rows.append(row)
+            return rows
+    for line in text.splitlines():
+        line = line.strip().strip(",")
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.replace("\t", ",").split(",")]
+        if not parts[0] or _canon(parts[0]) == "repo_url":
+            continue
+        rows.append({"repo_url": parts[0],
+                     "branch": parts[1] if len(parts) > 1 else "",
+                     "cd_repo_url": parts[2] if len(parts) > 2 else "",
+                     "cd_branch": parts[3] if len(parts) > 3 else ""})
+    return rows
+
+
+def rows_to_tasks(rows: list[dict[str, str]], cfg: Config) -> list[Task]:
+    tasks: list[Task] = []
+    for r in rows:
+        url = r.get("repo_url", "").strip()
+        if not url:
+            continue
+        pb = _split_list(r.get("playbooks", "")) or list(cfg.playbooks)
+        if not pb:
+            raise ValueError("No playbook chosen. Add one in Setup.")
+        if len(pb) > 2:
+            raise ValueError(f"At most 2 playbooks per run — {url} has {len(pb)}.")
+        mm = r.get("mirror_mode", "")
+        tasks.append(Task(
+            repo_url=url,
+            branch=r.get("branch") or cfg.branch,
+            playbooks=pb,
+            goal=r.get("goal") or cfg.goal,
+            cd_repo_url=r.get("cd_repo_url") or cfg.cd_repo_url,
+            cd_branch=r.get("cd_branch") or cfg.cd_branch,
+            repo_path=r.get("repo_path") or cfg.repo_path,
+            user_id=r.get("user_id") or cfg.user_id,
+            mirror_mode=(mm.lower() in {"1", "true", "yes"}) if mm
+            else cfg.mirror_mode,
+        ))
+
+    seen: set[str] = set()
+    out: list[Task] = []
+    for t in tasks:
+        if t.key in seen:
+            continue
+        seen.add(t.key)
+        if cfg.shards > 1:
+            bucket = int(hashlib.md5(t.key.encode()).hexdigest(), 16) % cfg.shards
+            if bucket != cfg.shard:
+                continue
+        out.append(t)
+    return out
+
+
+def load_tasks(cfg: Config) -> list[Task]:
+    path = cfg.input_path
+    assert path is not None
+    if not path.exists():
+        raise ValueError(f"Repository list not found: {path}")
+    text = path.read_text(encoding="utf-8-sig")
+    return rows_to_tasks(
+        parse_rows(text, path.suffix.lower() in {".csv", ".tsv"}), cfg)
+
+
+# ==========================================================================
+# HTML dashboard — the "next morning" view
+# ==========================================================================
+
+HTML = r"""<!doctype html>
+<meta charset="utf-8">
+<title>CodeMind batch — __TITLE__</title>
+__REFRESH__
+<style>
+:root{
+  --bg:#0b0f14; --panel:#111820; --line:#1e2a36; --ink:#d7e3ee; --dim:#6f8296;
+  --ok:#3ddc97; --bad:#ff5c6c; --warn:#ffc857; --dead:#c792ea; --run:#4cc9f0;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+header{padding:22px 28px;border-bottom:1px solid var(--line);
+  display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}
+h1{margin:0;font-size:16px;letter-spacing:.18em;text-transform:uppercase;font-weight:700}
+h1 span{color:var(--run)}
+.meta{color:var(--dim);font-size:12px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+  gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
+.kpi{background:var(--panel);padding:16px 18px}
+.kpi b{display:block;font-size:26px;font-weight:600;letter-spacing:-.02em}
+.kpi small{color:var(--dim);text-transform:uppercase;letter-spacing:.12em;font-size:10px}
+.rail{display:flex;height:6px;background:var(--panel)}
+.rail i{display:block;height:100%}
+.controls{padding:14px 28px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input,select{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  padding:7px 11px;border-radius:4px;font:inherit;font-size:13px}
+input:focus,select:focus{outline:2px solid var(--run);outline-offset:-1px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer;
+  color:var(--dim);background:none;font:inherit;font-size:12px}
+.chip[aria-pressed=true]{color:var(--bg);background:var(--ink);border-color:var(--ink)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{position:sticky;top:0;background:var(--bg);text-align:left;padding:10px 14px;
+  color:var(--dim);font-weight:500;border-bottom:1px solid var(--line);
+  cursor:pointer;white-space:nowrap;text-transform:uppercase;letter-spacing:.1em;font-size:10px}
+td{padding:9px 14px;border-bottom:1px solid #131c25;vertical-align:top}
+tr:hover td{background:#0f161d}
+.s{font-weight:600}
+.SUCCEEDED{color:var(--ok)} .FAILED{color:var(--bad)} .TIMEOUT{color:var(--warn)}
+.DEAD{color:var(--dead)} .RUNNING{color:var(--run)} .PENDING{color:var(--dim)}
+.err{color:var(--bad);opacity:.85;max-width:460px;display:block;overflow-wrap:anywhere}
+a{color:var(--run)}
+footer{padding:18px 28px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
+</style>
+<header>
+  <h1>CodeMind <span>batch</span> · __TITLE__</h1>
+  <div class="meta">__ENDPOINT__ · generated __GENERATED__ · __STATEDIR__</div>
+</header>
+<div class="kpis" id="kpis"></div>
+<div class="rail" id="rail"></div>
+<div class="controls">
+  <input id="q" placeholder="filter repo, run id, status, error…" size="42">
+  <span id="chips"></span>
+  <span class="meta" id="shown"></span>
+  <button class="chip" onclick="dl()">Download CSV</button>
+</div>
+<table>
+  <thead><tr>
+    <th data-k="repo">repo</th><th data-k="branch">branch</th>
+    <th data-k="state">outcome</th><th data-k="api_status">api status</th>
+    <th data-k="run_id">run id</th><th data-k="duration_s">duration</th>
+    <th data-k="polls">polls</th><th data-k="finished">finished</th>
+    <th data-k="report">report</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<footer>Per-run JSON lives in reports/&lt;date&gt;/. Full history: sqlite3 state.db "select * from tasks".</footer>
+<script>
+const DATA = __DATA__;
+const ORDER = ["SUCCEEDED","FAILED","TIMEOUT","DEAD","RUNNING","PENDING"];
+const COLOR = {SUCCEEDED:"var(--ok)",FAILED:"var(--bad)",TIMEOUT:"var(--warn)",
+               DEAD:"var(--dead)",RUNNING:"var(--run)",PENDING:"#26313c"};
+let filter="", only=new Set(), sortK="repo", asc=true;
+
+const counts = () => DATA.reduce((a,r)=>(a[r.state]=(a[r.state]||0)+1,a),{});
+
+function head(){
+  const c=counts(), tot=DATA.length;
+  const done=(c.SUCCEEDED||0)+(c.FAILED||0)+(c.TIMEOUT||0)+(c.DEAD||0);
+  const durs=DATA.filter(r=>r.duration_s).map(r=>r.duration_s).sort((a,b)=>a-b);
+  const p50=durs.length?durs[Math.floor(durs.length*.5)]:0;
+  const p95=durs.length?durs[Math.floor(durs.length*.95)]:0;
+  const cards=[["total",tot],["succeeded",c.SUCCEEDED||0,"var(--ok)"],
+    ["failed",(c.FAILED||0)+(c.DEAD||0),"var(--bad)"],
+    ["timeout",c.TIMEOUT||0,"var(--warn)"],
+    ["in flight",c.RUNNING||0,"var(--run)"],["queued",c.PENDING||0],
+    ["success rate",done?((c.SUCCEEDED||0)/done*100).toFixed(1)+"%":"—"],
+    ["p50 / p95",fmt(p50)+" / "+fmt(p95)]];
+  kpis.innerHTML=cards.map(([l,v,col])=>
+    `<div class="kpi"><b style="color:${col||"var(--ink)"}">${v}</b><small>${l}</small></div>`).join("");
+  rail.innerHTML=ORDER.map(s=>{const n=c[s]||0;return n?
+    `<i style="width:${n/tot*100}%;background:${COLOR[s]}" title="${s}: ${n}"></i>`:""}).join("");
+  chips.innerHTML=ORDER.filter(s=>c[s]).map(s=>
+    `<button class="chip" data-s="${s}" aria-pressed="${only.has(s)}">${s.toLowerCase()} ${c[s]}</button>`).join(" ");
+  chips.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    const s=b.dataset.s; only.has(s)?only.delete(s):only.add(s); draw();});
+}
+const fmt = s => !s?"—":s<60?Math.round(s)+"s":Math.floor(s/60)+"m"+String(Math.round(s%60)).padStart(2,"0")+"s";
+
+function view(){
+  let rs=DATA.filter(r=>{
+    if(only.size&&!only.has(r.state))return false;
+    if(!filter)return true;
+    return JSON.stringify(r).toLowerCase().includes(filter);
+  });
+  rs.sort((a,b)=>{const x=a[sortK]??"",y=b[sortK]??"";
+    return (x>y?1:x<y?-1:0)*(asc?1:-1)});
+  return rs;
+}
+function draw(){
+  head();
+  const rs=view();
+  shown.textContent=`${rs.length} of ${DATA.length}`;
+  rows.innerHTML=rs.map(r=>`<tr>
+    <td title="${r.repo_url}">${r.repo}${r.error?`<span class="err">${esc(r.error)}</span>`:""}</td>
+    <td>${r.branch||""}</td>
+    <td class="s ${r.state}">${r.state.toLowerCase()}</td>
+    <td>${esc(r.api_status||"")}</td>
+    <td>${(r.run_id||"").slice(0,12)}</td>
+    <td>${fmt(r.duration_s)}</td><td>${r.polls||0}</td>
+    <td>${r.finished||""}</td>
+    <td>${r.report?`<a href="${r.report}">json</a>`:""}</td></tr>`).join("")
+    || `<tr><td colspan="9" style="padding:36px;color:var(--dim)">
+        No runs match this filter. Clear the search or state chips to see everything.</td></tr>`;
+}
+const esc=s=>String(s).replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+q.oninput=e=>{filter=e.target.value.toLowerCase();draw()};
+document.querySelectorAll("th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k; asc = sortK===k ? !asc : true; sortK=k; draw();});
+function dl(){
+  const rs=view(), cols=["repo_url","branch","state","api_status","run_id",
+    "duration_s","polls","finished","error","report"];
+  const csv=[cols.join(",")].concat(rs.map(r=>cols.map(c=>
+    `"${String(r[c]??"").replace(/"/g,'""')}"`).join(","))).join("\n");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  a.download="codemind_runs.csv"; a.click();
+}
+draw();
+</script>
+"""
+
+
+def write_html(cfg: Config, store: Store, live: bool = False,
+               out: Optional[Path] = None) -> Path:
+    rows = store.all_rows()
+    base = cfg.state_dir.resolve()
+    data = []
+    for r in rows:
+        rp = ""
+        if r["report_path"]:
+            with contextlib.suppress(Exception):
+                rp = os.path.relpath(r["report_path"], base).replace(os.sep, "/")
+        fin = ""
+        if r["finished_at"]:
+            fin = datetime.fromtimestamp(r["finished_at"]).strftime("%m-%d %H:%M")
+        data.append({
+            "repo": r["repo_url"].rstrip("/").rsplit("/", 1)[-1],
+            "repo_url": r["repo_url"], "branch": r["branch"], "state": r["state"],
+            "api_status": r["api_status"], "run_id": r["run_id"],
+            "duration_s": round(r["duration_s"], 1) if r["duration_s"] else 0,
+            "polls": r["polls"], "finished": fin,
+            "error": (r["error"] or "")[:300], "report": rp,
+        })
+    title = "live" if live else "summary"
+    html = (HTML
+            .replace("__DATA__", json.dumps(data))
+            .replace("__TITLE__", title)
+            .replace("__GENERATED__", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            .replace("__ENDPOINT__", cfg.base_url or "—")
+            .replace("__STATEDIR__", str(cfg.state_dir))
+            .replace("__REFRESH__",
+                     '<meta http-equiv="refresh" content="30">' if live else ""))
+    path = out or cfg.snapshot_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+
+
+# ==========================================================================
+# small helpers used by the app layer
+# ==========================================================================
+
+
+def make_logger(cfg: Config):
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    fh = cfg.log_path.open("a", encoding="utf-8")
+
+    def log(msg: str) -> None:
+        fh.write(f"{utcnow()} {msg}\n")
+        fh.flush()
+    return log
+
+
+def cmd_export(cfg: Config, out: Path, quiet: bool = False) -> int:
+    store = Store(cfg.db_path)
+    rows = store.all_rows()
+    cols = ["repo_url", "branch", "playbooks", "state", "api_status", "run_id",
+            "duration_s", "polls", "attempt", "error", "report_path",
+            "enqueued_at", "updated_at"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r[c] for c in cols])
+    store.close()
+    if not quiet:
+        print(f"{len(rows)} rows -> {out.resolve()}")
+    return 0
+
+
+# ==========================================================================
+# controller — owns config, store, and the background batch thread
+# ==========================================================================
+
+CONFIG_NAME = "codemind.json"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "base_url": "",
+    "playbooks": [],
+    "goal": "generate report",
+    "branch": "main",
+    "cd_repo_url": "",
+    "cd_branch": "",
+    "user_id": "",
+    "token": "",
+    "insecure": True,
+    "concurrency": 2,
+    "max_wall_minutes": 30,
+    "poll_interval": 30,
+    "first_poll_delay": 60,
+    "state": "./cm_state",
+    "shard": "1/1",
+    "auto_start": True,
+    "start_on_login": False,
+    "hours_per_day": 8,
+    "show_session_log": True,
+}
+
+
+def config_path() -> Path:
+    return Path.cwd() / CONFIG_NAME
+
+
+def build_config(r: dict[str, Any]) -> Config:
+    """Turn the saved settings dict into the engine's Config."""
+    shard, shards = 0, 1
+    with contextlib.suppress(Exception):
+        i, n = str(r.get("shard", "1/1")).split("/")
+        shard, shards = int(i) - 1, int(n)
+    if not (0 <= shard < shards):
+        shard, shards = 0, 1
+    return Config(
+        base_url=str(r.get("base_url", "")).strip().rstrip("/"),
+        state_dir=Path(r.get("state") or "./cm_state"),
+        playbooks=[str(x).strip() for x in (r.get("playbooks") or [])
+                   if str(x).strip()],
+        goal=r.get("goal", ""), branch=r.get("branch") or "main",
+        cd_repo_url=r.get("cd_repo_url", ""), cd_branch=r.get("cd_branch", ""),
+        user_id=r.get("user_id", ""), token=r.get("token", ""),
+        verify=not bool(r.get("insecure", True)),
+        concurrency=max(1, min(16, int(r.get("concurrency", 2) or 2))),
+        max_wall=float(r.get("max_wall_minutes", 30)) * 60,
+        poll_interval=float(r.get("poll_interval", 30)),
+        first_poll_delay=float(r.get("first_poll_delay", 60)),
+        shard=shard, shards=shards, no_ui=True,
+    )
+
+
+# --------------------------------------------------------------------------
+# start-on-login: make the OS launch this the moment you log in, so the
+# batch is already working before you've even opened a browser
+# --------------------------------------------------------------------------
+
+
+def _autostart_windows_path() -> Optional[Path]:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return (Path(appdata) / "Microsoft" / "Windows" / "Start Menu" /
+            "Programs" / "Startup" / "CodeMind Batch Runner.bat")
+
+
+def _autostart_macos_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / "com.codemind.batchrunner.plist"
+
+
+def autostart_installed() -> bool:
+    sysname = platform.system()
+    if sysname == "Windows":
+        p = _autostart_windows_path()
+        return bool(p and p.exists())
+    if sysname == "Darwin":
+        return _autostart_macos_path().exists()
+    return False
+
+
+def install_autostart() -> dict[str, Any]:
+    sysname = platform.system()
+    me = Path(sys.argv[0]).resolve()
+    workdir = me.parent
+    if sysname == "Windows":
+        p = _autostart_windows_path()
+        if not p:
+            return {"ok": False,
+                    "message": "Could not find the Windows Startup folder."}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            "@echo off\r\n"
+            f'cd /d "{workdir}"\r\n'
+            f'start "" pythonw "{me.name}" --no-browser\r\n')
+        return {"ok": True,
+                "message": "Will start automatically next time you log in."}
+    if sysname == "Darwin":
+        p = _autostart_macos_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.codemind.batchrunner</string>
+<key>ProgramArguments</key><array>
+<string>{sys.executable}</string><string>{me}</string><string>--no-browser</string>
+</array>
+<key>WorkingDirectory</key><string>{workdir}</string>
+<key>RunAtLoad</key><true/>
+</dict></plist>""")
+        with contextlib.suppress(Exception):
+            subprocess.run(["launchctl", "load", "-w", str(p)],
+                           capture_output=True, timeout=10)
+        return {"ok": True,
+                "message": "Will start automatically next time you log in."}
+    return {"ok": False,
+            "message": "Not automated on Linux yet — add a cron @reboot "
+                       "line or a systemd --user unit pointing at this file."}
+
+
+def remove_autostart() -> dict[str, Any]:
+    sysname = platform.system()
+    if sysname == "Windows":
+        p = _autostart_windows_path()
+        if p and p.exists():
+            p.unlink()
+        return {"ok": True, "message": "Removed from Windows startup."}
+    if sysname == "Darwin":
+        p = _autostart_macos_path()
+        if p.exists():
+            with contextlib.suppress(Exception):
+                subprocess.run(["launchctl", "unload", str(p)],
+                               capture_output=True, timeout=10)
+            p.unlink()
+        return {"ok": True, "message": "Removed from login items."}
+    return {"ok": True, "message": "Nothing was installed."}
+
+
+class Controller:
+    def __init__(self):
+        self.raw: dict[str, Any] = dict(DEFAULT_CONFIG)
+        if config_path().exists():
+            with contextlib.suppress(Exception):
+                loaded = json.loads(config_path().read_text(encoding="utf-8-sig"))
+                self.raw.update({k: v for k, v in loaded.items()
+                                 if not k.startswith("_")})
+        self.cfg = self._build()
+        self.store = Store(self.cfg.db_path)
+        self.runner: Optional[Runner] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
+        self.phase = "idle"                 # idle | running | stopping
+        self.message = ""
+        self.awake = KeepAwake(True)
+        self.lock = InstanceLock(self.cfg.state_dir)
+        self.log = None
+        self.session_id = self.store.open_session()
+
+    def close(self) -> None:
+        self.store.close_session(self.session_id)
+        self.store.close()
+
+    # -- config ----------------------------------------------------------
+    def _build(self) -> Config:
+        return build_config(self.raw)
+
+    def save_config(self, patch: dict[str, Any]) -> None:
+        if self.phase != "idle":
+            raise ValueError("Pause the batch before changing settings.")
+        clean = {k: v for k, v in patch.items()
+                 if k in DEFAULT_CONFIG and k != "start_on_login"}
+        if "playbooks" in clean:
+            pb = [str(x).strip() for x in clean["playbooks"] if str(x).strip()]
+            if len(pb) > 2:
+                raise ValueError("At most 2 playbooks per run.")
+            clean["playbooks"] = pb
+        if not str(clean.get("base_url", self.raw.get("base_url", ""))).strip():
+            raise ValueError("The server address cannot be empty.")
+        self.raw.update(clean)
+        old_state = self.cfg.state_dir
+        self.cfg = self._build()
+        config_path().write_text(json.dumps(self.raw, indent=2) + "\n")
+        if self.cfg.state_dir != old_state:
+            self.store.close()
+            self.store = Store(self.cfg.db_path)
+            self.lock = InstanceLock(self.cfg.state_dir)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.cfg.base_url and self.cfg.playbooks)
+
+    def set_concurrency(self, n: int) -> int:
+        """Unlike save_config, this works while running — it's the knob
+        for 'push it harder while I'm actually at the laptop'."""
+        n = max(1, min(16, int(n)))
+        self.raw["concurrency"] = n
+        self.cfg.concurrency = n
+        config_path().write_text(json.dumps(self.raw, indent=2) + "\n")
+        if self.phase == "running" and self.runner and self.loop:
+            self.loop.call_soon_threadsafe(self.runner.set_concurrency, n)
+        return n
+
+    # -- work ------------------------------------------------------------
+    def add_repos(self, text: str, as_csv: bool) -> dict[str, int]:
+        rows = parse_rows(text, as_csv)
+        if not rows:
+            raise ValueError("No repository URLs found in that list.")
+        tasks = rows_to_tasks(rows, self.cfg)
+        if not tasks:
+            raise ValueError("Nothing to add — every row belongs to another shard.")
+        new, dup = self.store.enqueue(tasks)
+        return {"added": new, "already_known": dup, "parsed": len(rows)}
+
+    def test_connection(self) -> dict[str, Any]:
+        return probe_server(self.cfg)
+
+    def start(self) -> None:
+        if self.phase != "idle":
+            raise ValueError("Already running.")
+        if not self.configured:
+            raise ValueError("Finish setup first.")
+        rows = self.store.actionable()
+        if not rows:
+            raise ValueError("No repositories waiting. Add some below.")
+        self.lock.acquire()
+        self.awake.start()
+        self.log = make_logger(self.cfg)
+        self.message = ""
+        self.phase = "running"
+        self.thread = threading.Thread(target=self._thread, args=(rows,),
+                                       daemon=True)
+        self.thread.start()
+
+    def _thread(self, rows: list[sqlite3.Row]) -> None:
+        try:
+            asyncio.run(self._arun(rows))
+        except Exception as exc:                       # never lose the reason
+            self.message = f"Stopped: {type(exc).__name__}: {exc}"
+            if self.log:
+                self.log(f"fatal: {type(exc).__name__}: {exc}")
+        finally:
+            self.phase = "idle"
+            self.awake.stop()
+            self.lock.release()
+            with contextlib.suppress(Exception):
+                write_html(self.cfg, self.store, live=False)
+
+    async def _arun(self, rows: list[sqlite3.Row]) -> None:
+        self.loop = asyncio.get_running_loop()
+        counts = self.store.counts()
+        already = sum(v for k, v in counts.items() if k in TERMINAL)
+        self.runner = Runner(self.cfg, self.store, self.log or (lambda m: None))
+        await self.runner.run(rows, already)
+
+    def stop(self) -> None:
+        if self.phase != "running" or not (self.runner and self.loop):
+            return
+        self.phase = "stopping"
+        self.message = "Finishing the runs in flight — they resume where they left off."
+        self.loop.call_soon_threadsafe(self.runner.stop.set)
+
+    # -- read models -----------------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        counts = self.store.counts()
+        total = sum(counts.values())
+        done = sum(counts.get(k, 0) for k in TERMINAL)
+        st = self.runner.stats if (self.runner and self.phase != "idle") else None
+        active = []
+        if st:
+            for lr in list(st.active.values()):
+                active.append({"repo": lr.repo, "run_id": lr.run_id,
+                               "status": lr.status, "polls": lr.polls,
+                               "elapsed": round(now_ts() - lr.started)})
+        durations = self.store.durations()
+        avg = sum(durations) / len(durations) if durations else 0
+        rate = st.rate_per_hour if st else 0
+        remaining = total - done
+        eta = (remaining / rate * 3600) if rate else (
+            remaining * avg / self.cfg.concurrency if avg else 0)
+        hours_per_day = max(0.5, float(self.raw.get("hours_per_day", 8) or 8))
+        eta_working_days = (eta / 3600 / hours_per_day) if eta else 0
+        api = self.runner.api if self.runner else None
+        sess = self.store.session_summary(self.session_id)
+        sess["current_seconds"] = round(
+            now_ts() - (sess.get("current_started_at") or now_ts())) \
+            if sess.get("current_started_at") else 0
+        return {
+            "phase": self.phase,
+            "message": self.message,
+            "configured": self.configured,
+            "config": {**self.raw, "token": "***" if self.raw.get("token") else ""},
+            "endpoints": {"submit": SUBMIT_PATH, "poll": POLL_PATH},
+            "counts": counts, "total": total, "done": done,
+            "succeeded": counts.get(SUCCEEDED, 0),
+            "failed": counts.get(FAILED, 0) + counts.get(DEAD, 0),
+            "timeout": counts.get(TIMEOUT, 0),
+            "in_flight": counts.get(RUNNING, 0),
+            "waiting": counts.get(PENDING, 0),
+            "rate_per_hour": round(rate),
+            "eta_seconds": round(eta),
+            "eta_working_days": round(eta_working_days, 1),
+            "hours_per_day": hours_per_day,
+            "elapsed": round(st.elapsed) if st else 0,
+            "avg_seconds": round(avg),
+            "concurrency": self.cfg.concurrency,
+            "active": active,
+            "events": [{"ts": e["ts"][11:19], "level": e["level"],
+                        "msg": e["msg"]} for e in self.store.recent_events(14)],
+            "http": {"requests": api.requests if api else 0,
+                     "retries": api.retries if api else 0,
+                     "breaker": bool(self.runner.breaker.is_open)
+                     if self.runner else False},
+            "state_dir": str(self.cfg.state_dir.resolve()),
+            "sessions": sess,
+            "autostart_installed": autostart_installed(),
+        }
+
+    def runs(self, q: str = "", state: str = "", limit: int = 300) -> list[dict]:
+        out = []
+        for r in self.store.all_rows():
+            if state and r["state"] != state:
+                continue
+            blob = f"{r['repo_url']} {r['state']} {r['api_status']} {r['error']}"
+            if q and q.lower() not in blob.lower():
+                continue
+            rp = ""
+            if r["report_path"]:
+                with contextlib.suppress(Exception):
+                    rp = os.path.relpath(
+                        r["report_path"],
+                        self.cfg.state_dir.resolve()).replace(os.sep, "/")
+            out.append({
+                "repo": r["repo_url"].rstrip("/").rsplit("/", 1)[-1],
+                "repo_url": r["repo_url"], "branch": r["branch"],
+                "state": r["state"], "api_status": r["api_status"] or "",
+                "run_id": r["run_id"] or "",
+                "duration": round(r["duration_s"] or 0),
+                "polls": r["polls"] or 0, "error": (r["error"] or "")[:240],
+                "report": rp,
+            })
+        out.sort(key=lambda x: (x["state"] != "RUNNING", x["state"]))
+        return out[:limit]
+
+
+def probe_server(cfg: Config) -> dict[str, Any]:
+    """Friendly reachability check used by the Test connection button."""
+    url = cfg.base_url
+    if not url:
+        return {"ok": False, "message": "Enter the server address first."}
+    headers = {"accept": "application/json",
+               "user-agent": f"{APP}/{VERSION}"}
+    if cfg.token:
+        headers["Authorization"] = f"Bearer {cfg.token}"
+    for path in ("/openapi.json", "/docs", "/"):
+        try:
+            r = http_call(url + path, "GET", headers, None, 15,
+                          cfg.verify)
+        except Exception as exc:
+            reason = getattr(exc, "reason", exc)
+            return {"ok": False,
+                    "message": f"Cannot reach {url} — {reason}"}
+        if r.status < 400:
+            found = SUBMIT_PATH in r.body if path == "/openapi.json" else None
+            msg = f"Connected to {url}"
+            if found is False:
+                msg += f" — warning: {SUBMIT_PATH} was not in its API list"
+            return {"ok": True, "message": msg}
+        if r.status in (401, 403):
+            return {"ok": False,
+                    "message": "The server answered but refused the "
+                               "credentials. Check the token in Advanced."}
+    return {"ok": False,
+            "message": f"{url} answered, but not with an API. "
+                       f"Check the address."}
+
+
+# ==========================================================================
+# the browser app
+# ==========================================================================
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CodeMind Batch Runner</title>
+<style>
+:root{
+  --bg:#080c11; --panel:#0f1720; --raise:#141f2a; --line:#1d2b39;
+  --ink:#e3edf6; --dim:#7b8fa3; --faint:#4a5c6e;
+  --cy:#4cc9f0; --ok:#3ddc97; --bad:#ff5c6c; --warn:#ffc857; --dead:#c792ea;
+  --r:10px;
+}
+*{box-sizing:border-box}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.mono{font-family:ui-monospace,"Cascadia Mono",Consolas,monospace}
+header{display:flex;align-items:center;gap:14px;padding:16px 26px;
+  border-bottom:1px solid var(--line);background:var(--panel);
+  position:sticky;top:0;z-index:20;flex-wrap:wrap}
+.brand{font-weight:700;letter-spacing:.2em;font-size:12px;text-transform:uppercase}
+.brand b{color:var(--cy)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);display:inline-block}
+.dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(61,220,151,.15)}
+.dot.busy{background:var(--cy);animation:p 1.4s infinite}
+@keyframes p{50%{opacity:.25}}
+.spacer{flex:1}
+main{max-width:1180px;margin:0 auto;padding:26px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:22px 24px;margin-bottom:18px}
+h2{margin:0 0 4px;font-size:17px}
+h3{margin:26px 0 10px;font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--dim);font-weight:600;display:flex;align-items:center;gap:10px}
+h3 i{width:20px;height:20px;border-radius:50%;background:var(--raise);color:var(--cy);
+  display:grid;place-items:center;font-size:11px;font-style:normal;font-weight:700}
+p.sub{margin:0 0 18px;color:var(--dim);font-size:13.5px}
+label{display:block;font-size:13px;color:var(--dim);margin:12px 0 5px}
+input[type=text],input[type=number],textarea,select{width:100%;background:var(--bg);
+  border:1px solid var(--line);color:var(--ink);border-radius:7px;padding:10px 12px;
+  font:inherit;font-size:14px}
+textarea{font-family:ui-monospace,monospace;font-size:12.5px;min-height:130px;resize:vertical}
+input:focus,textarea:focus,select:focus{outline:2px solid var(--cy);outline-offset:-1px}
+.hint{color:var(--faint);font-size:12px;margin-top:5px}
+.row{display:flex;gap:14px;flex-wrap:wrap}
+.row>*{flex:1;min-width:190px}
+button{font:inherit;font-size:14px;border-radius:8px;border:1px solid var(--line);
+  background:var(--raise);color:var(--ink);padding:10px 16px;cursor:pointer}
+button:hover{border-color:var(--cy)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.primary{background:var(--cy);color:#04141b;border-color:var(--cy);font-weight:650}
+.primary:hover{filter:brightness(1.1)}
+.danger{color:var(--warn)}
+.big{padding:15px 30px;font-size:16px}
+.pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);
+  border-radius:999px;padding:5px 13px;font-size:12.5px;color:var(--dim);
+  background:none;cursor:pointer}
+.pill[aria-pressed=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.hero{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+.count{font-size:44px;font-weight:700;letter-spacing:-.03em;line-height:1}
+.count small{font-size:15px;color:var(--dim);font-weight:400;letter-spacing:0}
+.rail{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--raise);
+  margin:20px 0 10px}
+.rail i{height:100%;transition:width .6s ease}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
+.legend b{color:var(--ink);font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:14px;
+  margin-top:20px}
+.kpi{background:var(--raise);border-radius:8px;padding:13px 15px}
+.kpi b{display:block;font-size:20px;font-weight:650}
+.kpi span{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim)}
+.slot{display:flex;align-items:center;gap:14px;background:var(--raise);
+  border-radius:8px;padding:12px 15px;margin-top:10px;font-size:13.5px}
+.slot .st{margin-left:auto;color:var(--cy)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:9px 12px;color:var(--dim);font-weight:500;font-size:11px;
+  letter-spacing:.09em;text-transform:uppercase;border-bottom:1px solid var(--line)}
+td{padding:9px 12px;border-bottom:1px solid #121b24;vertical-align:top}
+tr:hover td{background:#0d1620}
+.SUCCEEDED{color:var(--ok)}.FAILED,.DEAD{color:var(--bad)}.TIMEOUT{color:var(--warn)}
+.RUNNING{color:var(--cy)}.PENDING{color:var(--dim)}
+.err{display:block;color:var(--bad);opacity:.8;font-size:11.5px;margin-top:3px;
+  overflow-wrap:anywhere}
+a{color:var(--cy)}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:60;
+  background:var(--raise);border:1px solid var(--line);border-left:3px solid var(--cy);
+  border-radius:8px;padding:13px 20px;max-width:640px;box-shadow:0 12px 40px #000a}
+.toast.bad{border-left-color:var(--bad)}
+.empty{color:var(--dim);text-align:center;padding:34px 10px}
+.hidden{display:none}
+.evt{font-size:12px;color:var(--dim);padding:4px 0;border-bottom:1px solid #101922;
+  display:flex;gap:12px}
+.evt span:first-child{color:var(--faint);flex:none}
+footer{color:var(--faint);font-size:12px;text-align:center;padding:20px}
+</style></head><body>
+
+<header>
+  <div class="brand">Code<b>Mind</b> · Batch Runner</div>
+  <span id="dot" class="dot"></span><span id="phase" class="mono" style="font-size:12px;color:var(--dim)"></span>
+  <div class="spacer"></div>
+  <button onclick="toggleSetup()">Settings</button>
+  <button onclick="openReport()">Full report</button>
+  <button onclick="location.href='/export.csv'">Download CSV</button>
+</header>
+
+<main>
+<!-- ============ SETUP ============ -->
+<section id="setup" class="card hidden">
+  <h2>One-time setup</h2>
+  <p class="sub">Three things, then you never see this screen again.</p>
+
+  <h3><i>1</i> Where is the server?</h3>
+  <label for="base">Server address</label>
+  <input type="text" id="base" placeholder="https://your-orchestrator-host" class="mono">
+  <div class="hint">The address you use to open the API docs, without <span class="mono">/docs</span> at the end.</div>
+  <div style="margin-top:12px"><button onclick="testConn()">Test connection</button>
+    <span id="testout" style="margin-left:12px;font-size:13px"></span></div>
+
+  <h3><i>2</i> What should it run?</h3>
+  <div class="row">
+    <div><label for="pb1">Playbook</label>
+      <input type="text" id="pb1" class="mono" placeholder="required"></div>
+    <div><label for="pb2">Second playbook <span style="color:var(--faint)">(optional)</span></label>
+      <input type="text" id="pb2" class="mono" placeholder="leave empty if not needed"></div>
+  </div>
+  <div class="row">
+    <div><label for="goal">Goal</label><input type="text" id="goal"></div>
+    <div><label for="branch">Default branch</label><input type="text" id="branch"></div>
+  </div>
+
+  <h3><i>3</i> Keep it running when you're not watching</h3>
+  <p class="sub" style="margin-bottom:14px">This laptop has to be on for anything to happen — there's no way
+    around that. These settings make the most of the time it <em>is</em> on.</p>
+  <label style="display:flex;align-items:center;gap:9px">
+    <input type="checkbox" id="autostart" style="width:auto">
+    Start automatically whenever this app is opened — no click needed
+  </label>
+  <div class="row" style="margin-top:14px;align-items:flex-end">
+    <div><label for="hpd">Hours per day this laptop is usually on</label>
+      <input type="number" id="hpd" min="1" max="24"></div>
+    <div>
+      <label>Start automatically when I log in</label>
+      <button type="button" id="loginbtn" onclick="toggleLogin()" style="width:100%">…</button>
+    </div>
+  </div>
+  <div class="hint" id="loginhint"></div>
+
+  <h3><i>4</i> Anything unusual?</h3>
+  <details><summary style="cursor:pointer;color:var(--dim);font-size:13px">Advanced settings — safe to skip</summary>
+    <div class="row">
+      <div><label for="conc">Repositories at a time</label>
+        <input type="number" id="conc" min="1" max="16"></div>
+      <div><label for="wall">Give up after (minutes)</label>
+        <input type="number" id="wall" min="5" max="240"></div>
+      <div><label for="shard">This machine handles shard</label>
+        <input type="text" id="shard" class="mono" placeholder="1/1"></div>
+    </div>
+    <div class="row">
+      <div><label for="token">Access token (if the server needs one)</label>
+        <input type="text" id="token" class="mono" placeholder="leave empty if not needed"></div>
+      <div><label for="cdrepo">CD repository URL (optional)</label>
+        <input type="text" id="cdrepo" class="mono"></div>
+      <div><label for="cdbranch">CD branch (optional)</label>
+        <input type="text" id="cdbranch" class="mono"></div>
+    </div>
+    <label style="margin-top:14px;display:flex;align-items:center;gap:9px">
+      <input type="checkbox" id="insecure" style="width:auto">
+      Skip certificate checking (usual for internal servers)</label>
+    <label style="margin-top:10px;display:flex;align-items:center;gap:9px">
+      <input type="checkbox" id="showsessions" style="width:auto">
+      Show total time worked across sessions on the dashboard</label>
+  </details>
+
+  <div style="margin-top:24px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+    <button class="primary big" onclick="saveSetup()">Save settings</button>
+    <span class="hint" style="margin:0">Then add your repositories in the card below.</span>
+    <button onclick="toggleSetup()" id="setupcancel">Cancel</button>
+  </div>
+</section>
+
+<!-- ============ DASHBOARD ============ -->
+<section id="dash" class="hidden">
+  <div class="card">
+    <div id="bgnote" class="hidden" style="background:var(--raise);border:1px solid var(--line);
+        border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:var(--dim);
+        display:flex;align-items:center;gap:9px">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span>
+      Running in the background — closing this browser tab won't stop it.
+      Only closing the app window does that.
+    </div>
+    <div class="hero">
+      <div>
+        <div class="count"><span id="hdone">0</span><small> of <span id="htotal">0</span> repositories</small></div>
+        <div id="hsub" style="color:var(--dim);font-size:13.5px;margin-top:6px"></div>
+      </div>
+      <div class="spacer" style="flex:1"></div>
+      <div style="display:flex;align-items:center;gap:14px">
+        <div id="concwrap" class="hidden" style="display:flex;align-items:center;gap:8px;
+            background:var(--raise);border:1px solid var(--line);border-radius:8px;padding:6px 10px">
+          <span style="font-size:12px;color:var(--dim)">at once</span>
+          <button onclick="stepConc(-1)" style="padding:3px 10px">–</button>
+          <b id="concval" style="min-width:18px;text-align:center">2</b>
+          <button onclick="stepConc(1)" style="padding:3px 10px">+</button>
+        </div>
+        <button id="mainbtn" class="primary big" onclick="toggleRun()">Start</button>
+      </div>
+    </div>
+    <div class="rail" id="rail"></div>
+    <div class="legend" id="legend"></div>
+    <div class="kpis" id="kpis"></div>
+    <div id="sesspanel" class="hidden" style="margin-top:14px;font-size:13px;color:var(--dim)"></div>
+    <div id="slots"></div>
+  </div>
+
+  <div class="card" id="addrepos">
+    <h2>Add repositories</h2>
+    <p class="sub">Paste a list, pick a CSV, or add a single one. You can add more at any time — even while it is running.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <button class="pill" data-m="one" onclick="mode('one')">One repository</button>
+      <button class="pill" data-m="list" onclick="mode('list')">Paste a list</button>
+      <button class="pill" data-m="file" onclick="mode('file')">CSV file</button>
+    </div>
+    <div id="m-one" class="hidden">
+      <input type="text" id="onerepo" class="mono" placeholder="https://github.com/org/repository">
+      <div class="hint">Add <span class="mono">,branch</span> after the URL to use a branch other than the default.</div>
+    </div>
+    <div id="m-list" class="hidden">
+      <textarea id="listrepos" placeholder="https://github.com/org/repo-a&#10;https://github.com/org/repo-b,develop&#10;https://github.com/org/repo-c"></textarea>
+      <div class="hint">One repository per line. Optional: <span class="mono">url,branch,cd_url,cd_branch</span></div>
+    </div>
+    <div id="m-file" class="hidden">
+      <input type="file" id="csvfile" accept=".csv,.tsv,.txt" onchange="pickFile()" style="font-size:13px">
+      <div class="hint">Headers understood: repo_url, branch, cd_repo_url, cd_branch, playbooks, goal. A plain list works too.</div>
+      <div id="fileinfo" class="hint"></div>
+    </div>
+    <div style="margin-top:16px"><button class="primary" onclick="addRepos()">Add to queue</button></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <h2 style="margin:0">Results</h2>
+      <div class="spacer" style="flex:1"></div>
+      <input type="text" id="q" placeholder="Search repository, status or error" oninput="loadRuns()"
+             style="max-width:260px">
+      <button onclick="requeue()" class="danger">Try failed again</button>
+      <span id="chips"></span>
+    </div>
+    <div style="overflow:auto;max-height:560px;margin-top:14px">
+      <table><thead><tr><th>Repository</th><th>Outcome</th><th>Server status</th>
+        <th>Run id</th><th>Time</th><th>Report</th></tr></thead>
+        <tbody id="rows"></tbody></table>
+    </div>
+  </div>
+
+  <details class="card"><summary style="cursor:pointer;color:var(--dim)">Activity log</summary>
+    <div id="events" style="margin-top:12px"></div></details>
+</section>
+</main>
+<footer id="foot"></footer>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+let S={}, RUNS=[], filterState="", addMode="list", fileText="", fileIsCsv=false, setupOpen=false;
+const $=id=>document.getElementById(id);
+const COL={SUCCEEDED:"var(--ok)",FAILED:"var(--bad)",DEAD:"var(--bad)",
+  TIMEOUT:"var(--warn)",RUNNING:"var(--cy)",PENDING:"#22303d"};
+const ORDER=["SUCCEEDED","FAILED","DEAD","TIMEOUT","RUNNING","PENDING"];
+const NICE={SUCCEEDED:"done",FAILED:"failed",DEAD:"rejected",TIMEOUT:"timed out",
+  RUNNING:"in progress",PENDING:"waiting"};
+
+function toast(msg,bad){const t=$("toast");t.textContent=msg;
+  t.className="toast"+(bad?" bad":"");clearTimeout(t._t);
+  t._t=setTimeout(()=>t.className="toast hidden",bad?7000:3500);}
+async function api(path,body){
+  const r=await fetch(path,body?{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)}:{});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.error||("Request failed ("+r.status+")"));
+  return d;}
+function dur(s){if(!s)return "—";if(s<60)return Math.round(s)+"s";
+  const m=Math.floor(s/60);if(m<60)return m+"m "+Math.round(s%60)+"s";
+  const h=Math.floor(m/60);if(h<48)return h+"h "+(m%60)+"m";return Math.floor(h/24)+" days";}
+
+/* ---------- setup ----------
+   fillSetup() must NEVER run on a routine poll tick — it only runs once,
+   the moment the setup panel transitions from closed to open. Every
+   assignment below is also guarded against the field currently having
+   keyboard focus, as a second line of defense. This is what was silently
+   overwriting whatever you were typing every 2 seconds. */
+let setupFilled=false;
+function setVal(id,v){const el=$(id);if(document.activeElement!==el)el.value=v;}
+function fillSetup(){const c=S.config||{};
+  setVal("base",c.base_url||""); setVal("pb1",(c.playbooks||[])[0]||"");
+  setVal("pb2",(c.playbooks||[])[1]||""); setVal("goal",c.goal||"");
+  setVal("branch",c.branch||"main"); setVal("conc",c.concurrency||2);
+  setVal("wall",c.max_wall_minutes||30); setVal("shard",c.shard||"1/1");
+  setVal("token",""); setVal("cdrepo",c.cd_repo_url||"");
+  setVal("cdbranch",c.cd_branch||"");
+  setVal("hpd",c.hours_per_day||8);
+  if(document.activeElement!==$("insecure"))$("insecure").checked=c.insecure!==false;
+  if(document.activeElement!==$("autostart"))$("autostart").checked=c.auto_start!==false;
+  if(document.activeElement!==$("showsessions"))$("showsessions").checked=c.show_session_log!==false;
+  paintLoginButton();}
+function paintLoginButton(){
+  const on=S.autostart_installed;
+  $("loginbtn").textContent=on?"Turn off":"Turn on";
+  $("loginhint").textContent=on
+    ?"On — this app opens automatically when you log in."
+    :"Off — you'll need to open this app yourself each time.";}
+async function toggleLogin(){
+  const enable=!S.autostart_installed;
+  $("loginbtn").disabled=true;
+  try{const d=await api("/api/autostart",{enable});
+    S.autostart_installed=d.installed; paintLoginButton();
+    toast(d.message,!d.ok);}
+  catch(e){toast(e.message,1);}
+  finally{$("loginbtn").disabled=false;}}
+function toggleSetup(){setupOpen=!setupOpen; if(!setupOpen)setupFilled=false; paint();}
+function setupPayload(){
+  const p={base_url:$("base").value.trim(),
+    playbooks:[$("pb1").value.trim(),$("pb2").value.trim()].filter(Boolean),
+    goal:$("goal").value.trim(),branch:$("branch").value.trim()||"main",
+    concurrency:+$("conc").value||2,max_wall_minutes:+$("wall").value||30,
+    shard:$("shard").value.trim()||"1/1",cd_repo_url:$("cdrepo").value.trim(),
+    cd_branch:$("cdbranch").value.trim(),insecure:$("insecure").checked,
+    hours_per_day:+$("hpd").value||8,auto_start:$("autostart").checked,
+    show_session_log:$("showsessions").checked};
+  if($("token").value.trim())p.token=$("token").value.trim();
+  return p;}
+async function testConn(){
+  $("testout").textContent="Checking…";$("testout").style.color="var(--dim)";
+  try{const d=await api("/api/test",setupPayload());
+    $("testout").textContent=d.message;
+    $("testout").style.color=d.ok?"var(--ok)":"var(--bad)";}
+  catch(e){$("testout").textContent=e.message;$("testout").style.color="var(--bad)";}}
+async function saveSetup(){
+  const p=setupPayload();
+  if(!p.base_url){toast("Enter the server address first.",1);return;}
+  if(!p.playbooks.length){toast("Enter at least one playbook.",1);return;}
+  try{await api("/api/config",p);setupOpen=false;setupFilled=false;await refresh();
+    toast("Settings saved. Now add your repositories.");
+    $("addrepos").scrollIntoView({behavior:"smooth",block:"start"});
+  }catch(e){toast(e.message,1);}}
+async function stepConc(delta){
+  const n=Math.max(1,Math.min(16,(S.concurrency||2)+delta));
+  $("concval").textContent=n;
+  try{const d=await api("/api/concurrency",{value:n});
+    S.concurrency=d.concurrency;}
+  catch(e){toast(e.message,1);}}
+
+/* ---------- repositories ---------- */
+function mode(m){addMode=m;
+  document.querySelectorAll(".pill[data-m]").forEach(b=>
+    b.setAttribute("aria-pressed",b.dataset.m===m));
+  ["one","list","file"].forEach(x=>$("m-"+x).classList.toggle("hidden",x!==m));}
+function pickFile(){const f=$("csvfile").files[0];if(!f)return;
+  const rd=new FileReader();
+  rd.onload=()=>{fileText=rd.result;fileIsCsv=/\.(csv|tsv)$/i.test(f.name);
+    const n=fileText.split(/\r?\n/).filter(l=>l.trim()).length;
+    $("fileinfo").textContent=f.name+" — "+n+" lines read";};
+  rd.readAsText(f);}
+async function addRepos(){
+  let text="",as_csv=false;
+  if(addMode==="one")text=$("onerepo").value.trim();
+  else if(addMode==="list")text=$("listrepos").value;
+  else{text=fileText;as_csv=fileIsCsv;}
+  if(!text.trim()){toast("Nothing to add yet.",1);return;}
+  try{const d=await api("/api/repos",{text,as_csv});
+    toast(d.added+" added"+(d.already_known?", "+d.already_known+" already in the list":"")+".");
+    $("onerepo").value="";$("listrepos").value="";fileText="";$("fileinfo").textContent="";
+    await refresh();loadRuns();}catch(e){toast(e.message,1);}}
+
+/* ---------- run control ---------- */
+async function toggleRun(){
+  try{if(S.phase==="running"){await api("/api/stop",{});toast("Pausing…");}
+      else{await api("/api/start",{});toast("Started.");}
+      await refresh();}catch(e){toast(e.message,1);}}
+async function requeue(){
+  try{const d=await api("/api/retry",{});
+    toast(d.requeued?d.requeued+" put back in the queue — press Start.":"Nothing to retry.");
+    await refresh();loadRuns();}catch(e){toast(e.message,1);}}
+async function openReport(){try{const d=await api("/api/report");
+  window.open(d.url,"_blank");}catch(e){toast(e.message,1);}}
+
+/* ---------- render ---------- */
+function paint(){
+  const needSetup=!S.configured;
+  $("setup").classList.toggle("hidden",!(needSetup||setupOpen));
+  $("dash").classList.remove("hidden");
+  $("setupcancel").classList.toggle("hidden",needSetup);
+  if((needSetup||setupOpen)&&!setupFilled){fillSetup();setupFilled=true;}
+  else if(needSetup||setupOpen){paintLoginButton();}   // keep status text fresh only
+
+  const running=S.phase==="running",stopping=S.phase==="stopping";
+  $("dot").className="dot "+(running||stopping?"busy":(S.configured?"on":""));
+  $("phase").textContent=running?"running":stopping?"pausing":
+    (S.configured?"ready":"needs setup");
+  $("hdone").textContent=(S.done||0).toLocaleString();
+  $("htotal").textContent=(S.total||0).toLocaleString();
+  const b=$("mainbtn");
+  b.textContent=running?"Pause":stopping?"Pausing…":(S.done&&S.done===S.total?"All done":"Start");
+  b.disabled=stopping||!S.total||(S.done===S.total&&!running);
+  b.className=running?"big":"primary big";
+
+  $("bgnote").classList.toggle("hidden",!running);
+  $("concwrap").classList.toggle("hidden",!S.configured);
+  $("concval").textContent=S.concurrency||2;
+
+  let sub="";
+  if(!S.configured)sub="Fill in the setup above and save it, then add repositories below.";
+  else if(S.message)sub=S.message;
+  else if(running){
+    const bits=[];
+    if(S.rate_per_hour)bits.push(S.rate_per_hour+" per hour");
+    if(S.eta_seconds){
+      bits.push("about "+dur(S.eta_seconds)+" of scanning left");
+      if(S.eta_working_days)bits.push("~"+S.eta_working_days+" working day"+
+        (S.eta_working_days===1?"":"s")+" at "+S.hours_per_day+"h/day");
+    }
+    sub=bits.length?bits.join(" · "):"estimating…";
+  }
+  else if(!S.total)sub="No repositories yet. Add some below to begin.";
+  else if(S.done===S.total)sub="Every repository has finished. Open the full report to review.";
+  else sub=(S.total-S.done).toLocaleString()+" waiting. Press Start when ready.";
+  $("hsub").textContent=sub;
+
+  const sp=$("sesspanel");
+  if(S.config&&S.config.show_session_log!==false&&S.sessions){
+    sp.classList.remove("hidden");
+    sp.textContent="Worked "+dur(S.sessions.total_seconds)+" total across "+
+      S.sessions.sessions+" session"+(S.sessions.sessions===1?"":"s")+
+      (running?" · this session so far: "+dur(S.sessions.current_seconds):"");
+  } else sp.classList.add("hidden");
+
+  const c=S.counts||{},tot=S.total||1;
+  $("rail").innerHTML=ORDER.map(k=>c[k]?
+    `<i style="width:${c[k]/tot*100}%;background:${COL[k]}" title="${NICE[k]}: ${c[k]}"></i>`:"").join("");
+  $("legend").innerHTML=ORDER.filter(k=>c[k]).map(k=>
+    `<span><span class="dot" style="background:${COL[k]}"></span> <b>${c[k].toLocaleString()}</b> ${NICE[k]}</span>`).join("");
+  const sr=S.done?Math.round((S.succeeded||0)/S.done*100):0;
+  $("kpis").innerHTML=[["Succeeded",(S.succeeded||0).toLocaleString(),"var(--ok)"],
+    ["Failed",(S.failed||0).toLocaleString(),"var(--bad)"],
+    ["Timed out",(S.timeout||0).toLocaleString(),"var(--warn)"],
+    ["Success rate",S.done?sr+"%":"—"],["Average run",dur(S.avg_seconds)],
+    ["Running for",dur(S.elapsed)]].map(([l,v,col])=>
+    `<div class="kpi"><b style="color:${col||"var(--ink)"}">${v}</b><span>${l}</span></div>`).join("");
+  $("slots").innerHTML=(S.active||[]).map(a=>
+    `<div class="slot"><span class="dot busy"></span><b>${a.repo}</b>
+     <span class="mono" style="color:var(--faint);font-size:12px">${(a.run_id||"").slice(0,8)}</span>
+     <span class="st">${a.status} · ${dur(a.elapsed)}</span></div>`).join("");
+  $("events").innerHTML=(S.events||[]).map(e=>
+    `<div class="evt"><span>${e.ts}</span><span>${e.msg}</span></div>`).join("")
+    ||`<div class="empty">Nothing yet.</div>`;
+  $("chips").innerHTML=ORDER.filter(k=>c[k]).map(k=>
+    `<button class="pill" onclick="setFilter('${k}')" aria-pressed="${filterState===k}">${NICE[k]} ${c[k]}</button>`).join(" ");
+  $("foot").textContent="Results are saved in "+(S.state_dir||"")+
+    " — safe to close this window, nothing is lost.";
+}
+function setFilter(k){filterState=filterState===k?"":k;loadRuns();paint();}
+async function loadRuns(){
+  const q=encodeURIComponent($("q").value||"");
+  RUNS=await api(`/api/runs?q=${q}&state=${filterState}`);
+  $("rows").innerHTML=RUNS.map(r=>`<tr>
+    <td><b>${r.repo}</b>${r.branch?` <span style="color:var(--faint)">${r.branch}</span>`:""}
+      ${r.error?`<span class="err">${esc(r.error)}</span>`:""}</td>
+    <td class="${r.state}">${NICE[r.state]||r.state}</td>
+    <td style="color:var(--dim)">${esc(r.api_status)}</td>
+    <td class="mono" style="font-size:11.5px;color:var(--faint)">${r.run_id.slice(0,8)}</td>
+    <td>${dur(r.duration)}</td>
+    <td>${r.report?`<a href="/file/${r.report}" target="_blank">open</a>`:"—"}</td></tr>`).join("")
+    ||`<div></div>`;
+  if(!RUNS.length)$("rows").innerHTML=
+    `<tr><td colspan="6" class="empty">No repositories match. Clear the search or the filter.</td></tr>`;
+}
+const esc=s=>String(s||"").replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+async function refresh(){try{S=await api("/api/state");paint();}catch(e){
+  $("phase").textContent="lost connection to the app";}}
+mode("list");refresh().then(loadRuns);
+setInterval(refresh,2000);setInterval(loadRuns,6000);
+</script></body></html>
+"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    ctl: Controller = None            # type: ignore[assignment]
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a: Any) -> None:
+        return
+
+    # -- helpers ---------------------------------------------------------
+    def _send(self, code: int, body: bytes, ctype: str,
+              extra: Optional[dict] = None) -> None:
+        self.send_response(code)
+        self.send_header("content-type", ctype)
+        self.send_header("content-length", str(len(body)))
+        self.send_header("cache-control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(body)
+
+    def _json(self, obj: Any, code: int = 200) -> None:
+        self._send(code, json.dumps(obj, default=str).encode(),
+                   "application/json")
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("content-length") or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def _file(self, rel: str) -> None:
+        root = self.ctl.cfg.state_dir.resolve()
+        target = (root / unquote(rel)).resolve()
+        if root not in target.parents and target != root:
+            return self._json({"error": "not allowed"}, 403)
+        if not target.is_file():
+            return self._json({"error": "file not found"}, 404)
+        ctype = ("text/html" if target.suffix == ".html"
+                 else "application/json" if target.suffix == ".json"
+                 else "text/plain")
+        self._send(200, target.read_bytes(), ctype + "; charset=utf-8")
+
+    # -- routes ----------------------------------------------------------
+    def do_GET(self) -> None:
+        u = urlparse(self.path)
+        path = u.path
+        try:
+            if path in ("/", "/index.html"):
+                return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if path == "/api/state":
+                return self._json(self.ctl.snapshot())
+            if path == "/api/runs":
+                qs = dict(x.split("=", 1) for x in u.query.split("&") if "=" in x)
+                return self._json(self.ctl.runs(
+                    unquote(qs.get("q", "")).replace("+", " "),
+                    qs.get("state", "")))
+            if path == "/api/report":
+                p = write_html(self.ctl.cfg, self.ctl.store, live=False)
+                rel = os.path.relpath(p, self.ctl.cfg.state_dir.resolve())
+                return self._json({"url": "/file/" + rel.replace(os.sep, "/")})
+            if path == "/export.csv":
+                out = self.ctl.cfg.state_dir / "runs.csv"
+                cmd_export(self.ctl.cfg, out, quiet=True)
+                return self._send(200, out.read_bytes(), "text/csv",
+                                  {"content-disposition":
+                                   'attachment; filename="codemind_runs.csv"'})
+            if path.startswith("/file/"):
+                return self._file(path[len("/file/"):])
+            if path == "/favicon.ico":
+                return self._send(204, b"", "image/x-icon")
+            return self._json({"error": "unknown page"}, 404)
+        except Exception as exc:
+            return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        body = self._body()
+        try:
+            if path == "/api/config":
+                self.ctl.save_config(body)
+                return self._json({"ok": True})
+            if path == "/api/test":
+                return self._json(probe_server(
+                    build_config({**self.ctl.raw, **body})))
+            if path == "/api/repos":
+                return self._json(self.ctl.add_repos(
+                    body.get("text", ""), bool(body.get("as_csv"))))
+            if path == "/api/start":
+                self.ctl.start()
+                return self._json({"ok": True})
+            if path == "/api/stop":
+                self.ctl.stop()
+                return self._json({"ok": True})
+            if path == "/api/retry":
+                if self.ctl.phase != "idle":
+                    return self._json(
+                        {"error": "Pause the batch before requeuing."}, 400)
+                n = self.ctl.store.reset_states({FAILED, TIMEOUT, DEAD})
+                return self._json({"requeued": n})
+            if path == "/api/concurrency":
+                n = self.ctl.set_concurrency(body.get("value", 2))
+                return self._json({"ok": True, "concurrency": n})
+            if path == "/api/autostart":
+                enable = bool(body.get("enable"))
+                result = install_autostart() if enable else remove_autostart()
+                self.ctl.raw["start_on_login"] = enable and result.get("ok", False)
+                with contextlib.suppress(Exception):
+                    config_path().write_text(
+                        json.dumps(self.ctl.raw, indent=2) + "\n")
+                result["installed"] = autostart_installed()
+                return self._json(result)
+            return self._json({"error": "unknown action"}, 404)
+        except (ValueError, SystemExit) as exc:
+            return self._json({"error": str(exc)}, 400)
+        except Exception as exc:
+            return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def free_port(preferred: int = 0) -> int:
+    for cand in ([preferred] if preferred else []) + [8765, 8766, 8767, 0]:
+        with contextlib.suppress(OSError):
+            s = socket.socket()
+            s.bind(("127.0.0.1", cand))
+            port = s.getsockname()[1]
+            s.close()
+            return port
+    return 8765
+
+
+def write_launchers() -> None:
+    """Create a double-clickable shortcut next to this file, once."""
+    me = Path(sys.argv[0]).resolve()
+    here = me.parent
+    with contextlib.suppress(Exception):
+        if platform.system() == "Windows":
+            bat = here / "Start Batch Runner.bat"
+            if not bat.exists():
+                bat.write_text(
+                    "@echo off\r\ntitle CodeMind Batch Runner\r\n"
+                    'cd /d "%~dp0"\r\n'
+                    f'python "{me.name}"\r\n'
+                    "if errorlevel 1 pause\r\n")
+        else:
+            sh = here / "Start Batch Runner.command"
+            if not sh.exists():
+                sh.write_text('#!/bin/bash\ncd "$(dirname "$0")"\n'
+                              f'python3 "{me.name}"\n')
+                os.chmod(sh, 0o755)
+
+
+def serve(port: int, open_browser: bool) -> int:
+    ctl = Controller()
+    Handler.ctl = ctl
+    write_launchers()
+    port = free_port(port)
+    httpd = Server(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}/"
+
+    started_automatically = False
+    if ctl.raw.get("auto_start", True) and ctl.configured:
+        with contextlib.suppress(ValueError):
+            ctl.start()                     # runs whether or not a browser
+            started_automatically = True    # ever opens to look at it
+
+    print("\n  " + "─" * 52)
+    print(f"  {APP} {VERSION}")
+    print(f"  Dashboard:  {url}")
+    print(f"  Results:    {ctl.cfg.state_dir.resolve()}")
+    if started_automatically:
+        print("  Already scanning — this keeps going even if you close")
+        print("  the browser tab. Closing this app window stops it.")
+    print("  " + "─" * 52 + "\n")
+
+    def launch() -> None:
+        with contextlib.suppress(Exception):
+            webbrowser.open(url)
+
+    if open_browser:
+        threading.Timer(0.8, launch).start()
+
+    def on_term(*_a: Any) -> None:
+        raise KeyboardInterrupt
+
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGTERM, on_term)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Shutting down…")
+        ctl.stop()
+        for _ in range(40):
+            if ctl.phase == "idle":
+                break
+            time.sleep(0.25)
+    finally:
+        httpd.server_close()
+        ctl.close()
+    return 0
+
+
+# ==========================================================================
+# headless mode (servers, OCP jobs) and the demo self test
+# ==========================================================================
+
+
+def run_headless() -> int:
+    ctl = Controller()
+    if not ctl.configured:
+        raise SystemExit(f"{config_path()} is missing base_url or playbooks.")
+    if ctl.cfg.input_path is None and ctl.raw.get("input"):
+        ctl.cfg.input_path = Path(ctl.raw["input"])
+    if ctl.cfg.input_path and ctl.cfg.input_path.exists():
+        ctl.store.enqueue(load_tasks(ctl.cfg))
+    rows = ctl.store.actionable()
+    print(f"{len(rows)} repositories to process")
+    if not rows:
+        return 0
+    ctl.start()
+    try:
+        while ctl.phase != "idle":
+            time.sleep(2)
+    except KeyboardInterrupt:
+        ctl.stop()
+        while ctl.phase != "idle":
+            time.sleep(0.5)
+    counts = ctl.store.counts()
+    print(" ".join(f"{k.lower()}={v}" for k, v in sorted(counts.items())))
+    print(f"report: {write_html(ctl.cfg, ctl.store)}")
+    ctl.close()
+    return 0
+
+
+def start_mock_server() -> str:
+    runs: dict[str, dict] = {}
+
+    class M(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a): pass
+
+        def _s(self, code: int, body: dict) -> None:
+            raw = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if random.random() < 0.15:
+                return self._s(503, {"detail": "busy"})
+            rid = str(uuid.uuid4())
+            runs[rid] = {"n": 0, "repo": body.get("repo_url", "")}
+            self._s(200, {"run_id": rid, "status": "queued"})
+
+        def do_GET(self):
+            if self.path.startswith("/openapi.json"):
+                return self._s(200, {"paths": {SUBMIT_PATH: {}}})
+            rid = self.path.rstrip("/").rsplit("/", 1)[-1]
+            r = runs.get(rid)
+            if not r:
+                return self._s(404, {"detail": "not found"})
+            r["n"] += 1
+            if r["n"] < 2:
+                return self._s(200, {"run_id": rid, "status": "running"})
+            bad = random.random() < 0.2
+            self._s(200, {"run_id": rid,
+                          "status": "failed" if bad else "completed",
+                          "error": "playbook assertion failed" if bad else None,
+                          "report": {"findings": random.randint(0, 9),
+                                     "repo": r["repo"]}})
+
+    srv = Server(("127.0.0.1", 0), M)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def run_demo(headless: bool, port: int, browser: bool = True) -> int:
+    import tempfile
+    base = start_mock_server()
+    work = Path(tempfile.mkdtemp(prefix="codemind_demo_"))
+    os.chdir(work)
+    config_path().write_text(json.dumps({
+        "base_url": base, "playbooks": ["demo_playbook"],
+        "goal": "generate report", "branch": "main", "insecure": True,
+        "concurrency": 2, "max_wall_minutes": 2, "poll_interval": 0.5,
+        "first_poll_delay": 0.5, "state": "./cm_state",
+        "input": "repos.csv"}, indent=2))
+    Path("repos.csv").write_text(
+        "repo_url,branch\n" + "\n".join(
+            f"https://github.com/example/service-{i:02d},main"
+            for i in range(1, 13)))
+    print(f"Demo workspace: {work}\nMock server: {base}")
+    return run_headless() if headless else serve(port, browser)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="codemind_batch",
+        description="CodeMind Batch Runner — opens a dashboard in your browser.")
+    ap.add_argument("--headless", action="store_true",
+                    help="no browser; run straight from codemind.json")
+    ap.add_argument("--port", type=int, default=0, help="dashboard port")
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--demo", action="store_true",
+                    help="self test against a built-in mock server")
+    ap.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    a = ap.parse_args(argv)
+
+    if a.demo:
+        return run_demo(a.headless, a.port, not a.no_browser)
+    if a.headless:
+        return run_headless()
+    return serve(a.port, not a.no_browser)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
