@@ -1,0 +1,472 @@
+# Devin ACU Hardening — Reference Playbook
+**Production standard, v1.0 — repo-agnostic**
+
+Applies to any repository onboarded to Devin, with or without a graph-based retrieval CLI. Placeholders are written as `<ANGLE_BRACKETS>`; everything else is drop-in.
+
+---
+
+## Part 0 — The cost model (why any of this works)
+
+ACUs accrue on work Devin performs: planning, **context gathering**, execution, browser actions, code execution — plus a small VM/bandwidth component. Cloning repos, waiting for your reply, and waiting for test suites are **not** billed. Sessions auto-sleep after roughly 0.1 ACU of inactivity and cost nothing while asleep.
+
+Three exploitable properties follow:
+
+1. **Retrieval is billed; retrieval you pre-compute is not.** A structured query that returns a call chain replaces a multi-file read plus the planning turns needed to reconcile them.
+2. **Snapshot work is free; in-session discovery is billed.** Toolchain installs, warm dependency caches, and index builds cost zero ACUs in the blueprint. The same work discovered mid-session is billed *and* triggers re-planning.
+3. **Context size compounds.** Tokens gathered early ride along in every subsequent planning step. Bloat is a per-turn tax, not a one-time charge.
+
+Session-size thresholds (from Session Insights) — size is `max(ACU-derived, message-derived)`:
+
+| Size | ACU (standard) | ACU (enterprise) | User messages |
+|---|---|---|---|
+| XS | ≤ 2 | ≤ 20 | ≤ 2 |
+| S | ≤ 5 | ≤ 50 | ≤ 5 |
+| M | ≤ 10 | ≤ 100 | ≤ 10 |
+| L | ≤ 20 | ≤ 200 | ≤ 20 |
+| XL | > 20 | > 200 | > 20 |
+
+L and XL are flagged unhealthy by Cognition's own tooling. **Target: XS/S/M ≥ 85% of sessions.**
+
+---
+
+## Part 1 — The seven failure modes
+
+These are the recurring defects found in agent-instruction files across repos. Each is a mechanism, not a style preference. Audit any repo against this list.
+
+### F1 — Examples teach the failure mode
+
+If your instruction file demonstrates a query style, then later warns that style is unreliable, the agent copies the demonstration. It reads top-down and imitates the first concrete example.
+
+The result is worse than having no guidance: the agent pays for the failing retrieval *and then* falls back to the expensive path anyway. Your retrieval layer becomes a tax paid before file reading rather than a replacement for it.
+
+**Rule: every documented example must be one you want copied. Failure-prone patterns go below, labeled, in a separate section.**
+
+### F2 — Unbounded fallbacks
+
+"If X fails, fall back to reading files" has no ceiling. On any non-trivial repo that permits a fifteen-file read followed by re-planning over bloated context. The line intended as a safety valve becomes the most expensive instruction in the file.
+
+**Rule: every fallback needs a hard numeric cap and a terminal stop-and-report state.**
+
+### F3 — Capabilities documented but not prescribed
+
+Output-limiting flags, scoping filters, module-level build targets — if these are listed as available but no rule says when to use them, they don't get used. An unbounded overview command returns a large payload that then inflates every subsequent planning step in the session.
+
+**Rule: prescribe defaults. "Available" is not guidance.**
+
+### F4 — No staleness rule for the agent's own edits
+
+Refreshing an index at session start is correct and insufficient. Once the agent edits code, the index is stale. Re-querying returns pre-edit answers, producing wrong edits, producing CI failures several steps later. This is a silent-thrash generator that will not surface as an obvious error in the timeline.
+
+**Rule: mandate a refresh after any edit, before any subsequent query. If the refresh is fast, there is no reason to skip it.**
+
+### F5 — Auto-approve treated as optional
+
+An unapproved command blocks on manual approval. Waiting is not billed — but the session stalls, message count climbs (which alone can push a session to L/XL), and worse, **a blocked tool is a tool the agent routes around.** It will grep instead. The guardrail fails open into the expensive path.
+
+**Rule: auto-approve is step 0, not a later step. Gate rollout on it.**
+
+### F6 — No stop condition anywhere
+
+Nothing in a typical instruction file tells the agent when to give up. Devin cannot see its own meter. Absent an explicit ceiling, "try another approach" is always locally rational, and loops are where 20+ ACU sessions come from.
+
+**Rule: two failed attempts at the same step → stop and report.**
+
+### F7 — Platform and credential drift
+
+Windows sessions cost roughly 9% more than Ubuntu for equivalent work. Credentials embedded in committed config are both a security defect and an operational one — rotation breaks every session silently. Committed index artifacts that go stale fail silently, which is worse than absent.
+
+**Rule: standardize on Ubuntu; credentials in the secret store; indexes built in the snapshot, never trusted from a commit alone.**
+
+---
+
+## Part 2 — AGENTS.md reference template
+
+Devin applies `AGENTS.md` by directory. Root file below; per-module files in Part 3.
+
+```markdown
+# AGENTS.md — Agent instructions for <REPO_NAME>
+
+## Code retrieval
+
+<IF YOU HAVE A RETRIEVAL CLI — otherwise delete this section and keep the rest>
+
+This repository ships <RETRIEVAL_TOOL>. **It is the primary retrieval tool.**
+Do not grep or read files in bulk to build context — query it instead.
+
+Always invoke as `<CANONICAL_INVOCATION>` (this form does not depend on `PATH`).
+
+### Rules
+
+1. Before answering any question about this codebase, or before editing code you
+   have not already opened, run a `<TOOL>` command first.
+2. **Query by identifier, not by prose.** Prose questions frequently fail to match.
+   Use the exact class, method, or module name. If you do not know the identifier,
+   run `<OVERVIEW_COMMAND>` first to find it.
+3. Prefer structured queries over `grep` or full-file reads for questions about
+   classes, methods, callers/callees, imports, inheritance, and data flow.
+4. Read a full file only when the query output is insufficient — you need exact
+   method bodies, annotations, or config values — or you are about to edit it.
+5. **Budget every command.** Defaults in the table below. No unbudgeted queries.
+6. **Refresh the index after you edit code, before any further query.** A stale
+   index returns pre-edit answers and will send you down a wrong path that costs
+   far more to unwind than the refresh costs to run.
+7. Never open or parse the index artifact directly; always use the CLI.
+8. **Bounded fallback.** If a query returns nothing:
+   a. Re-run once with a narrower identifier, or with `<OVERVIEW_COMMAND>`.
+   b. If still empty, read at most **3** files, chosen from the nearest neighbours
+      the query did surface.
+   c. If still unresolved, **stop.** State what you queried, what you read, and
+      what you need. Do not continue exploring.
+9. **Two-strike rule.** Two failed attempts at the same step means stop and report.
+   Do not attempt a third approach.
+
+### Commands
+
+| Command | Purpose | Default budget |
+|---|---|---|
+| `<OVERVIEW_COMMAND>` | High-level structure and central abstractions | `<N>` |
+| `<SYMBOL_QUERY>` | Find a symbol and its neighbourhood | `<N>` |
+| `<EXPLAIN_COMMAND>` | Structural detail for one class/method/module | `<N>` |
+| `<PATH_COMMAND>` | Relationship/call chain between two nodes | `<N>` |
+| `<REFRESH_COMMAND>` | Rebuild after code changes | — |
+
+Raise a budget only after a budgeted run came back truncated *and* the missing
+part is load-bearing for the task.
+
+### Example queries — identifier-first (use these)
+
+```bash
+<OVERVIEW_COMMAND>                          # what are the main components?
+<SYMBOL_QUERY "RealClassFromThisRepo">      # symbol lookup
+<EXPLAIN_COMMAND "RealServiceFromThisRepo"> # methods + connections
+<PATH_COMMAND "A" "B">                      # data flow
+```
+
+Use real identifiers from this repository, not placeholders — the agent copies
+these verbatim.
+
+### Prose queries — low yield, fallback only
+
+Supported, but frequently fail to match. Use only when you have no identifier and
+`<OVERVIEW_COMMAND>` did not surface one. If a prose query returns nothing, do not
+re-run it in different phrasing. Switch to `<OVERVIEW_COMMAND>`, extract the
+identifier, and query that.
+
+### Index freshness
+
+The index lives at `<INDEX_PATH>`. If missing, stale, or reported outdated,
+rebuild before querying:
+
+```bash
+<REFRESH_COMMAND>       # <note any --force semantics>
+<FULL_REBUILD_COMMAND>  # if refresh yields an empty index
+```
+
+Refresh takes <DURATION> on this repo. There is never a reason to skip it.
+
+## Repository conventions
+
+- <LANGUAGE_VERSION> + <BUILD_TOOL>. Give <BUILD_TOOL> instructions and code
+  samples for dependency work.
+- Work is tracked in <TRACKER>.
+- See [README.md](README.md) for build/run details.
+- Module build: `<MODULE_BUILD_CMD>`
+- Module tests: `<MODULE_TEST_CMD>`
+- Lint: `<LINT_CMD>`
+
+## Scope discipline
+
+- Change only the module named in your task. Do not modify sibling modules, the
+  root build file, or shared configuration unless the task names them.
+- Do not refactor, reformat, or modernize code you are not required to change.
+- Do not disable, skip, delete, or weaken tests to make a build pass.
+- <IF NO UI> Do not use the browser for this repository.
+
+## Session discipline
+
+- State your plan in one short paragraph before executing. Do not produce a long
+  written plan document.
+- Run the module build and module test suite. Do not run a full workspace build
+  unless the task requires it.
+- If you are not converging after two attempts at the same step, stop and report:
+  what you tried, the exact error, and what you need.
+```
+
+**Sizing:** keep the root file under ~5 KB. It is read every session — the cheapest instruction surface you have, governing the most expensive action class. But it is not free, and a bloated one taxes every session.
+
+---
+
+## Part 3 — Per-module AGENTS.md
+
+Add one per major module containing **only what differs** from the root. Under 40 lines. A module file that restates the root is pure context tax.
+
+```markdown
+# AGENTS.md — <MODULE_NAME>
+
+Build:  `<MODULE_BUILD_CMD>`
+Tests:  `<MODULE_TEST_CMD>`
+
+Entry points: `<Identifier1>`, `<Identifier2>`, `<Identifier3>`
+
+Module-specific:
+- <convention that differs from the root>
+- <known gotcha unique to this module>
+```
+
+---
+
+## Part 4 — Blueprint reference
+
+Everything here is unmetered. Anything omitted gets discovered mid-session at full rate.
+
+```yaml
+# Devin blueprint — <REPO_NAME>
+secrets:
+  - <ARTIFACT_REPO_USER>
+  - <ARTIFACT_REPO_TOKEN>
+
+steps:
+  - name: Configure package manager for internal mirror
+    run: |
+      # write pip.conf / .npmrc / gradle init.gradle / settings.xml
+      # from secrets — never from committed files
+
+  - name: Install toolchain
+    run: <INSTALL_COMMANDS>
+
+  - name: Verify toolchain          # fail here, not in a session
+    run: |
+      <TOOL> --version
+      <RETRIEVAL_CLI> --help
+
+  - name: Warm dependency cache
+    run: <DEPENDENCY_RESOLVE_CMD> || true
+
+  - name: Verify build and test commands
+    run: |
+      <MODULE_BUILD_CMD>
+      <ONE_FAST_TEST>
+
+  - name: Build index
+    run: <FULL_REBUILD_COMMAND>
+
+startup:
+  - name: Refresh index
+    run: <REFRESH_COMMAND>
+```
+
+Design rules:
+
+- **Verify every tool in the blueprint.** A failure here is free and visible. The same failure in a session is billed, and the agent silently falls back to the expensive path.
+- **Warm caches.** Cold dependency resolution through a corporate proxy is a top-tier silent-thrash trigger.
+- **Full rebuild at build time, incremental refresh at startup.** Never pay full extraction inside a session.
+- **Do not trust a committed index alone.** Stale-and-committed fails silently — confident wrong answers, CI catches it three steps later. The snapshot must build its own.
+- **Credentials from the secret store.** Rotation must not break every session.
+- **Ubuntu, not Windows** — ~9% cheaper for equivalent work.
+
+### Auto-approve — step 0
+
+Add before rolling anything out:
+
+```
+<RETRIEVAL_CLI>
+<CANONICAL_INVOCATION>
+<BUILD_TOOL>
+```
+
+Gate the rollout on this. Without it the retrieval path stalls, message counts climb, and the agent routes around your guardrail.
+
+---
+
+## Part 5 — Prompt contract
+
+Front-load everything. Facts you supply are free; facts the agent discovers are billed.
+
+```
+REPO: <org/repo>   BRANCH: <base-branch>
+SCOPE: only these paths — <path/a>, <path/b>. Do not modify anything else.
+
+TASK
+<one sentence, imperative>
+
+CONTEXT (given — do not go looking for this)
+- Current state: <exact versions / code / error output>
+- Target state: <exact target>
+- Reference implementation: <file already doing this correctly>
+- Known gotcha: <the thing that otherwise costs 4 ACUs>
+
+DECISIONS ALREADY MADE (do not re-evaluate)
+- <decision 1>
+- <decision 2>
+
+VERIFY
+1. `<exact build command>`
+2. `<exact test command>`
+3. `<exact lint command>`
+
+DONE WHEN
+- All three pass
+- Diff touches only the scoped paths
+- PR opened against <branch>
+
+BUDGET
+Target ≤ <N> ACUs. If not converging after two failed attempts at the same step,
+STOP, do not try a third approach, and report: what you tried, the exact error,
+and what you need from me.
+
+FORBIDDEN
+- Do not refactor unrelated code
+- Do not upgrade dependencies not named above
+- Do not use the browser unless <condition>
+- Do not disable, skip, or weaken tests
+```
+
+The last forbidden line matters more than it looks. Without it, "make the tests pass" invites the cheapest-path failure — you pay ACUs for a PR you then reject.
+
+---
+
+## Part 6 — Playbook template
+
+Register with a macro (`!<name>`) so anyone attaches it with one token. Playbooks are versioned and revertible — treat them as code.
+
+```
+Playbook: <NAME>
+
+## Overview
+<One paragraph: outcome, and that this is mechanical not design work.>
+Target: XS/S session.
+
+## Required From User
+- <input 1>
+- <input 2>
+
+## Procedure
+1. <Refresh index.>
+2. <Query by identifier to scope. Do not grep.>
+3. <Make the change, single module.>
+4. <Build the named module only.>
+5. <On failure: refresh index, query the break, fix only what the change caused.>
+6. <Run the module test suite.>
+7. <If an unrelated test fails, stop and report.>
+8. <Open PR with verification evidence and tracker key.>
+
+## Specifications
+- Diff confined to the named module
+- <postcondition 2>
+- Build and tests pass
+- PR body contains verification evidence
+
+## Advice and Pointers
+- The snapshot has the toolchain installed and caches warm. Do not reinstall or
+  reconfigure anything.
+- Query by identifier. Prose queries are low-yield on this repo.
+- <repo-specific prior correction>
+
+## Forbidden Actions
+- Do not modify the root build file or sibling modules
+- Do not disable, skip, or weaken any test
+- Do not run a full workspace build
+- Do not use the browser
+- Do not open or parse the index artifact
+- Do not attempt a third approach after two failures — stop and report
+```
+
+One step per line, imperative, mutually exclusive and collectively exhaustive. Cover setup, task, and delivery.
+
+---
+
+## Part 7 — Measurement harness
+
+Do not roll everything at once. You will not be able to attribute the delta, and you will be asked to.
+
+**Control design.** Take 20 comparable work items. Randomize into two arms of 10. Arm A: current configuration. Arm B: hardened AGENTS.md + blueprint + auto-approve + playbook. Same reviewers, same week, same repo.
+
+**Instrumentation** (v3 API):
+
+| Endpoint | Metric |
+|---|---|
+| `GET /consumption/daily/sessions` | ACU per session |
+| `GET /sessions/insights` | Size distribution, issue labels, message counts |
+| `GET /metrics/sessions-by-category` | ACU by task category |
+| `GET /metrics/prs` | Merged PRs — the denominator |
+
+Tag every session (`<initiative>`, `arm-a` / `arm-b`) so attribution is automatic.
+
+**Primary metric: ACU per *merged* PR.** Not per session — a change that halves session cost while doubling rejections is a regression, and only the merged denominator catches it.
+
+**Quality guardrails — the run fails if any move the wrong way:**
+
+| Guard | Threshold |
+|---|---|
+| PR rejection rate | No increase vs Arm A |
+| Review comments per PR | No increase |
+| Post-merge defect rate (30d) | No increase |
+| Sessions ending in stop-and-report | ≤ 15% |
+
+That last one is the tuning dial. The bounded fallback is deliberately aggressive; if the agent stops too often, loosen the file cap in Rule 8b from 3 to 5 before touching anything else.
+
+---
+
+## Part 8 — Task selection (applies before any of the above)
+
+No amount of instruction tuning rescues a badly chosen task.
+
+Slice criteria:
+- Under **90 minutes** of equivalent manual engineering work
+- **Atomic**: one file, one module, one CVE, one endpoint
+- **Independently verifiable**: tests, build, CI, or a verification script
+- **Backwards compatible**: mergeable alone, no coordination with sibling slices
+- **Minimal external dependencies**
+
+Wide-and-shallow beats tall-and-deep. Ten XS sessions at 2 ACUs each is cheaper *and* more reliable than one XL session at 35. There are no concurrency limits on Team/Enterprise — run them in parallel.
+
+| Bad slice | Good slice |
+|---|---|
+| "Remediate all CVEs in this repo" | "Bump `<artifact>` to `<version>` in `<module>`, resolve compile breaks, CI green" |
+| "Migrate the service to `<framework vN>`" | "Migrate `<old>` → `<new>` imports in `<module>` only; no behavior change; tests pass" |
+| "Fix the flaky tests" | "`<TestClass>.<testMethod>` is flaky. Reproduce with 20 runs, fix the race, keep all other tests green" |
+
+---
+
+## Part 9 — Rollout
+
+**Day 0.** Auto-approve the retrieval and build commands. Confirm Ubuntu. Move credentials into the secret store.
+
+**Week 1.** Baseline Arm A untouched. In parallel, build and verify the blueprint — blueprint work is free and cannot contaminate the measurement.
+
+**Week 2.** Ship the hardened AGENTS.md and the first playbook. Run Arm B.
+
+**Week 3.** Wire pre-flight context injection into your prompt generator: run the retrieval queries on your own infrastructure and paste results into the CONTEXT block. Measure separately so you can attribute it.
+
+**Week 4.** Enable Devin Review with Auto-Fix. Audit Knowledge for misleading items — a single stale item taxes every session org-wide, invisibly. Publish the ACU-per-merged-PR panel.
+
+**Then ratchet.** Weekly: take the three highest-ACU sessions, read Session Insights, push each finding into the blueprint, the AGENTS.md, or the playbook. Nothing gets fixed twice in a prompt. Any environment issue appearing twice in Action Items becomes a blueprint defect ticket.
+
+---
+
+## Appendix — Repo onboarding checklist
+
+**Environment**
+- [ ] Retrieval and build commands auto-approved
+- [ ] Blueprint installs **and verifies** every tool
+- [ ] Dependency caches warm in snapshot
+- [ ] Full index build at snapshot, incremental refresh at startup
+- [ ] Credentials in secret store, not in repo
+- [ ] Ubuntu, not Windows
+
+**Instructions**
+- [ ] Root AGENTS.md under ~5 KB; per-module files under 40 lines
+- [ ] Every example is one you want copied
+- [ ] Failure-prone patterns in a separate, labeled section
+- [ ] Budgets prescribed on every documented command
+- [ ] Post-edit index refresh rule present
+- [ ] Fallback ladder with a numeric file cap
+- [ ] Two-strike stop condition present
+- [ ] Scope and session discipline sections present
+- [ ] Real identifiers from this repo in the examples, not placeholders
+
+**Operations**
+- [ ] Playbook registered with macro for each repeated task type
+- [ ] Sessions tagged for attribution
+- [ ] Quality guardrails instrumented alongside ACU
+- [ ] Weekly high-ACU session review scheduled
