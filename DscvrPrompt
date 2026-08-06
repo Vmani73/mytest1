@@ -1,0 +1,49 @@
+# Copilot Agent Mode Prompt — Discovery Agent: live + intelligent behavior (no layout change)
+
+Do not restructure, reskin, reposition, or recolor any existing element. Additive only.
+
+## Preserve exactly (zero diff)
+Header (wordmark, Playbook Store, Search History, Log out, avatar), hero heading, source pills (IDP, Tachyon Agent Marketplace, Enterprise Git), mode tabs (Catalog Search, Intelligent Discovery), search input + button, Trending Now / Most Popular cards, "Or try" chips. Same DOM, classes, copy, style. No sidebar, no dark mode, no new palette/typography, no new nav.
+
+## Add below the hero (currently empty space)
+
+**1. Live status line** — under search bar: `<count> solutions indexed · updated <N>s ago` + pulsing dot. Count from stats endpoint. Ticks 1/sec, resets on refetch (poll 30–60s). Reserve height, no layout shift.
+
+**2. Trending Now / Most Popular → functional toggle** — single-select, default Trending Now. On select: skeleton (~300–450ms) → card grid, sorted by growth or search volume. Card: type icon, id (mono), type label, 2-line desc, reuse count, growth %. Cap 6–8 cards, no pagination. Card click = no-op/TODO unless detail view exists elsewhere.
+
+**3. Search** — debounce 250ms; Enter/Search button = immediate. Replaces grid with query results; empty query reverts to Trending/Most Popular. Chips fill input + trigger search. Zero-match = calm empty state, no red/error styling.
+
+**4. Intelligent Discovery tab** — on search, render instead of grid:
+- Summary: N related entries, strongest match id + reuse count
+- "Reuse instead of build" callout with est. dev-days-saved range
+- "Grounded in N matches" line
+- Matched entities as §2 cards below
+
+Zero matches: state plainly nothing matches, no fabricated results.
+Switching back to Catalog Search preserves current query.
+
+**API contract (typed client; mock now, real later):**
+```ts
+type Entity = { id:string; type:"component"|"agent"|"repo"|"prompt"; description:string; reuseCount:number; growth7d:number; searches7d:number };
+GET  /api/catalog/stats                    -> { indexedCount:number }
+GET  /api/catalog/search?q=&sort=trending|popular -> { items:Entity[] }
+POST /api/catalog/ask  { query:string }    -> { summary:string; matches:Entity[]; estimatedSavingsDays:[number,number]; grounded:boolean }
+```
+Match existing repo API conventions if they differ — don't add a second convention.
+
+**5. Corner notifications** — bottom-right, every 8–10s (first at ~2–3s). Kinds: new solution indexed, now trending, just reused, playbook published. Icon + label + id (mono) + auto-dismiss progress (~5–6s) + manual close. Max 2–3 stacked. `aria-live="polite"`, no focus-steal, no sound. Source from events endpoint if present; else local sample list isolated in one swappable function.
+
+**6. Data honesty** — any mock count/%/reuse number gets a small "sample preview data" tag near the results header. Gate behind a `usingMockData` flag; auto-removes once wired to a real endpoint.
+
+## Acceptance gate
+- [ ] Existing header/hero/pills/tabs/search/cards/chips: zero visual diff
+- [ ] Live status line ticks, no layout shift
+- [ ] Trending/Most Popular functional toggle → real grid
+- [ ] Search debounced + Enter/button immediate + chips wired
+- [ ] Intelligent Discovery renders grounded synthesized answer; zero-match handled honestly
+- [ ] Corner notifications: interval, dismissible, `aria-live="polite"`, no focus-steal
+- [ ] Mock data labeled + removable via one flag
+- [ ] No renaming of product or any source anywhere
+
+## Do not
+Sidebar. Dashboard chrome. New color system. Dark mode. New top-level nav. Restyle/remove existing elements. New entity detail page. Hardcoded URLs/secrets. Fabricated precise metrics outside §6.
