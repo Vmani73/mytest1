@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+SonarQube Test Coverage Fetcher Utility (Hardcoded version)
+
+Edit the CONFIG section below, then simply run:
+    python sonar_coverage_fetcher.py
+
+Requirements:
+  pip install requests
+"""
+
+from __future__ import annotations
+
+import csv
+import sys
+from typing import Any, Dict, List, Optional
+
+try:
+    import requests
+except ImportError:
+    print("ERROR: 'requests' package is required. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+
+# =============================================================================
+# CONFIG - CHANGE THESE VALUES
+# =============================================================================
+
+# Pod A (primary)
+SONAR_URL_A = "https://sonar-pod-a.example.com"          # e.g. https://sonar.company.com
+SONAR_TOKEN_A = "squ_xxxxxxxxxxxxxxxxxxxxxxxx"           # your SonarQube token
+
+# Pod B (optional - set both to empty string "" or None to skip)
+SONAR_URL_B = "https://sonar-pod-b.example.com"
+SONAR_TOKEN_B = "squ_yyyyyyyyyyyyyyyyyyyyyyyy"
+
+# List of project keys. Leave empty [] to fetch ALL projects from Sonar.
+REPOS = [
+    # "com.myorg:service-a",
+    # "com.myorg:service-b",
+    # "another-project-key",
+]
+
+# Output file
+OUTPUT_CSV = "sonar_coverage.csv"
+
+# Metrics to fetch (you can add/remove)
+METRIC_KEYS = [
+    "coverage",
+    "line_coverage",
+    "branch_coverage",
+    "new_coverage",
+    "ncloc",
+    "tests",
+    "test_success_density",
+]
+
+# =============================================================================
+
+
+def _auth(token: str) -> tuple:
+    """SonarQube token auth: username = token, password empty."""
+    return (token, "")
+
+
+def _normalize_base_url(url: str) -> str:
+    """Strip trailing slash and optional /api suffix so we can append /api/... cleanly."""
+    url = url.rstrip("/")
+    if url.endswith("/api"):
+        url = url[:-4]
+    return url
+
+
+def fetch_all_project_keys(base_url: str, token: str, page_size: int = 500) -> List[Dict[str, str]]:
+    """
+    Paginate through /api/components/search?qualifiers=TRK to get every project.
+    Returns list of dicts with at least 'key' and 'name'.
+    """
+    base_url = _normalize_base_url(base_url)
+    projects: List[Dict[str, str]] = []
+    page = 1
+
+    while True:
+        url = f"{base_url}/api/components/search"
+        params = {
+            "qualifiers": "TRK",
+            "ps": page_size,
+            "p": page,
+        }
+        resp = requests.get(url, params=params, auth=_auth(token), timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+
+        components = data.get("components", [])
+        if not components:
+            break
+
+        for c in components:
+            projects.append({
+                "key": c.get("key", ""),
+                "name": c.get("name", ""),
+            })
+
+        paging = data.get("paging", {})
+        total = paging.get("total", 0)
+        if page * page_size >= total:
+            break
+        page += 1
+
+    return projects
+
+
+def get_measures_for_component(
+    base_url: str,
+    token: str,
+    project_key: str,
+    metric_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Call /api/measures/component for a single project key.
+    Returns a flat dict with key, name and the requested metrics (or error info).
+    """
+    if metric_keys is None:
+        metric_keys = METRIC_KEYS
+
+    base_url = _normalize_base_url(base_url)
+    url = f"{base_url}/api/measures/component"
+    params = {
+        "component": project_key,
+        "metricKeys": ",".join(metric_keys),
+    }
+
+    try:
+        resp = requests.get(url, params=params, auth=_auth(token), timeout=30)
+        if resp.status_code == 404:
+            return {
+                "project_key": project_key,
+                "project_name": "",
+                "error": "Component not found (404)",
+            }
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        return {
+            "project_key": project_key,
+            "project_name": "",
+            "error": str(exc),
+        }
+
+    component = data.get("component", {})
+    measures_raw = component.get("measures", [])
+    measures = {m["metric"]: m.get("value") for m in measures_raw}
+
+    result: Dict[str, Any] = {
+        "project_key": component.get("key", project_key),
+        "project_name": component.get("name", ""),
+        "error": None,
+    }
+    for mk in metric_keys:
+        result[mk] = measures.get(mk)
+
+    return result
+
+
+def fetch_coverages(
+    base_url: str,
+    token: str,
+    instance_name: str,
+    repo_keys: Optional[List[str]] = None,
+    metric_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Main worker: resolve the list of keys (all or given), fetch measures, tag with instance.
+    """
+    results: List[Dict[str, Any]] = []
+
+    if not repo_keys:
+        print(f"[{instance_name}] No repo list supplied → fetching ALL projects …")
+        projects = fetch_all_project_keys(base_url, token)
+        repo_keys = [p["key"] for p in projects]
+        name_lookup = {p["key"]: p["name"] for p in projects}
+        print(f"[{instance_name}] Found {len(repo_keys)} projects")
+    else:
+        name_lookup = {}
+        print(f"[{instance_name}] Fetching coverage for {len(repo_keys)} provided project(s)")
+
+    for idx, key in enumerate(repo_keys, 1):
+        print(f"[{instance_name}] ({idx}/{len(repo_keys)}) {key}")
+        row = get_measures_for_component(base_url, token, key, metric_keys)
+        row["instance"] = instance_name
+        if not row.get("project_name") and key in name_lookup:
+            row["project_name"] = name_lookup[key]
+        results.append(row)
+
+    return results
+
+
+def write_csv(rows: List[Dict[str, Any]], output_path: str, metric_keys: List[str]) -> None:
+    """Write results to CSV. Columns are stable and ordered."""
+    fieldnames = [
+        "instance",
+        "project_key",
+        "project_name",
+        *metric_keys,
+        "error",
+    ]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            clean = {k: row.get(k) for k in fieldnames}
+            writer.writerow(clean)
+
+    print(f"\nWrote {len(rows)} row(s) → {output_path}")
+
+
+def main() -> None:
+    instances: List[tuple[str, str, str]] = []  # (name, url, token)
+
+    # Pod A
+    if SONAR_URL_A and SONAR_TOKEN_A:
+        instances.append(("pod-A", SONAR_URL_A, SONAR_TOKEN_A))
+
+    # Pod B (optional)
+    if SONAR_URL_B and SONAR_TOKEN_B:
+        instances.append(("pod-B", SONAR_URL_B, SONAR_TOKEN_B))
+
+    if not instances:
+        print(
+            "ERROR: Please set at least SONAR_URL_A + SONAR_TOKEN_A in the CONFIG section.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    all_rows: List[Dict[str, Any]] = []
+
+    for name, url, token in instances:
+        try:
+            rows = fetch_coverages(
+                base_url=url,
+                token=token,
+                instance_name=name,
+                repo_keys=REPOS if REPOS else None,   # empty list → fetch all
+                metric_keys=METRIC_KEYS,
+            )
+            all_rows.extend(rows)
+        except Exception as exc:
+            print(f"[{name}] FATAL: {exc}", file=sys.stderr)
+
+    if not all_rows:
+        print("No data collected.", file=sys.stderr)
+        sys.exit(1)
+
+    write_csv(all_rows, OUTPUT_CSV, METRIC_KEYS)
+
+
+if __name__ == "__main__":
+    main()
