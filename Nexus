@@ -1,0 +1,580 @@
+# Nexus Agent — Phased Build Prompts for GitHub Copilot
+
+**Purpose:** build the Nexus Agent orchestration system in 8 controlled phases.
+**Audience:** the engineer driving Copilot. You run one phase per chat session.
+
+---
+
+## HOW TO USE THIS FILE
+
+### Rules for the operator (you)
+
+1. **One phase = one fresh Copilot chat session.** Start a new chat before each phase. Do not continue a phase in a session that already ran a previous phase.
+2. **Copy the fenced `PROMPT` block only.** Everything outside it is instruction for you, not for Copilot.
+3. **Attach only the files named in "Context to attach."** Do not attach folders. Do not use `@workspace` at any point in this build — it indexes the entire repository and is the single largest credit cost available in Copilot Chat.
+4. **Use Edit mode, not Agent mode**, for every phase except Phase 8. These phases produce deterministic file content; agent mode adds tool-calling loops and re-reads that you are paying for and do not need.
+5. **Run all PowerShell yourself.** Never ask Copilot to execute, verify, or "test" a script. Copilot cannot see the result and will fabricate one.
+6. **Verify the acceptance criteria manually** after each phase. Do not proceed on a failed phase.
+7. **Never paste this whole file into Copilot.** It is ~8x the context any single phase needs.
+
+### Before you start — fill these in
+
+Search this file for `<FILL:` and replace every occurrence. The build will produce incorrect output if you skip this. Nothing below assumes a value you have not supplied.
+
+| Token | Meaning | Example from your current setup |
+|---|---|---|
+| `<FILL:WORKSPACE_ROOT>` | Repo root path | `C:\Users\Public\Automation\FabricAgent` |
+| `<FILL:GITHUB_ORG>` | GitHub org that hosts agent repos | `wftgitsas-CIO-CONSMR-TECH` |
+| `<FILL:AGENT_LIST>` | Every agent: id, repo URL, branch, exclude patterns, capabilities | see Phase 1 |
+| `<FILL:ROUTE_LIST>` | Every capability → agent mapping, with example phrasings | see Phase 1 |
+
+**Do not let Copilot invent entries for these.** Every phase prompt below contains an explicit instruction forbidding it. If you do not have all 14 routes ready, ship with the ones you have — a missing route produces a clean `NEEDS_CLARIFICATION`, an invented one produces a wrong action.
+
+### Phase map
+
+| Phase | Produces | Copilot needed? |
+|---|---|---|
+| 0 | Folder scaffold + `.gitignore` | No — you run it |
+| 1 | `copilot-instructions.md` (config hub) | Minimal |
+| 2 | SKILL.md contract + template + codegraph skill | Yes |
+| 3 | `nexus-agent.agent.md` (orchestrator) | Yes — highest care |
+| 4 | `install-skill.ps1` (installer) | Yes |
+| 5 | `validate-registry.ps1` (CI gate) | Yes |
+| 6 | Prompt-file generator + `/nexus-install-*` commands | Yes |
+| 7 | Run log + troubleshooting doc | Yes |
+| 8 | Acceptance run | Yes — agent mode |
+
+---
+
+## CREDIT DISCIPLINE — READ ONCE, APPLIES THROUGHOUT
+
+There are two separate costs. Control both.
+
+**Build-time cost** (this file, one-off) is controlled by the operator rules above: fresh session per phase, named-file context only, no `@workspace`, Edit mode.
+
+**Runtime cost** (every developer request, forever) is controlled by what you build. These constraints are baked into the Phase 3 and Phase 2 prompts and must not be relaxed:
+
+- The orchestrator reads **exactly one** config file per request (`copilot-instructions.md`). It never enumerates `.github/skills/`, never opens a SKILL.md it has not routed to, never reads `playbooks/` to decide routing.
+- Routing is **two-stage**: exact capability-token match first (zero model calls), LLM classification only on miss.
+- `SKILL.md` is capped at **200 lines**. It is an index, not a manual. Detail lives in `playbooks/`, loaded only after the skill is selected.
+- The orchestrator loads **one** playbook — the matched one. Never the folder.
+- Installation is a **one-time** cost per workspace per agent. Already-installed agents skip clone entirely.
+- Prerequisites (`requires:`) are declared **per skill**, not run globally. A request that does not need CodeGraph does not pay for it.
+
+If a later change makes the orchestrator read more than one file before routing, you have lost the cost control and should revert it.
+
+---
+
+## PHASE 0 — Scaffold (no Copilot)
+
+Run this yourself. There is nothing here worth spending a model call on.
+
+```powershell
+$root = "<FILL:WORKSPACE_ROOT>"
+$dirs = @(
+  ".github\agents",
+  ".github\skills\codegraph",
+  ".github\skills\nexus-agent\hooks",
+  ".github\skills\nexus-agent\registry",
+  ".github\skills\nexus-agent\templates",
+  ".github\skills\nexus-agent\references",
+  ".github\prompts",
+  ".nexus\logs"
+)
+$dirs | ForEach-Object { New-Item -ItemType Directory -Force -Path (Join-Path $root $_) | Out-Null }
+```
+
+Then create `<FILL:WORKSPACE_ROOT>\.gitignore` (append if it exists):
+
+```gitignore
+# Nexus — installed skills are cached artifacts, never committed
+.github/skills/*/
+!.github/skills/codegraph/
+!.github/skills/nexus-agent/
+
+# Nexus — run logs are local
+.nexus/logs/
+
+# Nexus — installer scratch
+.nexus/tmp/
+```
+
+**Acceptance:** all directories exist; `git status` shows `.gitignore` modified and no `skills/` subfolders staged.
+
+---
+
+## PHASE 1 — Config hub
+
+**Context to attach:** none.
+**Mode:** Edit.
+
+This phase is deliberately low-intelligence. You are supplying the data; Copilot is only formatting it. Replace the two `<FILL:...>` blocks with your real values before sending.
+
+````text
+PROMPT — PHASE 1
+
+Create one file: `.github/copilot-instructions.md`
+
+This is the single source of truth for agent routing. Produce it exactly to the
+specification below. Do not add sections. Do not add example rows beyond the data
+I supply. Do not invent agents, capabilities, repositories, or branches — if data
+is missing, leave the cell as `TBD` and add nothing else.
+
+File structure, in this order:
+
+1. H1 title: `Nexus Agent Configuration`
+2. A one-paragraph note stating: this file is the only routing source of truth;
+   it is read at runtime by the orchestrator; edits here require no code changes.
+3. H2 `Routes` — a markdown table with exactly these columns:
+   | Capability | Agent | Description | Example Phrasings |
+   - Capability: lowercase kebab-case token, unique
+   - Agent: must match an Agent id in the Registry table below
+   - Description: one line, what the capability does
+   - Example Phrasings: 2-3 quoted natural-language requests, semicolon-separated
+   Populate from ROUTE DATA below and nothing else.
+4. H2 `Agent Registry` — a markdown table with exactly these columns:
+   | Agent | Repo | Branch | Exclude | Status |
+   - Status is one of: `active`, `planned`
+   - Rows with repo `TBD` must have Status `planned`
+   Populate from AGENT DATA below and nothing else.
+5. H2 `Routing Rules` — a numbered list, verbatim:
+   1. Match the request to a Capability by exact token first, then by Example Phrasings.
+   2. If no capability matches with confidence, return NEEDS_CLARIFICATION and list the three closest capabilities. Never guess.
+   3. If multiple capabilities match, present an ordered plan and ask for confirmation before executing.
+   4. Only agents with Status `active` may be routed to. A `planned` agent returns BLOCKED.
+   5. Never hardcode any of this table into agent logic or scripts.
+6. H2 `Maintainer Notes` — three bullets:
+   - To add an agent: add one Routes row and one Agent Registry row. Nothing else.
+   - After editing, run `.github/skills/nexus-agent/hooks/validate-registry.ps1`.
+   - The JSON mirror at `.github/skills/nexus-agent/registry/ide-agent-skills.json` is GENERATED. Never hand-edit it.
+
+ROUTE DATA:
+<FILL:ROUTE_LIST — one line per route: capability | agent | description | example phrasings>
+
+AGENT DATA:
+<FILL:AGENT_LIST — one line per agent: id | repo URL | branch | exclude patterns | active|planned>
+
+Output the complete file content only. No commentary, no explanation.
+````
+
+**Acceptance:** every Agent value in Routes appears in Agent Registry; no row exists that you did not supply; the six sections are present in order.
+
+---
+
+## PHASE 2 — SKILL.md contract, template, and default skill
+
+**Context to attach:** `.github/copilot-instructions.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 2
+
+Create three files. Output each with its full path as a heading. No commentary.
+
+=== FILE 1: `.github/skills/nexus-agent/references/skill-contract.md` ===
+
+The specification every SKILL.md must satisfy. Contents:
+
+- H1 `SKILL.md Contract v1`
+- A statement that any file failing this contract is invalid and must not be executed.
+- H2 `Required Frontmatter` — a YAML block showing every required key with its type
+  and one-line meaning:
+    schemaVersion   integer, must be 1
+    name            string, kebab-case, must match the folder name
+    capabilities    string array, must all appear in the Routes table
+    requires        string array, other skill names that must be installed first (may be empty)
+    allowedCommands array of objects (see below)
+    outputs         string array, artifact filenames this skill produces
+- H2 `allowedCommands` — each entry has:
+    id          string, unique within the skill
+    exec        ARRAY of strings, argv form. Never a single shell string.
+    cwd         string, relative to the skill folder
+    timeoutSec  integer
+  State explicitly: argv-array form is mandatory because a single shell string
+  permits argument injection. A SKILL.md using a shell string is invalid.
+- H2 `Required Body Sections` — exactly these H2s in this order:
+    `## When To Use`, `## Procedure`, `## Playbooks`, `## Outputs`, `## Limits`
+- H2 `Hard Constraints` — a bullet list, verbatim:
+    - Maximum 200 lines. SKILL.md is an index, not a manual.
+    - Detailed steps live in `playbooks/`, loaded only after the skill is selected.
+    - A skill must not contain routing logic. Routing lives only in copilot-instructions.md.
+    - A skill must not read or modify copilot-instructions.md.
+    - A skill must not invoke another skill directly; it declares `requires` and the orchestrator resolves it.
+    - A skill must not run any command not listed in allowedCommands.
+- H2 `Validation` — state that `validate-registry.ps1` enforces this contract and
+  that a failing skill returns BLOCKED at runtime.
+
+=== FILE 2: `.github/skills/nexus-agent/templates/SKILL.template.md` ===
+
+A fill-in-the-blank skill file that satisfies the contract above. Every value is a
+`<PLACEHOLDER>`. Include one worked `allowedCommands` entry in argv form, commented
+as an example. Keep it under 60 lines.
+
+=== FILE 3: `.github/skills/codegraph/SKILL.md` ===
+
+The built-in default skill, conforming to the contract. Frontmatter:
+  schemaVersion: 1
+  name: codegraph
+  capabilities: [codegraph]
+  requires: []
+  allowedCommands: []      # built-in; no external process
+  outputs: [codegraph.json]
+
+Body sections:
+- `## When To Use` — dependency graph generation, impact analysis, call-chain
+  tracing, module mapping. State clearly: invoke only when the request needs
+  structural code analysis, or when another skill declares `requires: [codegraph]`.
+  State explicitly that this skill is NOT run on every request.
+- `## Procedure` — numbered, at most 6 steps, describing graph construction scoped
+  to the files relevant to the request rather than the whole repository.
+- `## Playbooks` — state: none; this skill is self-contained.
+- `## Outputs` — `codegraph.json` written to `.nexus/artifacts/`.
+- `## Limits` — bullets: scope analysis to the files named in the request or
+  reachable within two dependency hops; do not traverse the full repository;
+  do not read files outside the workspace root.
+
+Do not invent commands, paths, or capabilities beyond those specified.
+````
+
+**Acceptance:** codegraph SKILL.md is under 200 lines; all five body H2s present in order; no `allowedCommands` entry uses a shell string.
+
+---
+
+## PHASE 3 — The orchestrator
+
+This is the highest-value file in the system and the one most likely to be over-generated. The prompt is deliberately prescriptive. **Attach only the two named files.**
+
+**Context to attach:** `.github/copilot-instructions.md`, `.github/skills/nexus-agent/references/skill-contract.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 3
+
+Create one file: `.github/agents/nexus-agent.agent.md`
+
+This is the single front-door orchestrator. It must be under 250 lines. Prefer
+terse imperative instructions over prose — this file is loaded into context on
+every developer request, so its length is a permanent per-request cost.
+
+Structure:
+
+1. Frontmatter: `name: nexus-agent`, `description:` one line describing it as the
+   single entry point that routes requests to specialized agents.
+
+2. `## Role` — 3 sentences max. Single front door. Routes by reading configuration
+   at runtime. Never performs specialized work itself.
+
+3. `## Execution Flow` — exactly four steps, in this order:
+
+   STEP 1 — ROUTE
+     - Read `.github/copilot-instructions.md`. This is the ONLY file read at this stage.
+     - Match by exact capability token first. If found, proceed with zero further analysis.
+     - If no exact token, classify the request against the Description and Example
+       Phrasings columns.
+     - If confidence is low or ambiguous → return NEEDS_CLARIFICATION with the three
+       closest capabilities and stop.
+     - If the matched agent has Status `planned` → return BLOCKED and stop.
+     - If multiple capabilities match → present an ordered plan, ask for confirmation, stop.
+
+   STEP 2 — ENSURE INSTALLED
+     - Check whether `.github/skills/<agent>/SKILL.md` exists. Check this ONE path.
+       Do not list or scan the skills directory.
+     - If present → go to STEP 3.
+     - If absent → run `.github/skills/nexus-agent/hooks/install-skill.ps1 -SkillId <agent>`
+     - If the installer exits non-zero → return BLOCKED with the installer's message and stop.
+
+   STEP 3 — RESOLVE PREREQUISITES
+     - Read the matched SKILL.md. Read the `requires` list.
+     - For each entry, verify `.github/skills/<name>/SKILL.md` exists; install if not.
+     - Do not run prerequisites that are not declared.
+
+   STEP 4 — EXECUTE AND RETURN
+     - Follow the matched SKILL.md `## Procedure`.
+     - Load at most one playbook — the one the procedure names.
+     - Run only commands listed in that skill's allowedCommands. Refuse anything else.
+     - Append one line to the run log (see `## Run Log`).
+     - Return a consolidated response, the evidence produced, and exactly one status.
+
+4. `## Status Values` — a table of exactly five, with a one-line definition each:
+   COMPLETED, PARTIALLY_COMPLETED, NEEDS_CLARIFICATION, BLOCKED, FAILED.
+
+5. `## Context Discipline` — a bullet list, verbatim. State that these exist to
+   control per-request cost:
+   - Read exactly one config file to route. Never enumerate `.github/skills/`.
+   - Never open a SKILL.md for an agent you have not routed to.
+   - Load one playbook, never a folder.
+   - Never read `playbooks/`, `hooks/`, or `agents/` to make a routing decision.
+   - Do not re-read files already in context.
+   - Do not summarize files you were not asked about.
+
+6. `## Hard Rules` — a bullet list, verbatim:
+   - Never create additional `.agent.md` files for specialized agents.
+   - Never hardcode routes or registry entries into any file other than copilot-instructions.md.
+   - Never execute a command not declared in the target skill's allowedCommands.
+   - Never clone from a repository outside the organization allowlist.
+   - Never auto-generate a SKILL.md and treat it as valid. Missing SKILL.md is BLOCKED.
+   - Never modify files outside the workspace root.
+   - When uncertain, return NEEDS_CLARIFICATION. Do not guess.
+
+7. `## Run Log` — state that every request appends one JSON object as a single line
+   to `.nexus/logs/runs.jsonl` with these fields and no others:
+   timestamp, request, matchedCapability, agent, resolvedCommit, status, durationMs.
+
+Do not add sections beyond these seven. Do not include example dialogues.
+````
+
+**Acceptance:** file is under 250 lines; STEP 1 names exactly one file to read; all five statuses present; no invented sections.
+
+---
+
+## PHASE 4 — Installer
+
+**Context to attach:** `.github/copilot-instructions.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 4
+
+Create one file: `.github/skills/nexus-agent/hooks/install-skill.ps1`
+
+Windows PowerShell 5.1 compatible. Target: an internal IDE workspace on Windows.
+Do not use cross-platform abstractions. Do not add features beyond this spec.
+
+Parameters:
+  -SkillId        [string] Required. Agent id as it appears in the Agent Registry.
+  -WorkspaceRoot  [string] Optional, defaults to the repo root resolved from $PSScriptRoot.
+  -Force          [switch] Reinstall even if already present.
+
+Behavior, in order — implement exactly these steps:
+
+1. Resolve paths. Set `$ErrorActionPreference = 'Stop'`.
+
+2. If `.github/skills/<SkillId>/SKILL.md` exists and -Force is not set:
+   write "ALREADY_INSTALLED" and exit 0. Do no work.
+
+3. Read `.github/copilot-instructions.md`. Parse the `Agent Registry` markdown table.
+   Find the row where Agent equals SkillId.
+   - Not found → write "BLOCKED: agent '<SkillId>' is not in the Agent Registry." exit 2
+   - Status is `planned` or Repo is `TBD` → write "BLOCKED: agent '<SkillId>' is not yet available." exit 2
+
+4. ORGANIZATION ALLOWLIST. Define at the top of the script:
+     $AllowedOrgs = @('<FILL:GITHUB_ORG>')
+   If the repo URL host is not github.com, or its org segment is not in $AllowedOrgs:
+   write "BLOCKED: repository is outside the organization allowlist." exit 3
+   This check runs BEFORE any network call.
+
+5. Clone shallow into `.nexus/tmp/<SkillId>`:
+     git clone --depth 1 --branch <Branch> <Repo> <tmpPath>
+   Non-zero exit → write "FAILED: git clone failed." plus git's stderr. exit 4
+
+6. Capture the resolved commit: `git -C <tmpPath> rev-parse HEAD`. Hold it for logging.
+   Do not gate on it. Do not compare it to anything.
+
+7. Verify `<tmpPath>\SKILL.md` exists.
+   - If MISSING: write `<tmpPath>\SKILL.md.draft` containing the template from
+     `.github/skills/nexus-agent/templates/SKILL.template.md` with the name field
+     pre-filled. Copy the draft to `.github/skills/<SkillId>/SKILL.md.draft`.
+     Then write:
+       "BLOCKED: source package has no SKILL.md. A draft has been written to
+        .github/skills/<SkillId>/SKILL.md.draft. Review it, then submit it to the
+        source repository. Installation stopped."
+     Clean up tmp. exit 5
+   - Do NOT auto-generate a working SKILL.md. Do NOT continue installation.
+
+8. Copy into place with robocopy, excluding `.git`, `node_modules`, and each pattern
+   from the Exclude column. Robocopy exit codes 0-7 are success; 8+ are failure.
+
+9. Append one JSON line to `.nexus/logs/runs.jsonl`:
+   { timestamp, action: "install", agent, branch, resolvedCommit, status }
+
+10. Remove `.nexus/tmp/<SkillId>`. Use try/finally so cleanup runs on every exit path.
+
+11. Write "COMPLETED: <SkillId> installed at .github/skills/<SkillId>/" and exit 0.
+
+Exit codes: 0 success, 2 registry/availability, 3 allowlist, 4 clone, 5 missing SKILL.md, 1 unexpected.
+
+Every message must be prefixed with one of: COMPLETED, BLOCKED, FAILED, ALREADY_INSTALLED.
+Use Write-Output for status lines and Write-Error only for unexpected exceptions.
+Add a comment-based help header with .SYNOPSIS and .EXAMPLE.
+
+Output the script only. No explanation.
+````
+
+**Acceptance:** run `install-skill.ps1 -SkillId doesnotexist` → exits 2 with a BLOCKED message and makes no network call. Then run it against one real active agent.
+
+---
+
+## PHASE 5 — Validator
+
+**Context to attach:** `.github/copilot-instructions.md`, `.github/skills/nexus-agent/references/skill-contract.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 5
+
+Create one file: `.github/skills/nexus-agent/hooks/validate-registry.ps1`
+
+Windows PowerShell 5.1. Pure validation plus one generated artifact. It must never
+clone, install, or modify any file except the generated JSON.
+
+Parameters:
+  -WorkspaceRoot [string] Optional, defaults to repo root from $PSScriptRoot.
+  -Fix           [switch] Regenerate the JSON mirror instead of only reporting drift.
+
+Checks, each reporting PASS or FAIL with the offending value:
+
+C1  copilot-instructions.md exists and both required tables parse.
+C2  Every Capability token is unique and matches ^[a-z0-9]+(-[a-z0-9]+)*$.
+C3  Every Agent referenced in Routes exists in Agent Registry.
+C4  Every Agent Registry row has a non-empty Branch, or Status is `planned`.
+C5  Every active agent's Repo org is in the allowlist (read the $AllowedOrgs list
+    from install-skill.ps1 so the two cannot drift).
+C6  Every Routes row has at least two Example Phrasings.
+C7  For each INSTALLED skill folder under .github/skills/ that contains a SKILL.md:
+      - frontmatter parses and schemaVersion is 1
+      - name matches the folder name
+      - every capability listed appears in the Routes table
+      - all five required body H2s are present
+      - file is 200 lines or fewer
+      - every allowedCommands.exec is an array, not a string
+      Skip folders with no SKILL.md — those are not yet installed and are not errors.
+C8  Every `requires` entry names an agent that exists in the Agent Registry.
+C9  JSON mirror drift: build the expected JSON from the Registry table and compare
+    to `.github/skills/nexus-agent/registry/ide-agent-skills.json`.
+      - Without -Fix: report FAIL on mismatch.
+      - With -Fix: rewrite the file and report FIXED.
+C10 Prompt-file drift: every active agent has a matching
+    `.github/prompts/nexus-install-<agent>.prompt.md`, and no such prompt file
+    exists for an agent absent from the Registry. With -Fix, delegate regeneration
+    to generate-install-prompts.ps1 if that script exists; otherwise report only.
+
+Output: one line per check, `[PASS]` / `[FAIL]` / `[FIXED]` prefixed. Then a summary
+count. Exit 0 if no FAIL, exit 1 otherwise, so it can gate a pull request.
+
+Do not add checks beyond C1-C10. Do not make network calls.
+````
+
+**Acceptance:** run it on the current repo — it should pass, or fail with a specific actionable line. Deliberately break one Routes row and confirm the correct check fails.
+
+---
+
+## PHASE 6 — Install commands with autocomplete
+
+**Context to attach:** `.github/copilot-instructions.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 6
+
+Create two files.
+
+=== FILE 1: `.github/skills/nexus-agent/hooks/generate-install-prompts.ps1` ===
+
+Windows PowerShell 5.1. Generates one Copilot prompt file per ACTIVE agent so that
+typing `/nexus-install` in Copilot Chat autocompletes the full list of agents.
+
+Behavior:
+1. Parse the Agent Registry and Routes tables from copilot-instructions.md.
+2. For each agent with Status `active`, write
+   `.github/prompts/nexus-install-<agent>.prompt.md` containing:
+
+   ---
+   mode: agent
+   description: "Install <agent> — <comma-separated capabilities from Routes>"
+   ---
+   Install the `<agent>` skill.
+
+   1. Run: .github/skills/nexus-agent/hooks/install-skill.ps1 -SkillId <agent>
+   2. Report the installer's status line verbatim. Do not interpret or retry.
+   3. If the status is BLOCKED because SKILL.md is missing, tell the user the draft
+      path and stop. Do not attempt to author a SKILL.md.
+
+   Do not read any other file. Do not analyze the workspace.
+
+3. Delete any `.github/prompts/nexus-install-*.prompt.md` whose agent is no longer
+   active in the Registry.
+4. Print each file created, updated, or deleted.
+
+Keep the generated prompt bodies exactly as specified — they are short on purpose,
+because a prompt file's length is paid on every invocation.
+
+=== FILE 2: `.github/prompts/nexus-install.prompt.md` ===
+
+A hand-written discovery command, mode: agent, description
+"List installable Nexus agents and their install state".
+
+Body:
+  1. Read `.github/copilot-instructions.md` only.
+  2. List every agent: id, capabilities, Status, and whether
+     `.github/skills/<agent>/SKILL.md` exists (checking that one path per agent).
+  3. Present as a table. Do not install anything. Do not read any other file.
+  4. End by telling the user to run `/nexus-install-<agent>` to install one.
+
+Output both files. No commentary.
+````
+
+Run the generator, then reload the Copilot Chat window.
+
+**Acceptance:** typing `/nexus-install` in Copilot Chat lists every active agent with its capabilities in the description. Selecting one installs that agent and nothing else.
+
+---
+
+## PHASE 7 — Run log and troubleshooting
+
+**Context to attach:** `.github/agents/nexus-agent.agent.md`
+**Mode:** Edit.
+
+````text
+PROMPT — PHASE 7
+
+Create one file: `.github/skills/nexus-agent/references/troubleshooting.md`
+
+Cover exactly these six failure modes. For each: Symptom, Likely Cause, Fix.
+Be specific about file paths and commands. No generic advice.
+
+1. NEEDS_CLARIFICATION returned for a request that should have matched.
+   (Cause: capability missing from Routes, or Example Phrasings too narrow.)
+2. BLOCKED: agent is not in the Agent Registry.
+3. BLOCKED: repository is outside the organization allowlist.
+4. BLOCKED: source package has no SKILL.md — explain the draft workflow and why
+   auto-generating one is deliberately not supported.
+5. FAILED: git clone failed — branch missing, auth, network, git not on PATH.
+6. validate-registry.ps1 reports JSON or prompt-file drift.
+
+Then add an H2 `Reading the Run Log`: the path `.nexus/logs/runs.jsonl`, the field
+list, and two example PowerShell one-liners — last 20 runs, and all runs with
+status FAILED or BLOCKED.
+
+Then add an H2 `Cost Checks` with three bullets a maintainer should verify monthly:
+- No SKILL.md exceeds 200 lines.
+- The orchestrator still reads only one file before routing.
+- No prompt file instructs Copilot to scan the workspace.
+
+Do not add sections beyond these.
+````
+
+---
+
+## PHASE 8 — Acceptance run
+
+This is the only phase that uses **Agent mode**, and it is a test, not a build. Start a fresh chat, attach nothing, and run these five prompts one at a time. Record each result.
+
+| # | Prompt | Expected |
+|---|---|---|
+| 1 | `/nexus-install` | Table of all active agents with install state. No installs performed. |
+| 2 | `/nexus-install-<one active agent>` | `COMPLETED`, skill folder created. |
+| 3 | Repeat prompt 2 | `ALREADY_INSTALLED`, no clone, near-instant. |
+| 4 | One of your real Example Phrasings, in plain language | Routes to the correct agent, executes, returns one status. |
+| 5 | A deliberately vague request, e.g. "make this repo better" | `NEEDS_CLARIFICATION` with three candidate capabilities. **Not** a guess. |
+
+Then run `validate-registry.ps1` — expect exit 0.
+
+**If test 5 returns anything other than NEEDS_CLARIFICATION, stop and revisit Phase 3 STEP 1.** Silent misrouting is the failure mode that erodes trust in the whole system, and it is the hardest to detect once developers are relying on it.
+
+---
+
+## AFTER THE BUILD
+
+- Add `validate-registry.ps1` to your PR check. It is the entire CI story at IDE scope.
+- Adding an agent is now: two rows in `copilot-instructions.md`, then `validate-registry.ps1 -Fix`. No code change, no new agent file.
+- If you later need this to run headless in CI, the only file that must change is `nexus-agent.agent.md`. Everything else — registry, contract, installer, validator — is already vendor-neutral. Keep it that way.
