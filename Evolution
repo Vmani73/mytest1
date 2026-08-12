@@ -1,0 +1,74 @@
+You are an expert VS Code + GitHub Copilot + MCP systems architect and full-stack engineer. Your task is to design and implement a complete local system called **"Local Evolutionary Mirror Agent"** that runs on the developer’s machine inside VS Code.
+
+### Goal
+Create a personal AI system that:
+1. Watches when the developer pushes code or opens a PR.
+2. Spins up multiple specialized agents in isolated git worktrees.
+3. Lets them compete to improve the change.
+4. Scores the results using both objective quality metrics and the developer’s historical accept/reject behavior.
+5. Shows only the single best suggestion.
+6. Learns over time by retaining successful agent configurations (lineages) and mutating/pruning them (evolutionary selection).
+
+Everything must stay local-first. Prefer native VS Code Copilot features (custom agents + skills) + MCP + git worktrees + a small local orchestrator.
+
+### Architecture Requirements
+
+**Layers:**
+- Native Copilot Custom Agents + Skills (personas and knowledge)
+- MCP servers for tools
+- Local Orchestrator (Node.js preferred, or Python) that manages worktrees, parallel runs, scoring, and lineage
+- Simple local storage (SQLite recommended) for acceptance history and lineages
+- Trigger mechanism (git hooks + VS Code command + optional background watcher)
+
+**Specialized Agents needed (at minimum):**
+- Quality Agent (functional testing, performance, resilience)
+- Security Agent
+- Architecture Agent
+- Documentation Agent
+
+**Core Novel Feature – Evolutionary Selection:**
+- Store successful agent configurations as “lineages”
+- Weight future runs toward historically successful lineages
+- Occasionally mutate prompts/skills
+- Track accept/reject counts per lineage
+- Prune weak lineages
+
+### Deliverables (build in phases)
+
+**Phase 1 – Foundation (must be fully working first)**
+- Complete folder structure
+- `.github/agents/mirror.agent.md` (main orchestrating agent)
+- Skills for Quality, Security, Architecture, Documentation
+- Simple acceptance logging (JSONL or SQLite)
+- Manual trigger command/script that can be run after a push
+- Clear README explaining how to use Phase 1
+
+**Phase 2 – Isolation & Competition**
+- Git worktree management (create, run agent inside, collect result, cleanup)
+- Parallel execution of 3–4 specialized agents
+- Basic scorer (objective signals + simple history matching)
+- Show only the winning suggestion
+
+**Phase 3 – Full Evolutionary System**
+- SQLite schema for lineages
+- Selection + mutation logic
+- Automatic or semi-automatic trigger on push/PR
+- Background capability (optional but designed for)
+- Side-panel or chat-friendly output format
+- Persistence of learning across sessions
+
+### Technical Constraints
+- Must work with current VS Code + GitHub Copilot custom agents, skills, and MCP
+- Prefer git worktrees for isolation
+- Local only (no required cloud services)
+- Clean, well-documented, modular code
+- Make it easy to extend with more agents later
+
+### Output Format
+1. First show the complete recommended folder/file structure
+2. Then implement Phase 1 fully (all files with complete content)
+3. Then provide the architecture and key code for Phase 2
+4. Then provide the architecture, database schema, and key logic for Phase 3
+5. End with a clear “How to run and test” section and a roadmap for future improvements
+
+Start by creating the full Phase 1 implementation so I can immediately drop it into a repository and test it.
