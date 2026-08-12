@@ -1,0 +1,502 @@
+---
+name: "classify_tests"
+version: "1.0.0"
+schema_version: 1
+description: "Discover every test artifact in a repository (or a batch of repositories) and classify it deterministically along five axes — framework, pyramid tier, execution profile, CI gating role, and health — regardless of stack. Handles Karate, Playwright, Cypress, Selenium, JUnit 4/5, TestNG, Spock, Cucumber, RestAssured, pytest, Jest/Vitest, Gatling/JMeter/k6, Pact, Robot Framework, Postman/Newman and unknown frameworks via a generic fallback. Produces a per-test inventory plus a repo-level rollup with a bounded quality score, persisted idempotently by source_commit. Use when the user asks to inventory, classify, tier, audit, or report on tests; to find flaky/dead/skipped tests; to compute a test pyramid distribution; or to decide which suites gate a PR versus a nightly. Do NOT use to author, repair, or execute tests — this playbook is read-only and never runs a test suite."
+---
+
+# classify_tests
+
+Framework-agnostic test classification for Codemind. Read-only, deterministic, re-runnable.
+
+The output of this playbook is consumed downstream (catalog enrichment, migration risk scoring, Litmus candidate selection, CI gate rebalancing), so **stability matters more than cleverness**. Two runs against the same `source_commit` MUST produce byte-identical output. Any behaviour that cannot guarantee that belongs behind an explicit flag, not in the default path.
+
+---
+
+## 1. Purpose and scope
+
+### 1.1 What this playbook produces
+
+Two artifacts, both persisted to MongoDB:
+
+- **`test_inventory`** — one document per *test unit* (defined in §3.1). This is the atomic record.
+- **`test_profile`** — one document per repository: distributions, pyramid ratios, gating map, health findings, quality score.
+
+### 1.2 Explicit non-goals
+
+State these up front rather than half-delivering them:
+
+- **Does not execute tests.** No `mvn test`, no `npx playwright test`, no coverage instrumentation. Runtime and pass/fail data are ingested only if a report artifact already exists in the repo or is supplied as input (§2.3).
+- **Does not measure code coverage.** Coverage is a property of production code, not of tests. If a JaCoCo/Istanbul report is present it may be *attached* as enrichment, never computed.
+- **Does not judge test correctness.** "This test asserts the wrong thing" is out of scope. "This test asserts nothing at all" is in scope (§3.5) because it is structurally detectable.
+- **Does not modify anything.** No PRs, no file writes into the repo. Findings are reported, not remediated.
+
+### 1.3 Scale contract
+
+Designed to run across the full estate (~50k repos) via the batch path. That drives three hard constraints:
+
+- **No whole-repo file reads.** Read the candidate set only (§4.2), and read files by ranged/head reads where a header is sufficient.
+- **LLM calls are capped and optional.** Default `llm_budget = 0`. A repo must classify fully without any model call. See §3.7.
+- **Per-repo wall clock target: < 90s** for repos under 5k test units. If exceeded, emit partial results with `completeness: "partial"` and the reason — never silently truncate.
+
+---
+
+## 2. Inputs, preconditions, and tool contract
+
+### 2.1 Inputs
+
+| Field | Required | Default | Notes |
+|---|---|---|---|
+| `repo_url` or `repo_id` | yes | — | Single-repo mode |
+| `repo_batch` | no | — | CSV/list for batch mode; mutually exclusive with `repo_id` |
+| `branch` | no | resolved | See §2.2 |
+| `subpaths` | no | `["."]` | Restrict scan to modules, e.g. `["services/payments"]` |
+| `include_generated` | no | `false` | Include generated/vendored test dirs |
+| `llm_budget` | no | `0` | Max ambiguity-resolution model calls per repo |
+| `report_artifacts` | no | `[]` | Paths/URIs to surefire XML, Playwright JSON, Karate JSON, JUnit XML |
+| `schema_version` | injected | `1` | Written to every document |
+
+### 2.2 Branch discovery (do not assume `main`)
+
+Resolve in this order, stopping at first success, and record `branch_resolution` in the output:
+
+1. Explicit `branch` input.
+2. Repository default branch from the SCM API.
+3. First existing of `main`, `master`, `develop`, `trunk`.
+4. If none resolve → fail the repo with `RESOLUTION_FAILED`. Do not scan a detached or arbitrary ref silently.
+
+Capture `source_commit` (full 40-char SHA) at resolution time. Every downstream document carries it. If the SHA cannot be captured, abort — idempotency depends on it (§5.4).
+
+### 2.3 Tool contract
+
+Assumed Codemind tool names; rename to match the local registry but preserve the semantics.
+
+| Capability | Tool | Used for |
+|---|---|---|
+| List files by glob | `repo.list_files(globs, excludes)` | Candidate discovery |
+| Read file (ranged) | `repo.read_file(path, start?, end?)` | Signal extraction |
+| AST / symbol query | `graphifyy.query(repo, query)` | Java/TS/Python test-unit extraction, import edges |
+| Build config parse | `repo.read_file` on POM/Gradle/package.json | Surefire/Failsafe/Playwright projects |
+| CI config discovery | `repo.list_files` on CI globs | Gating role (§3.4) |
+| Persist | `mongo.upsert(collection, key, doc)` | Idempotent write |
+
+**Degradation rule:** if `graphifyy.query` is unavailable or returns no graph for the repo, fall back to regex-based extraction and set `extraction_mode: "textual"` on every affected record. Textual mode is permitted but must be visible — never present a regex-derived count as if it were AST-derived.
+
+---
+
+## 3. The classification model
+
+Five orthogonal axes. A test unit gets a value on every axis. Axes are independent: a Karate file can be `tier: contract`, and a JUnit file can be `tier: e2e`. Never infer one axis purely from another except where a rule below explicitly permits it.
+
+### 3.1 The test unit — definition first
+
+Miscounting starts here, so fix the atom before anything else:
+
+| Framework | One test unit is | Not a test unit |
+|---|---|---|
+| JUnit 4/5, TestNG | one `@Test` / `@ParameterizedTest` / `@RepeatedTest` method | the class, `@Before*`/`@After*`, abstract base methods |
+| Spock | one `def "..."` feature method | `setup()`, `cleanup()`, helper methods |
+| Karate | one `Scenario` or `Scenario Outline` | the `.feature` file, `Background`, the Java `Runner` class |
+| Cucumber/JBehave | one `Scenario` | step-definition methods |
+| Playwright | one `test()` call | `test.describe`, `beforeEach`, fixtures, POM classes |
+| Jest/Vitest/Mocha | one `it()` / `test()` | `describe`, snapshots |
+| pytest | one `test_*` function or method | fixtures, `conftest.py` |
+| Cypress | one `it()` | `describe`, `cy` commands, support files |
+| Robot Framework | one Test Case | Keywords, Settings |
+| Postman/Newman | one request with test scripts | folders, environments |
+| Gatling/JMeter/k6 | one Simulation / Test Plan / default fn | feeders, protocol config |
+
+Rules that follow from this:
+
+- **A `Scenario Outline` is ONE test unit** with `example_count: N`, not N units. Expanding examples makes counts unstable when a data row is added and breaks content-addressed identity. Same for `@ParameterizedTest` — one unit, `example_count` from the source count where statically determinable, else `null`.
+- **Runner/harness classes are not tests.** A Java class whose only role is `Runner.path(...)`, `@Karate.Test`, `@Suite`, `@CucumberOptions`, or a Playwright/Cypress config is recorded in a separate `harnesses[]` array on the repo profile with `role: "harness"`. It never enters `test_inventory`.
+- **A disabled test is still a test unit.** It is counted, with `status: "disabled"`. Excluding it hides the problem this playbook exists to surface.
+
+### 3.2 Axis 1 — framework detection
+
+Detection is a **precedence chain, not a score**. First rule that fires wins; record which one fired in `framework_evidence`. This is what makes reruns stable.
+
+Precedence order (highest first):
+
+1. **File-level syntactic identity** — extension + required construct in the same file.
+2. **Import/annotation evidence** in the test file itself.
+3. **Build/config declaration** (dependency present AND config file present).
+4. **Path convention.**
+5. **Generic fallback.**
+
+| Framework | Level-1/2 signals | Config signals |
+|---|---|---|
+| **Karate** | `.feature` file AND (`* def`, `Given url`, `And request`, `karate.` in body) | `karate-config.js`, `com.intuit.karate` dep, `Runner.path` |
+| **Cucumber** | `.feature` file WITHOUT Karate DSL markers, plus glue/step-def classes | `io.cucumber` dep, `@CucumberOptions` |
+| **Playwright** | `import { test } from '@playwright/test'` | `playwright.config.[tj]s`, `@playwright/test` dep |
+| **Playwright CT** | `@playwright/experimental-ct-*` import | `playwright-ct.config.ts` |
+| **Cypress** | `cy.` usage + `it(` | `cypress.config.[tj]s` |
+| **Selenium** | `org.openqa.selenium` / `selenium-webdriver` import | `selenium-java` dep |
+| **JUnit 5** | `org.junit.jupiter.api.Test` | `junit-jupiter` dep |
+| **JUnit 4** | `org.junit.Test` | `junit:junit` dep |
+| **TestNG** | `org.testng.annotations.Test` | `testng` dep |
+| **Spock** | `extends Specification` in `.groovy` | `spock-core` dep |
+| **RestAssured** | `io.restassured` import | dep |
+| **Pact** | `au.com.dius.pact` / `@pact-foundation/pact` | dep, `pacts/` dir |
+| **pytest** | `def test_` in `test_*.py` / `*_test.py` | `pytest.ini`, `[tool.pytest]` |
+| **Jest / Vitest** | `describe`/`it` in `*.test.*`/`*.spec.*` without Playwright import | `jest.config.*`, `vitest.config.*` |
+| **Gatling** | `extends Simulation` | `gatling-*` dep |
+| **JMeter** | `.jmx` file | — |
+| **k6** | `import http from 'k6/http'` | — |
+| **Robot** | `.robot` file with `*** Test Cases ***` | — |
+| **Newman** | `*.postman_collection.json` with `event.test` scripts | — |
+
+**Multi-framework files.** A file can legitimately carry two (RestAssured assertions inside a JUnit method; Testcontainers inside Spock). Record `framework` = the **execution framework** (the thing that discovers and runs the unit: JUnit, TestNG, Spock, Playwright, pytest…) and `libraries[]` = the assertion/transport/infra libraries (RestAssured, WireMock, Testcontainers, AssertJ, Mockito, Pact). Getting this backwards is failure mode **F5**.
+
+**Unknown frameworks.** If no rule fires but the file sits under a test root and contains an assertion-like construct, emit `framework: "unknown"` with `framework_candidates[]` from observed imports. Never force a wrong known label; `unknown` is a legitimate, actionable value.
+
+### 3.3 Axis 2 — pyramid tier
+
+Values: `unit | component | integration | contract | api | e2e_ui | performance | security | accessibility | data | chaos | unclassified`.
+
+Evaluate rules in order; first match wins.
+
+**Java / JVM**
+
+| Rule | Tier |
+|---|---|
+| Filename matches Failsafe pattern (`*IT`, `*ITCase`, `IT*`) or lives under `src/integrationTest` | `integration` |
+| `@SpringBootTest` with `webEnvironment` RANDOM/DEFINED PORT, or `@Testcontainers`, or `@AutoConfigureTestDatabase(replace=NONE)` | `integration` |
+| Slice annotations: `@WebMvcTest`, `@DataJpaTest`, `@JsonTest`, `@RestClientTest`, `@WebFluxTest` | `component` |
+| Pact provider/consumer annotations | `contract` |
+| Selenium/WebDriver/Appium import | `e2e_ui` |
+| Gatling/JMeter/k6 | `performance` |
+| OWASP ZAP / security-scanner harness imports | `security` |
+| Mocks only (Mockito/EasyMock/WireMock) + no container, no context load | `unit` |
+| Default under `src/test/java` with none of the above | `unit` |
+
+**Karate**
+
+| Rule | Tier |
+|---|---|
+| `driver ` keyword or `karate.driver` present | `e2e_ui` |
+| `karate.gatling` / referenced from a Gatling simulation | `performance` |
+| Mock server feature (`karate.start`, `* configure ...` mock scaffold) | `component` |
+| Consumer/provider contract tagging or pact publication | `contract` |
+| URL target is a deployed environment (`karate-config.js` env-driven base URL) | `api` |
+| Default `.feature` with HTTP verbs | `api` |
+
+**Playwright / browser stacks**
+
+| Rule | Tier |
+|---|---|
+| Uses `@playwright/experimental-ct-*` | `component` |
+| Uses only the `request` fixture, no `page` | `api` |
+| Uses `page` / `browser` | `e2e_ui` |
+| `@axe-core/playwright` or accessibility assertions | `accessibility` |
+
+**Node/Python**
+
+| Rule | Tier |
+|---|---|
+| Test imports the module under test only, all I/O mocked | `unit` |
+| Spins up an app server, DB, or Testcontainer | `integration` |
+| Hits an external base URL from env config | `api` |
+
+**Precedence between conflicting signals:** `performance` > `security` > `accessibility` > `contract` > `e2e_ui` > `integration` > `component` > `api` > `unit`. Rationale: the more environmentally demanding tier dominates, because gating decisions depend on the heaviest requirement. Record the losing signals in `tier_conflicts[]` rather than discarding them.
+
+If nothing matches: `unclassified` (never a silent default to `unit` — that inflates the pyramid base and is failure mode **F3**).
+
+### 3.4 Axis 3 — execution profile and Axis 4 — CI gating role
+
+**Execution profile** — derived from static signals, each independently recorded:
+
+- `hermetic: true|false` — false if any of: live URL literal or env-driven base URL, `@Testcontainers`, DB connection, `localhost:<port>` against a non-started service, filesystem writes outside temp dirs, message-broker client.
+- `env_dependency[]` — e.g. `["db:postgres", "http:payments-api", "kafka", "vault"]`.
+- `requires_credentials: true` if the test reads a secret/token/keystore from env or config.
+- `parallel_safe` — `false` if: static mutable state, `@NotThreadSafe`, TestNG `singleThreaded`, `@Execution(SAME_THREAD)`, `test.describe.serial`, shared fixture files, `@Stepwise` (Spock), Karate `callonce` writing shared state.
+- `order_dependent` — `true` on explicit ordering: `@TestMethodOrder`, TestNG `dependsOnMethods`, `describe.serial`, `pytest-order`.
+- `runtime_class` — `fast | medium | slow | unknown`. Only from ingested report artifacts (§2.3): `<1s` fast, `1–10s` medium, `>10s` slow. **Never guess runtime from tier** — if no report, `unknown`.
+
+**CI gating role** — `pr_blocking | nightly | release_gate | on_demand | unwired`. Derived by intersecting three sources:
+
+1. CI definitions: `Jenkinsfile*`, `.github/workflows/*.y*ml`, `.gitlab-ci.yml`, `azure-pipelines.yml`, `tekton/`, `.circleci/`.
+2. Build wiring: Surefire vs Failsafe includes/excludes, Gradle `test`/`integrationTest` tasks, Maven profiles, npm scripts, Playwright `projects` and `grep`/`grepInvert`.
+3. Tags/groups: JUnit `@Tag`, TestNG `groups`, Karate `@tags`, Playwright title tags (`@smoke`), pytest markers.
+
+**`unwired` is a first-class, high-value finding**: the test exists in the repo but no CI path, build include, or task ever selects it. It is dead weight masquerading as coverage. Compute it by resolving the include/exclude expressions — do not assume presence in a test dir implies execution (failure mode **F6**).
+
+### 3.5 Axis 5 — health signals
+
+Boolean/enum signals per unit, all statically detectable. Each contributes to the quality score (§5.3).
+
+| Signal | Detection |
+|---|---|
+| `no_assertion` | No assertion/expect/`match`/`status` construct anywhere in the body, and no `assertThrows`-style construct |
+| `disabled` | `@Disabled`, `@Ignore`, `enabled=false`, `test.skip`, `test.fixme`, `it.skip`, `xit`, `@pytest.mark.skip`, `@ignore` Karate tag |
+| `focused` | `test.only`, `fit`, `it.only`, `@Focus` — a repo-wide hazard: it silently disables siblings |
+| `hard_sleep` | `Thread.sleep`, `waitForTimeout`, `cy.wait(<number>)`, `time.sleep`, Karate `* java.lang.Thread.sleep` |
+| `retry_configured` | `retries` in config, `@RetryingTest`, `@Flaky`, TestNG `retryAnalyzer` — a declared flakiness admission |
+| `nondeterministic_input` | `Random`, `UUID.randomUUID`, `LocalDate.now`/`new Date()` without a fixed clock/seed |
+| `hardcoded_env` | Literal non-localhost URL, hostname, or environment name in the body |
+| `hardcoded_secret_shape` | Token/password-shaped literal (delegate to `ise_detect_sensitive_data_exposure` rules; report only, never echo the value) |
+| `conditional_assertion` | Assertions inside `if`/`try` such that a path can pass without asserting |
+| `empty_body` | Body is empty or comment-only |
+| `oversized` | Body exceeds 150 LOC or 40 assertions — maintenance risk |
+| `generated` | Under a generated/vendored path, or carries a generator header |
+
+`no_assertion` + `disabled` + `unwired` together define the **dead test** set — surface it explicitly in the report; it is usually the single most actionable output of this playbook.
+
+### 3.6 Ownership and domain
+
+- `owner_team` from `CODEOWNERS` (longest-prefix match), else module owner from the catalog, else `null`. Never guess from commit authors.
+- `component_id` by joining the file path to the catalog output of `identify_component_type` when present.
+- `domain_tags[]` from framework tags only (`@payments`, `@onboarding`). Do not infer domain from filenames with an LLM in the default path.
+
+### 3.7 When (and only when) the LLM is allowed
+
+Default `llm_budget = 0`; the playbook must complete without it. If a budget is granted, the model may be consulted **only** for units where `framework == "unknown"` or `tier == "unclassified"` after all deterministic rules.
+
+Constraints, all mandatory:
+
+- Input is the unit's body (truncated to 200 LOC) plus its import list — nothing else.
+- Output is constrained to the enum plus a confidence in `[0,1]`. Free text is rejected.
+- Confidence `< 0.8` → keep `unclassified`. Do not accept a low-confidence label to make a report look complete.
+- The result **cannot override** any deterministic rule and is recorded as `classified_by: "llm"`, `llm_model`, `llm_confidence`.
+- Results are cached by `sha256(unit_body_normalized)` so a rerun on the same commit reuses the cached label and stays byte-identical (failure mode **F7**).
+
+---
+
+## 4. Execution procedure
+
+### 4.1 Preflight
+
+1. Resolve branch and `source_commit` (§2.2).
+2. Check MongoDB for an existing `test_profile` with the same `(repo_id, source_commit, schema_version)`. If found and `force_refresh` is not set → return the cached profile, `cache_hit: true`. Do not rescan. This is what makes the 50k-repo sweep affordable.
+3. Detect build systems present (Maven, Gradle, npm/pnpm/yarn, Poetry/pip, Go, .NET) — determines which config parsers to run.
+
+### 4.2 Candidate discovery
+
+Include globs (union, then dedupe by canonical path):
+
+```
+**/src/test/**, **/src/it/**, **/src/integrationTest/**, **/src/testFixtures/**
+**/test/**, **/tests/**, **/__tests__/**, **/e2e/**, **/spec/**, **/cypress/**
+**/*[Tt]est.{java,kt,groovy,scala,cs}, **/*IT.java, **/*ITCase.java, **/*Spec.groovy
+**/*.{test,spec}.{js,jsx,ts,tsx,mjs}
+**/test_*.py, **/*_test.py, **/*_test.go, **/*_test.rb
+**/*.feature, **/*.robot, **/*.jmx, **/*postman_collection.json
+```
+
+Hard excludes (always, regardless of `include_generated`):
+
+```
+**/node_modules/**, **/target/**, **/build/**, **/out/**, **/dist/**, **/bin/**
+**/.venv/**, **/venv/**, **/site-packages/**, **/vendor/**, **/.git/**
+**/coverage/**, **/test-results/**, **/playwright-report/**, **/allure-results/**
+**/*.min.js, **/*.map
+```
+
+Excluded when `include_generated == false`:
+
+```
+**/generated/**, **/generated-sources/**, **/generated-test-sources/**, **/__snapshots__/**
+```
+
+**Guardrails:** if candidates exceed `max_candidate_files` (default 20,000), process in canonical-path order, stop at the cap, and set `completeness: "partial"` with `truncated_at`. Never sample randomly — sampling destroys reproducibility.
+
+### 4.3 Extraction
+
+Per candidate file:
+
+1. Determine framework (§3.2). If none and no assertion construct → drop as `not_a_test`, count it in `skipped_files` with a reason.
+2. Extract test units (§3.1) — AST via `graphifyy` where the language is supported; regex fallback with `extraction_mode: "textual"`.
+3. Classify tier, execution profile, health signals per unit.
+4. Compute `test_uid` (§5.4).
+
+Read budget: header + body of matched units. For files > 1 MB, read the first 4,000 lines and mark `truncated_read: true` on affected units.
+
+### 4.4 Wiring resolution
+
+Once per repo, after extraction: parse build and CI configs, resolve include/exclude/tag expressions, and stamp `gating_role` onto each unit (§3.4). Do this as a second pass — resolving per file would re-parse the same configs thousands of times.
+
+### 4.5 Enrichment (optional)
+
+If `report_artifacts` are supplied or discoverable in-repo, join them to units by fully-qualified name (Java), title path (Playwright/Jest), or feature+scenario name (Karate) to populate `runtime_ms`, `last_status`, `flake_rate`. Unmatched report entries go into `orphan_report_entries[]` — they usually indicate deleted tests still running in CI, which is itself a finding.
+
+### 4.6 Persist and report
+
+Upsert both collections (§5.4), then emit the human-facing report (§6.4).
+
+---
+
+## 5. Output contract
+
+### 5.1 `test_inventory` document
+
+```json
+{
+  "schema_version": 1,
+  "test_uid": "sha256:...",
+  "repo_id": "svp-web",
+  "source_commit": "a1b2c3...",
+  "branch": "main",
+  "module": "services/payments",
+  "file_path": "src/test/java/com/x/PaymentIT.java",
+  "unit_name": "shouldRejectExpiredCard",
+  "fq_name": "com.x.PaymentIT#shouldRejectExpiredCard",
+  "example_count": 4,
+
+  "framework": "junit5",
+  "framework_evidence": "L2:import:org.junit.jupiter.api.Test",
+  "framework_candidates": [],
+  "libraries": ["restassured", "testcontainers", "assertj"],
+
+  "tier": "integration",
+  "tier_rule": "JVM-R2:@Testcontainers",
+  "tier_conflicts": ["api:base_url_env"],
+
+  "execution": {
+    "hermetic": false,
+    "env_dependency": ["db:postgres", "http:card-service"],
+    "requires_credentials": false,
+    "parallel_safe": true,
+    "order_dependent": false,
+    "runtime_class": "slow",
+    "runtime_ms": 14200
+  },
+
+  "gating_role": "nightly",
+  "gating_evidence": ["failsafe:**/*IT.java", "gha:nightly.yml:integration-tests"],
+  "tags": ["@payments", "@regression"],
+
+  "health": {
+    "status": "active",
+    "flags": ["hard_sleep", "nondeterministic_input"],
+    "dead_test": false
+  },
+
+  "owner_team": "payments-core",
+  "component_id": "CMP-1042",
+  "extraction_mode": "ast",
+  "classified_by": "rules",
+  "generated_at": "2026-08-12T00:00:00Z"
+}
+```
+
+### 5.2 `test_profile` document (repo rollup)
+
+```json
+{
+  "schema_version": 1,
+  "repo_id": "svp-web",
+  "source_commit": "a1b2c3...",
+  "completeness": "full",
+  "totals": { "files_scanned": 812, "test_units": 3164, "harnesses": 22, "skipped_files": 140 },
+  "by_framework": { "junit5": 2401, "karate": 512, "playwright": 240, "unknown": 11 },
+  "by_tier": { "unit": 1980, "component": 300, "integration": 421, "api": 512, "e2e_ui": 240, "unclassified": 11 },
+  "by_gating": { "pr_blocking": 2010, "nightly": 690, "release_gate": 120, "on_demand": 80, "unwired": 264 },
+  "pyramid": { "base_pct": 62.6, "middle_pct": 23.2, "top_pct": 14.2, "shape": "inverted_middle" },
+  "health": {
+    "dead_tests": 84, "disabled": 61, "no_assertion": 23, "focused": 2,
+    "hard_sleep": 190, "retry_configured": 44, "non_parallel_safe": 128,
+    "hardcoded_env": 57
+  },
+  "quality_score": 68,
+  "quality_breakdown": { "pyramid": 22, "health": 18, "determinism": 16, "wiring": 12 },
+  "top_findings": ["264 unwired tests", "2 focused tests in playwright suite", "..."],
+  "harnesses": [{ "path": "src/test/java/.../KarateRunner.java", "framework": "karate", "selects": "classpath:features" }],
+  "generated_at": "2026-08-12T00:00:00Z"
+}
+```
+
+### 5.3 Quality score (bounded, saturating, explainable)
+
+Score is `0–100`, computed as the sum of four capped components. **Clamp each component to its own max before summing, then clamp the total** — an unbounded component silently saturating the score has bitten this codebase before.
+
+| Component | Max | Computation |
+|---|---|---|
+| Pyramid shape | 30 | Full marks when `unit ≥ 50%` and `e2e_ui ≤ 15%`; linear penalty toward 0 as the top-heavy ratio grows. `unclassified > 10%` caps this component at 15. |
+| Health | 30 | Start at 30, subtract `2 × dead_test_pct`, `1.5 × no_assertion_pct`, `1 × hard_sleep_pct`, `5` per `focused` test. Floor 0. |
+| Determinism | 20 | Start at 20, subtract `1 × retry_configured_pct`, `1 × nondeterministic_input_pct`, `0.5 × non_parallel_safe_pct`. Floor 0. |
+| Wiring | 20 | `20 × (1 − unwired_pct)`. |
+
+Percentages are of total test units, expressed 0–100 and clamped at 100 before weighting. If `test_units == 0`, `quality_score = null` — not `0`. A repo with no tests is a different fact from a repo with terrible tests, and collapsing them corrupts every downstream aggregate.
+
+### 5.4 Identity and idempotency
+
+```
+test_uid = sha256(repo_id + "|" + normalized_path + "|" + framework + "|" + fq_name_or_scenario_name)
+```
+
+- `normalized_path` is POSIX-separated, repo-root-relative, no leading `./`.
+- **`source_commit` is deliberately excluded** from the UID so a unit's identity survives across commits and history is queryable. The Mongo upsert key is `(test_uid, source_commit, schema_version)`.
+- Canonical ordering everywhere: sort inventory by `(module, normalized_path, unit_name)`; sort every map key and array of scalars lexicographically before writing. Byte-identical reruns depend on this.
+- Duplicate `test_uid` within one run → keep the first in canonical order, append the rest to `identity_collisions[]` and raise **F4**. Never silently overwrite.
+
+---
+
+## 6. Failure modes, validation, and reporting
+
+### 6.1 Named failure modes
+
+| ID | Name | Symptom | Guard |
+|---|---|---|---|
+| **F1** | `GHOST_TEST` | File matches a test glob but contains no executable unit; inflates counts | §4.3 step 1 drops with reason |
+| **F2** | `HARNESS_MISCOUNT` | Karate/Cucumber/Suite runners counted as tests; 1 runner ≈ 400 scenarios of error | §3.1 harness rule |
+| **F3** | `TIER_INFLATION` | Everything lands in one tier (usually `unit` by default, or `integration` from a broad `@SpringBootTest` match) | `unclassified` default + `tier_rule` audit |
+| **F4** | `DUPLICATE_IDENTITY` | Same `test_uid` twice — parameterized/outline expansion or same-named methods in inherited classes | Collision list, first-wins |
+| **F5** | `SHADOW_FRAMEWORK` | Assertion library labelled as execution framework (RestAssured "instead of" JUnit) | `framework` vs `libraries[]` split |
+| **F6** | `EXCLUDED_BUT_ACTIVE` | Test excluded from build/CI reported as coverage | `gating_role: unwired` resolution |
+| **F7** | `LLM_DRIFT` | Reruns on the same commit produce different labels | `llm_budget=0` default, body-hash cache, confidence floor |
+| **F8** | `GENERATED_FLOOD` | Generated/vendored suites dominate the distribution | Hard excludes + `generated` flag |
+| **F9** | `PARTIAL_AS_FULL` | Truncated scan reported as a complete inventory | `completeness` field is mandatory on every profile |
+| **F10** | `SECRET_ECHO` | A detected credential-shaped literal is reproduced in the report | Report location + rule ID only, never the value |
+
+### 6.2 Self-validation before persisting
+
+Run these assertions; fail the repo run rather than write a corrupt profile:
+
+1. `sum(by_tier.values()) == totals.test_units` and `sum(by_framework.values()) == totals.test_units`.
+2. `sum(by_gating.values()) == totals.test_units`.
+3. Every unit has non-null `framework`, `tier`, `gating_role`, `test_uid`, `source_commit`.
+4. `0 ≤ quality_score ≤ 100` or `quality_score is null`.
+5. `identity_collisions` empty, or **F4** is raised in the report.
+6. No harness appears in `test_inventory`.
+7. Rerun determinism spot-check (when `verify_determinism` is set): re-extract 20 canonically-first files and assert identical `test_uid` and labels.
+
+### 6.3 Batch mode
+
+- Process repos in canonical `repo_id` order; one repo's failure never aborts the batch.
+- Track state in SQLite (`repo_id, source_commit, status, started_at, finished_at, error`) so the run resumes after interruption without rescanning completed repos.
+- Emit a batch summary: repos succeeded/failed/cached, aggregate distributions, and the failure-reason histogram.
+- Bound concurrency explicitly and stagger repo initialization — simultaneous graph initialization across many repos is a known OOM path.
+
+### 6.4 Report shape
+
+```
+## Test Classification — <repo> @ <short_sha> (<branch>) [completeness: full]
+
+Quality score: 68/100  (pyramid 22/30 · health 18/30 · determinism 16/20 · wiring 12/20)
+
+### Inventory
+| Framework | Units | Tiers |
+| Tier | Units | % | PR-blocking | Nightly | Unwired |
+
+### Top findings
+1. 264 unwired tests (8.3%) — present in repo, selected by no build or CI path.
+2. 2 focused tests (`test.only`) in the Playwright suite — silently disabling siblings on every run.
+3. 190 tests with hard sleeps — <estimated wall clock impact if runtime data available>.
+4. 84 dead tests (disabled + no-assertion + unwired).
+
+### Caveats
+- extraction_mode: textual for <n> files (no code graph available)
+- runtime_class: unknown for <n> units (no report artifacts supplied)
+```
+
+Rules for the write-up: lead with the score and the three findings that would change someone's behaviour; state caveats plainly rather than burying them; never claim a suite is "fast," "healthy," or "passing" — this playbook never ran anything, and every number in it is a static observation.
+
+### 6.5 Pitfalls to avoid
+
+- Expanding `Scenario Outline`/`@ParameterizedTest` into N units — counts become unstable and identity breaks.
+- Defaulting unmatched tests to `unit` because it makes the pyramid look right.
+- Treating presence under `src/test` as proof of execution.
+- Letting an LLM label override a deterministic rule, or accepting a low-confidence label to eliminate `unclassified`.
+- Reporting a truncated or textual-mode scan without saying so.
+- Quoting a detected secret value in the findings.
+- Recomputing a profile that already exists for the same `source_commit` — wasteful at estate scale and the main reason batch sweeps overrun.
