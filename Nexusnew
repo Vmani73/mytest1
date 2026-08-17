@@ -1,0 +1,83 @@
+# Nexus / OCP — Copilot Design Prompt
+
+Paste this into Copilot Chat (Agent mode) in the OCP repo/workspace. Fill placeholder tokens before running.
+
+---
+
+## Role
+
+You are the lead architect implementing **OCP (Orchestration Control Plane)** — the server-side brain of Nexus, an internal developer platform that lets any IDE developer in the organization access specialized Copilot agent capabilities through plain-language requests, with zero local setup beyond one pointer file.
+
+---
+
+## Non-negotiable constraints — do not redesign these, implement against them
+
+1. **Client footprint is exactly two files, forever**: `nexus.md` (instruction pointer, zero capability knowledge) and `.vscode/mcp.json` (one-time MCP registration). No capability catalog, no routing logic, ever ships to a developer's machine.
+2. **All routing and capability information lives at OCP.** The client only knows how to reach OCP.
+3. **Lazy install, first real use only** — including default capabilities (`codegraph`, `synaptiq`). No pre-warming, no bootstrap install. `default: true` affects Discovery routing only, never install timing.
+4. **`SKILL.md` per agent is capped at 200 lines.** This is the adapter contract — do not design around larger files.
+5. **`NEEDS_CLARIFICATION` is a first-class terminal status**, distinct from `BLOCKED`. Ambiguous asks surface a question to the developer; they are never silently guessed.
+6. **No branch pinning beyond what's declared per capability** — resolved commit is logged for audit, never used to lock behavior.
+7. **Two delivery modes per capability**: `inline` (prose-only `skill_payload` in the response body) and `package` (archive of a real skill folder — scripts, hooks, resources — extracted client-side). Do not attempt to force package-type capabilities into inline delivery.
+
+---
+
+## Deliverables
+
+### 1. Registry schema
+Design the structured store replacing `copilot-instructions.md`. One record per capability with at minimum: `capability_id`, `agent`, `repo`, `branch`, `default` (bool), `delivery` (`inline`|`package`), `prerequisites` (array of `{check, install}`), `description` (used by Discovery). Include the current known set as seed data:
+- `synaptiq/oss-remediation`, `synaptiq/sonar-remediation`, `synaptiq/sprint-zero` — repo `<AGENT_REPO_URL>`, branch `<AGENT_BRANCH>`, delivery `package`
+- `codegraph` — default `true`, delivery `<TBD — confirm with existing SKILL.md>`
+- Placeholders for `black-duck-sca`, `avit-classifier` (no repo yet — registry must accept a capability record with `repo: null` in a `planned` state that Discovery never matches against)
+
+### 2. `/resolve` endpoint contract
+```
+POST /resolve
+Request:  { ask: string, workspace_id: string }
+Response: one of
+  { status: "RESOLVED", capability_id, agent, delivery,
+    skill_payload?, package_url?, prerequisites }
+  { status: "NEEDS_CLARIFICATION", question }
+  { status: "BLOCKED", reason }
+```
+Implement the full decision path: install-state cache check → default-flag short-circuit (skip Discovery only) → Discovery call → Hub fetch → install-state write-back → response.
+
+### 3. Discovery
+LLM-based classifier, not embeddings/vector search — catalog size (~14) doesn't justify that infrastructure. Inline the full capability catalog (descriptions only) into a system prompt, cheap/fast model, structured JSON output matching the three-status contract above. **Explicitly design and document the confident-wrong-match failure mode** — produce an eval set of at least 20 realistic developer phrasings per existing capability (including near-boundary phrasings that could plausibly match two capabilities, e.g. sonar vs. general oss remediation) and report classifier accuracy before this is considered production-ready. This is not optional polish — a confident wrong match is worse than `NEEDS_CLARIFICATION` and is currently unvalidated.
+
+### 4. Hub
+- `inline` capabilities: serve `skill_payload` text directly in `/resolve`.
+- `package` capabilities: serve an archive of the skill folder as committed at the pinned repo/branch, unmodified. Endpoint: `GET /packages/{capability_id}` → zip/tarball. Do not repackage or transform the source repo's structure.
+- Define and implement the **re-pull staleness policy** explicitly: does every ask for an already-extracted package capability re-download, or is there a commit-hash check that skips re-download when unchanged? This must be an explicit decision in the implementation, not an accident of whatever's easiest to code first.
+
+### 5. Install-state + audit log
+- Per-workspace record: `capability_id`, `resolved_at`, `source_commit`. Used only to skip Discovery on repeat asks — never used to skip prerequisite verification client-side.
+- Audit log replacing `runs.jsonl`: same fields (resolved commit, matched capability, agent, status, duration), server-side, queryable per workspace.
+
+### 6. `nexus.md` content
+Produce the final instruction file. It must contain the MCP tool-call instruction and nothing else — no examples of capabilities, no catalog, no routing hints.
+
+### 7. `.vscode/mcp.json` skeleton
+Minimal MCP server registration exposing a single `nexus.resolve` tool, pointed at `<OCP_ENDPOINT>`.
+
+### 8. Client-side execution contract (for the Copilot-facing instructions, not OCP itself)
+Document, precisely, what Copilot should do on each response status — including: for `package` delivery, extract to `.github/skills/{capability_id}/`, then **read `SKILL.md` directly with the file-read tool and act on it in the same turn** — do not depend on Copilot's native skill-discovery/reload mechanism, since OCP already performed the matching Discovery normally provides. Also specify: add `.github/skills/` to `.gitignore` as part of this contract, so extracted packages never get committed accidentally.
+
+---
+
+## Explicitly flag, do not silently assume
+
+- Whether extraction + MCP tool-call steps trigger approval prompts by default in VS Code agent mode, and what that does to the "seamless plain-language" pitch. Test this in a real session; report findings, don't assume either way.
+- OCP hosting target is not yet specified — implement against `<OCP_HOST_PLACEHOLDER>` and flag this as an infra decision for `<HOSTING_OWNER>` to confirm, not something to default silently.
+
+---
+
+## Placeholder tokens to fill before running
+
+| Token | Value |
+|---|---|
+| `<AGENT_REPO_URL>` | |
+| `<AGENT_BRANCH>` | |
+| `<OCP_ENDPOINT>` | |
+| `<OCP_HOST_PLACEHOLDER>` | |
+| `<HOSTING_OWNER>` | |
