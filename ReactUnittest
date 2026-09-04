@@ -1,0 +1,806 @@
+---
+name: react-unit-test-engineering
+description: Production-grade unit testing for React UI applications with Vitest/Jest and React Testing Library. Use this whenever the user asks to write, add, generate, review, repair or extend tests for React components, hooks, contexts, reducers or UI utilities; whenever they mention coverage, uncovered lines, flaky tests, duplicate tests, mutation testing, Stryker, or a failing test suite; and whenever they ask to "test this component", "increase coverage", "fix the test suite" or work through a testing backlog across many files. Also use it before writing any new test file in a repo that already has tests, because it enforces the mandatory existing-test inventory, duplicate check, 100% coverage gate and mutation gate.
+user-invocable: true
+---
+
+# React Unit Test Engineering
+
+Write tests that would fail if the code were wrong. Everything below serves that
+one sentence: coverage proves lines ran, mutation proves assertions bite, the
+inventory proves you are not re-testing what is already tested, and the ledger
+proves the work survives a context reset.
+
+## The contract
+
+Not style preferences. Violating any of these makes the output worse than no
+tests, because a green suite that asserts nothing removes the pressure to write
+a real one.
+
+1. **Never invent an API.** Every prop, export, hook return field, DOM role,
+   `data-testid`, module path, script name and fixture must be read from a real
+   file in this repo before it appears in a test. If you cannot find it, stop
+   and ask.
+2. **No placeholders.** No `it.todo`, no `describe.skip`, no `// TODO: assert`,
+   no `expect(true).toBe(true)`, no `expect(x).toBeDefined()` as a test's only
+   assertion, no commented-out cases.
+3. **Verify before you add.** Run the inventory and the existing suite first.
+   You cannot know a behaviour is untested until the tooling says so.
+4. **No duplicates.** Every planned case passes the duplicate check before a
+   line of it is written.
+5. **100% is the floor, mutation score is the target.** Statements, branches,
+   functions and lines at 100%; zero surviving mutants.
+6. **Never weaken a gate to make it pass.** Do not lower a threshold, add a
+   coverage `exclude`, add `/* istanbul ignore */`, delete a failing assertion,
+   or wrap a flaky test in a retry.
+7. **Never edit production source to make a test pass** unless the user agrees
+   the source is the defect. If a test exposes a real bug, report the bug.
+8. **Checkpoint after every file.** Long jobs die mid-way. The ledger is what
+   makes the next session resume instead of restart.
+
+---
+
+## Phase 0 — Bootstrap (always, even mid-conversation)
+
+Read the ledger before anything else. It is the memory that outlives the
+context window.
+
+```bash
+cat .copilot/test-ledger/progress.json 2>/dev/null || echo "no ledger yet"
+cat .copilot/test-ledger/conventions.md 2>/dev/null
+```
+
+If it exists, resume from `progress.json` — do not re-derive the plan, do not
+re-scan targets marked `done`. If it does not exist, create it (schema in
+**Memory protocol** below) and continue.
+
+## Phase 1 — Discover the stack, do not assume it
+
+Assumptions here are the largest single source of broken generated tests. Read,
+never guess:
+
+```bash
+cat package.json
+ls vitest.config.* vite.config.* jest.config.* 2>/dev/null
+cat tsconfig.json 2>/dev/null
+ls src/**/setupTests.* src/**/test-setup.* vitest.setup.* jest.setup.* 2>/dev/null
+```
+
+Record in `conventions.md`: runner and exact version; React version; the
+installed `@testing-library/react` and `user-event` majors (`userEvent.setup()`
+is v14+, older code uses the direct API — match what is installed); test file
+location convention taken from the majority of existing files; coverage
+provider and thresholds; path aliases; whether MSW, `jest-axe` and
+`@testing-library/jest-dom` are already present.
+
+Match existing conventions even where you would have chosen differently. A test
+file that looks foreign to the repo will not be maintained.
+
+## Phase 2 — Inventory and baseline
+
+List every test that already exists, with file and line. This is the only
+sanctioned answer to "does a test for X exist?" — never answer it from memory.
+
+```bash
+mkdir -p .copilot/test-ledger
+grep -rnoE "^[[:space:]]*(it|test|describe)(\.[a-zA-Z]+)?(\([^)]*\))?\(\s*['\"\`][^'\"\`]+" \
+  src --include='*.test.*' --include='*.spec.*' \
+  | tee .copilot/test-ledger/inventory.txt
+```
+
+The `^[[:space:]]*` anchor is deliberate: it skips `it(` inside comments and
+string literals, which is where naive greps go wrong. For the target module,
+also read its existing test file **in full** — the grep gives you titles, not
+what they assert.
+
+Find modules with no test at all:
+
+```bash
+find src -type f \( -name '*.tsx' -o -name '*.ts' \) \
+  ! -name '*.test.*' ! -name '*.spec.*' ! -name '*.d.ts' ! -name '*.stories.*' \
+| while read -r f; do
+    base=$(basename "$f"); base="${base%.*}"
+    grep -rqE "from ['\"][^'\"]*/${base}['\"]|from ['\"]\./${base}['\"]" \
+      src --include='*.test.*' --include='*.spec.*' || echo "NO TEST: $f"
+  done
+```
+
+Then establish the baseline — you must know which failures you inherited:
+
+```bash
+npx vitest run --coverage 2>&1 | tail -40
+```
+
+Record total tests, failures and coverage in the ledger. **Pre-existing failures
+are reported to the user, not silently fixed and not silently ignored.**
+
+Two findings always get raised immediately:
+
+- any `.only` — it silently disables the rest of that file's suite
+- any `.skip` / `.todo` — each is an uncovered behaviour in disguise
+
+```bash
+grep -rnE "\b(describe|it|test)\.(only|skip|todo)\(|\bfit\(|\bxit\(" src --include='*.test.*'
+```
+
+## Phase 3 — Plan the behaviour matrix, then prove it is new
+
+Read the target source file completely. Derive cases from what the code actually
+does, in this order:
+
+1. **Contract** — every exported symbol, every prop including defaults and
+   optionals, every branch of every conditional render.
+2. **States** — loading, empty, populated, error, disabled, and each variant of
+   any union-typed prop.
+3. **Interactions** — every handler prop, every form control, keyboard as well
+   as pointer paths.
+4. **Edge and boundary** — empty arrays, zero, negative, very long strings,
+   `null`/`undefined` on optionals, rapid repeated interaction.
+5. **Async** — resolution, rejection, in-flight state, cleanup on unmount, and
+   any race the code permits between two in-flight requests.
+6. **Accessibility** — role and accessible name for anything interactive. The
+   query you use is itself the assertion.
+
+### The duplicate gate
+
+Duplicates are rarely byte-identical; they are the same behaviour reworded. So
+compare normalised behaviour tokens, not strings. Write this once per repo:
+
+```bash
+cat > .copilot/test-ledger/dupcheck.mjs <<'EOF'
+// Existing titles on stdin, planned titles as argv. Exit 2 = duplicate found.
+import { readFileSync } from 'node:fs';
+const STOP = new Set(['a','an','and','as','at','be','by','component','correctly','for','given','in','is','it','of','on','or','properly','should','successfully','test','that','the','then','this','to','when','with','without']);
+const SYN = { renders:'render', rendered:'render', displays:'render', display:'render', shows:'render', clicks:'click', clicked:'click', presses:'click', calls:'call', called:'call', invokes:'call', fires:'call', triggers:'call', errors:'error', fails:'error', throws:'error', updates:'update', changes:'update', submits:'submit', validates:'validate', validation:'validate', props:'prop', buttons:'button', inputs:'input', fields:'input', items:'item', rows:'row', lists:'list' };
+const tok = s => [...new Set(String(s).toLowerCase().replace(/%[sdifjop#%]/g,' ').replace(/[^a-z0-9]+/g,' ').split(' ').filter(w => w.length > 1 && !STOP.has(w)).map(w => SYN[w] || w))].sort();
+const jac = (a, b) => { const B = new Set(b); const i = a.filter(x => B.has(x)).length; const u = new Set([...a, ...b]).size; return u ? i / u : 0; };
+const existing = readFileSync(0, 'utf8').split('\n').map(l => l.replace(/^.*?[`'"]/, '').trim()).filter(Boolean);
+const planned = process.argv.slice(2);
+let dup = 0;
+for (const p of planned) for (const e of existing) { const s = jac(tok(p), tok(e)); if (s >= 0.8) { console.error(`DUPLICATE ${s.toFixed(2)}: "${p}"  <->  "${e}"`); dup++; } }
+console.log(dup ? `${dup} duplicate(s) — do not write these.` : `${planned.length} planned case(s): no duplicates.`);
+process.exit(dup ? 2 : 0);
+EOF
+```
+
+Run it against the existing titles for the module you are about to test:
+
+```bash
+grep -rhoE "^[[:space:]]*(it|test)(\.[a-zA-Z]+)?(\([^)]*\))?\(\s*['\"\`][^'\"\`]+" \
+  src/components --include='*.test.*' \
+  | node .copilot/test-ledger/dupcheck.mjs \
+      "renders the display name from props" \
+      "falls back to initials when there is no avatar" \
+      "passes the user id to onSelect when activated"
+```
+
+Exit 2 means a duplicate — for example, "should render the label correctly"
+scores 1.00 against an existing "renders the label". Remove the case, or, if the
+behaviour truly differs, sharpen the title so it names the difference and note
+in the ledger why it is not a duplicate. Never raise the 0.8 threshold to get
+past it. Re-run the same command against the finished file after writing, to
+catch duplicates you introduced inside the new file.
+
+## Phase 4 — Write the tests
+
+Patterns are in **Testing patterns** below. The rules that decide whether a test
+is worth having:
+
+- **Assert on user-visible output**, not implementation. Query by role and
+  accessible name; `getByTestId` is a last resort and needs a one-line comment
+  saying why the accessible query was impossible.
+- **One behaviour per test**, and the title states the behaviour: "shows a
+  validation message when email is empty", not "test email logic".
+- **Assert the specific value.** `toHaveBeenCalledWith({ id: 7, name: 'Ada' })`,
+  never a bare `toHaveBeenCalled()`. Weak assertions are what mutants live on.
+- **`await userEvent.setup()`** per test. Use `fireEvent` only for synthetic
+  events a user cannot perform (`scroll`, `resize`, file-input `change`).
+- **`findBy*` for async appearance**, `waitFor` only for non-DOM assertions.
+  Never a bare `setTimeout`, never a fixed sleep.
+- **Mock at the boundary** — the network (MSW), the clock, modules you do not
+  own. Do not mock the component's own children unless they are genuinely
+  external or prohibitively heavy, and say so in a comment.
+- **Deterministic** — fake timers restored in `afterEach`, no shared mutable
+  fixtures, no reliance on test order.
+
+Then run only that file, and make it pass without touching production code:
+
+```bash
+npx vitest run src/components/UserCard.test.tsx
+```
+
+## Phase 5 — Coverage to 100%
+
+```bash
+npx vitest run --coverage
+```
+
+Read the gap, not the percentage. Three kinds of gap need three responses:
+
+- **uncovered lines** — a path no test walks. Write the test that walks it.
+- **uncovered functions** — usually a callback never invoked: an `onError`, a
+  cleanup return, a memo comparator. Trigger it.
+- **uncovered branches** — one side of a ternary, `&&`, default argument or
+  `if`. Render the case that takes the other side.
+
+Also check what the summary table cannot show you:
+
+```bash
+# Coverage bought with ignore comments rather than tests:
+grep -rnE "(istanbul|c8|v8)\s+ignore" src
+# Source files the run never instrumented — these only appear with coverage.all: true:
+node -e "const c=require('./coverage/coverage-final.json');console.log(Object.keys(c).length+' files instrumented')"
+```
+
+If a line is genuinely unreachable, delete the dead code — that is the fix, not
+an exclusion. If the user confirms it must stay, record it in
+`.copilot/test-ledger/coverage-exclusions.json` with `file`, `justification`,
+`owner` and `expires`. An exclusion is a dated promise, not a permanent hole.
+
+## Phase 6 — Mutation hunt
+
+Coverage says the line ran. Mutation says the assertion noticed. Run narrow
+while iterating on one module, full before declaring done:
+
+```bash
+npx stryker run --mutate "src/components/UserCard.tsx"
+npx stryker run
+```
+
+For each survivor, strengthen an existing assertion so the mutant dies. A new
+test walking the same path with the same weak assertion does not kill it and
+does add a duplicate. The recurring causes:
+
+| Survivor | What it means |
+| --- | --- |
+| `NoCoverage` (any mutator) | no test reaches this line — highest priority |
+| `BooleanLiteral` on a default prop | you only ever rendered with the default |
+| `ConditionalExpression` → `false` | the else branch renders something unasserted |
+| `StringLiteral` → `""` | you asserted an element exists, not its text |
+| `EqualityOperator` `<` → `<=` | no boundary test; add the exact-boundary case |
+| `ArrowFunction` → `() => undefined` | you asserted a callback ran, not what it returned or passed |
+| `ObjectLiteral` → `{}` | you asserted a payload was sent, not its contents |
+| `MethodExpression` (`filter` → identity) | you asserted the list rendered, not that it was filtered |
+| `BlockStatement` emptied | the side effect inside is unasserted |
+
+Some mutants are genuinely equivalent — a `<` to `<=` on a value that can never
+sit on the boundary. Mark those, with a real reason:
+
+```ts
+// Stryker disable next-line OptionalChaining: props.items is required and
+// non-null per ButtonGroupProps; the guard is defensive only.
+const count = props.items?.length ?? 0;
+```
+
+Two equivalent mutants in one file usually means the code has an unreachable
+path that should be deleted instead.
+
+## Phase 7 — Checkpoint and hand off
+
+After **every** file reaches green on all three gates, update `progress.json`
+before moving on. This is what makes a 200-file job survivable. Append anything
+learned to `conventions.md` — a mocking pattern that worked, a provider wrapper
+the repo needs, a component needing a `ResizeObserver` polyfill.
+
+Report briefly: files completed, tests added, coverage, mutation score, and any
+gate you could not meet with the reason.
+
+---
+
+## Memory protocol
+
+Everything needed to resume lives on disk in `.copilot/test-ledger/`, never in
+the conversation.
+
+```json
+{
+  "schema": "react-unit-test-engineering/progress@1",
+  "updatedAt": "2026-09-04T11:42:00.000Z",
+  "runner": "vitest",
+  "baseline": { "tests": 412, "failing": 3, "statements": 71.4, "branches": 58.2 },
+  "gates": { "coverage": 100, "mutationScore": 100, "maxSurvivors": 0 },
+  "pending": [
+    { "target": "src/components/UserCard.tsx", "reason": "no importing test" }
+  ],
+  "inProgress": {
+    "target": "src/components/DataTable.tsx",
+    "phase": "mutation",
+    "note": "3 survivors on the sort comparator, lines 88-96"
+  },
+  "done": [
+    {
+      "target": "src/components/Button.tsx",
+      "testFile": "src/components/Button.test.tsx",
+      "casesAdded": 11,
+      "coverage": { "statements": 100, "branches": 100, "functions": 100 },
+      "mutationScore": 100
+    }
+  ],
+  "blocked": [
+    {
+      "target": "src/legacy/ChartCanvas.tsx",
+      "reason": "requires a real canvas context; needs a user decision on jsdom-canvas"
+    }
+  ],
+  "inheritedFailures": ["src/hooks/useSession.test.ts > refreshes the token before expiry"]
+}
+```
+
+Rules:
+
+- `inProgress` holds **at most one** target. Two means an earlier run died
+  without checkpointing — verify that target's real state with the tools before
+  trusting the note.
+- Nothing moves to `done` until every gate passed in a command you actually ran
+  this session.
+- `blocked` is not failure. It is the right destination for anything needing a
+  human decision, and it is what you report at the end.
+- `inheritedFailures` is written once, at baseline, and never edited to make
+  progress look better.
+
+`conventions.md` is append-only prose — every fact about *this* repo that cost a
+tool call to learn, so future sessions do not pay again:
+
+```markdown
+# Repo testing conventions
+- Runner: Vitest 3.2.4, environment jsdom, setup file `src/test-setup.ts`.
+- RTL 16.x with user-event 14.x — always `const user = userEvent.setup()`.
+- Tests co-located: `Component.tsx` + `Component.test.tsx`.
+- Components under `src/features/**` need `renderWithProviders` from `src/test-utils/render.tsx`.
+- MSW handlers in `src/mocks/handlers.ts`; server starts in the setup file.
+- `IntersectionObserver` is not in jsdom; polyfilled in `src/test-setup.ts`.
+- Path alias `@/` -> `src/`, declared in both tsconfig and vite.config.ts.
+```
+
+**Context budgeting.** The failure mode on a large job is loading too much and
+losing the thread:
+
+- One module at a time. Read the target and its existing test file. Do not read
+  sibling components "for context" — the inventory already says what exists.
+- Prefer tool output to file contents. Four lines of coverage gap beat the HTML
+  report.
+- Truncate loops: after three coverage/mutation iterations on one module,
+  checkpoint, move it to `blocked` with the specific obstacle, and continue.
+- After finishing a module, the only things surviving into the next are its
+  `done` entry and any new line in `conventions.md`.
+
+**Resume procedure.** Read `progress.json` and `conventions.md` — nothing else
+yet. Re-run the inventory grep; the working tree may have moved. If `inProgress`
+is set, verify its real state before trusting the note. Continue from the first
+failing gate — never restart a module from Phase 3 if its tests already exist,
+because that is how duplicates get created. If git HEAD contradicts the ledger
+(test files vanished, targets renamed), say so and re-plan.
+
+---
+
+## Network timeouts and retries
+
+**Retry the network. Never retry a test.** A transient network failure is noise;
+a failing test is information. Retrying the second converts a reproducible
+defect into an intermittent one.
+
+Wrap every network-touching command:
+
+```bash
+retry() {  # retry <attempts> <timeout-seconds> -- <command...>
+  local attempts=$1 timeout_s=$2; shift 3
+  local n=1 delay=2 code=0
+  until timeout --signal=TERM --kill-after=10s "${timeout_s}s" "$@"; do
+    code=$?
+    if [ $n -ge "$attempts" ]; then
+      echo "retry: exhausted $attempts attempts (last exit $code)" >&2; return $code
+    fi
+    # 124 = timed out; 7/128/137/143 = unavailable or killed. Anything else is
+    # a real failure and must not be retried.
+    case $code in
+      124|7|128|137|143) ;;
+      *) echo "retry: exit $code is a REAL failure, not retrying" >&2; return $code ;;
+    esac
+    echo "retry: transient failure (exit $code), attempt $n/$attempts, backing off ${delay}s" >&2
+    sleep $delay; delay=$((delay * 2)); n=$((n + 1))
+  done
+}
+
+# Make npm resilient before the wrapper ever has to retry the whole command.
+export npm_config_fetch_retries=5
+export npm_config_fetch_retry_maxtimeout=120000
+export npm_config_fetch_timeout=300000
+
+retry 4 600 -- npm ci
+retry 3 2400 -- npx stryker run
+```
+
+Budgets: `npm ci` 10 min × 4; full `vitest run` 15 min × 2; a single test file
+2 min × 1 (no network in it, so any failure is real); full `stryker run` 40 min
+× 3.
+
+Behind a corporate proxy, verify the environment before blaming the tooling —
+`npm config get registry proxy https-proxy strict-ssl` and
+`echo "$HTTP_PROXY $HTTPS_PROXY $NO_PROXY"`. Never disable `strict-ssl`, never
+switch registries, never hardcode a proxy. If the registry is unreachable,
+report it and stop.
+
+**Flakes have five causes, all fixable:** an unawaited state update (the
+`act(...)` warning — `await` the user-event call or use `findBy*`); real timers
+(fake them, wiring `advanceTimers` into `userEvent.setup()`); a shared mutable
+fixture (build fixtures inside the test); an unmocked request (set MSW's
+`onUnhandledRequest: 'error'`); order dependence (reproduce with
+`npx vitest run --sequence.shuffle`, then fix the leaked global). Forbidden
+"fixes": `retry: 2` in config, a longer `waitFor` timeout, an added sleep,
+`it.skip`.
+
+---
+
+## Evidence rules
+
+A test asserting an invented API fails loudly, which is annoying. A test
+asserting invented *behaviour* that happens to pass is far worse: it freezes a
+guess into the suite and maintainers will defend it.
+
+Before writing any of these, read the evidence: a prop name/type/default (the
+props interface); an exported symbol (the `export` statement); a hook's return
+shape (its `return`); a DOM role or accessible name (the JSX plus the ARIA
+mapping); a `data-testid` (the literal string in the JSX); text content (the JSX
+or the i18n resource); an import alias (`tsconfig.json` / `vite.config.ts`
+`paths`); a test utility (the file exporting it); an npm script (`package.json`);
+a library API such as `userEvent.setup` (the installed major version).
+
+If the evidence does not exist, one of three things is true: you misremembered
+the library API (check the installed version); the repo genuinely lacks the
+helper (create it explicitly as its own file and say you did); or the intended
+behaviour is ambiguous (ask, naming the line and the two readings you are
+choosing between).
+
+**Never:** `it.todo`, `it.skip`, `xit`, empty test bodies,
+`expect(true).toBe(true)`, `toBeDefined()` as a sole assertion, `// TODO`
+stand-ins, a `describe` with no `it`, assertions on internal state or component
+names, large `toMatchSnapshot()` blobs as the primary assertion, `any` casts to
+force a type through, or a test copied from another repo or from memory.
+
+**Self-check before writing a file:** Can I point at the source line for every
+prop, role and string I used? Would each assertion fail if I changed the
+corresponding line of the source? Does each test name describe a behaviour a
+user or caller could observe? Have I imported anything that does not exist on
+disk? Is there any expected value I inferred rather than read? The second
+question is the important one — an assertion that survives the source being
+wrong is a mutant survivor you can save yourself a round trip on.
+
+---
+
+## Testing patterns
+
+Targets Vitest 3.x, RTL 16.x, user-event 14.x, MSW 2.x. **Check the installed
+versions and adapt** — for Jest, replace `vi` with `jest`; everything else holds.
+
+**Query priority.** Use the first that works and stop:
+`getByRole(role, { name })` → `getByLabelText` → `getByPlaceholderText` /
+`getByText` / `getByDisplayValue` → `getByTestId` (last resort, with a comment).
+`getBy*` throws when absent; `queryBy*` returns null (only for
+`not.toBeInTheDocument()`); `findBy*` returns a promise.
+
+### Providers
+
+```tsx
+// src/test-utils/render.tsx
+import { render, type RenderOptions } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
+import type { ReactElement, ReactNode } from 'react';
+
+export function renderWithProviders(
+  ui: ReactElement,
+  { route = '/', ...options }: RenderOptions & { route?: string } = {},
+) {
+  // Fresh client per test: a shared cache leaks state between tests.
+  // retry:false matters — the default turns one rejected request into a
+  // multi-second test that then times out for the wrong reason.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[route]}>{children}</MemoryRouter>
+      </QueryClientProvider>
+    );
+  }
+
+  return { queryClient, ...render(ui, { wrapper: Wrapper, ...options }) };
+}
+```
+
+### A component test
+
+```tsx
+import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { renderWithProviders } from '@/test-utils/render';
+import { UserCard } from './UserCard';
+
+const user = { id: 7, displayName: 'Ada Lovelace', avatarUrl: null };
+
+describe('UserCard', () => {
+  it('renders the display name as a heading', () => {
+    renderWithProviders(<UserCard user={user} onSelect={vi.fn()} />);
+    expect(screen.getByRole('heading', { name: 'Ada Lovelace' })).toBeInTheDocument();
+  });
+
+  it('falls back to initials when there is no avatar', () => {
+    renderWithProviders(<UserCard user={user} onSelect={vi.fn()} />);
+    expect(screen.getByText('AL')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  });
+
+  it('passes the user id to onSelect when the card is activated', async () => {
+    const interact = userEvent.setup();
+    const onSelect = vi.fn();
+    renderWithProviders(<UserCard user={user} onSelect={onSelect} />);
+
+    await interact.click(screen.getByRole('button', { name: /ada lovelace/i }));
+
+    // The exact argument is the point. toHaveBeenCalled() lets a mutant live.
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onSelect).toHaveBeenCalledWith(7);
+  });
+
+  it('activates on Enter as well as click', async () => {
+    const interact = userEvent.setup();
+    const onSelect = vi.fn();
+    renderWithProviders(<UserCard user={user} onSelect={onSelect} />);
+
+    await interact.tab();
+    await interact.keyboard('{Enter}');
+
+    expect(onSelect).toHaveBeenCalledWith(7);
+  });
+});
+```
+
+### Hooks
+
+```tsx
+import { renderHook, act } from '@testing-library/react';
+import { useCounter } from './useCounter';
+
+it('clamps the value at the configured maximum', () => {
+  const { result } = renderHook(() => useCounter({ max: 2 }));
+  act(() => { result.current.increment(); });
+  act(() => { result.current.increment(); });
+  act(() => { result.current.increment(); });
+  expect(result.current.count).toBe(2);
+});
+```
+
+Every state update goes inside `act`. For async hooks, prefer `waitFor` on the
+observable result over `act` around the promise.
+
+### Async and network (MSW 2)
+
+Mock the network, not your own modules. A `vi.mock` of the data layer asserts
+you called your own function; MSW asserts the component behaves correctly given
+a real response shape.
+
+```tsx
+import { http, HttpResponse, delay } from 'msw';
+import { setupServer } from 'msw/node';
+
+const server = setupServer(
+  http.get('/api/users/:id', () =>
+    HttpResponse.json({ id: 7, displayName: 'Ada Lovelace' })),
+);
+
+// A request you forgot to mock should fail the test, not silently hang.
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+it('shows the error state when the request fails', async () => {
+  server.use(http.get('/api/users/:id', () => new HttpResponse(null, { status: 500 })));
+
+  renderWithProviders(<UserProfile userId={7} />);
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('Could not load this profile');
+  expect(screen.queryByRole('status', { name: /loading/i })).not.toBeInTheDocument();
+});
+
+it('shows the loading state while the request is in flight', async () => {
+  server.use(http.get('/api/users/:id', async () => {
+    await delay(50);
+    return HttpResponse.json({ id: 7, displayName: 'Ada Lovelace' });
+  }));
+
+  renderWithProviders(<UserProfile userId={7} />);
+
+  expect(screen.getByRole('status', { name: /loading/i })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: 'Ada Lovelace' })).toBeInTheDocument();
+});
+```
+
+### Timers
+
+```tsx
+beforeEach(() => { vi.useFakeTimers(); });
+afterEach(() => { vi.useRealTimers(); });
+
+it('debounces the search callback to one call per 300ms', async () => {
+  // user-event must share the fake clock or every interaction hangs.
+  const interact = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  const onSearch = vi.fn();
+  render(<SearchBox onSearch={onSearch} delayMs={300} />);
+
+  await interact.type(screen.getByRole('searchbox'), 'ada');
+  expect(onSearch).not.toHaveBeenCalled();
+
+  await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+  expect(onSearch).toHaveBeenCalledTimes(1);
+  expect(onSearch).toHaveBeenCalledWith('ada');
+});
+```
+
+Always restore real timers in `afterEach`; a leaked fake clock breaks every
+later file in unpredictable ways.
+
+### Forms
+
+```tsx
+it('blocks submission and names the invalid field when the email is malformed', async () => {
+  const interact = userEvent.setup();
+  const onSubmit = vi.fn();
+  render(<SignupForm onSubmit={onSubmit} />);
+
+  await interact.type(screen.getByLabelText('Email'), 'not-an-email');
+  await interact.click(screen.getByRole('button', { name: 'Create account' }));
+
+  expect(await screen.findByText('Enter a valid email address')).toBeInTheDocument();
+  expect(screen.getByLabelText('Email')).toHaveAccessibleDescription('Enter a valid email address');
+  expect(onSubmit).not.toHaveBeenCalled();
+});
+```
+
+### Error boundaries
+
+```tsx
+it('renders the fallback when a child throws', () => {
+  // Silence React's caught-error log for this test only, so a real
+  // unexpected error elsewhere still surfaces.
+  const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const Boom = () => { throw new Error('kaboom'); };
+
+  render(<ErrorBoundary fallback={<p role="alert">Something went wrong</p>}><Boom /></ErrorBoundary>);
+
+  expect(screen.getByRole('alert')).toHaveTextContent('Something went wrong');
+  spy.mockRestore();
+});
+```
+
+### jsdom gaps
+
+jsdom has no layout and no observers. Polyfill in the setup file, never per
+test: `IntersectionObserver` and `ResizeObserver` (stub classes with
+observe/unobserve/disconnect), `window.matchMedia` (returns `matches: false`
+plus the listener methods), `Element.prototype.scrollIntoView` (`vi.fn()`).
+Anything relying on real measurement — virtualised lists, drag-and-drop
+positioning — belongs in an e2e test; say so rather than writing a unit test
+that asserts jsdom's zeroes.
+
+---
+
+## Configuration
+
+`vitest.config.ts` — do not lower these thresholds and do not widen `exclude`
+to make a run pass:
+
+```ts
+test: {
+  environment: 'jsdom',
+  globals: true,
+  setupFiles: ['./src/test-setup.ts'],
+  pool: 'forks',        // true isolation; threads leak module state more often
+  restoreMocks: true,   // spies restored between tests
+  clearMocks: true,     // call history cleared between tests
+  unstubEnvs: true,
+  unstubGlobals: true,
+  testTimeout: 10_000,
+  hookTimeout: 10_000,
+  retry: 0,             // a failing test must never be papered over
+  coverage: {
+    provider: 'v8',
+    reporter: ['text', 'json', 'html', 'lcov'],
+    all: true,          // files with zero tests must still appear in the report
+    include: ['src/**/*.{ts,tsx}'],
+    exclude: [
+      'src/**/*.d.ts',
+      'src/**/*.{test,spec}.{ts,tsx}',
+      'src/**/*.stories.{ts,tsx}',
+      'src/test-utils/**',
+      'src/mocks/**',
+      'src/test-setup.ts',
+      'src/main.tsx',
+    ],
+    thresholds: { statements: 100, branches: 100, functions: 100, lines: 100 },
+  },
+}
+```
+
+`all: true` is the one people forget: without it, a component with no test file
+is simply absent from the report and the percentage looks healthy. The `exclude`
+list above is the maximum defensible one — type declarations, stories, the tests
+themselves, test infrastructure, and the entry point that only calls
+`createRoot`. Excluding a component to reach 100% is the failure this whole
+skill exists to prevent.
+
+`stryker.conf.json`:
+
+```json
+{
+  "packageManager": "npm",
+  "testRunner": "vitest",
+  "coverageAnalysis": "perTest",
+  "mutate": [
+    "src/**/*.{ts,tsx}",
+    "!src/**/*.{test,spec}.{ts,tsx}",
+    "!src/**/*.stories.{ts,tsx}",
+    "!src/test-utils/**",
+    "!src/mocks/**",
+    "!src/main.tsx"
+  ],
+  "reporters": ["html", "json", "progress", "clear-text"],
+  "thresholds": { "high": 100, "low": 95, "break": 100 },
+  "timeoutMS": 20000,
+  "concurrency": 4,
+  "disableTypeChecks": "src/**/*.{ts,tsx}",
+  "ignoreStatic": false,
+  "incremental": true
+}
+```
+
+`coverageAnalysis: "perTest"` is what makes a full run finish in minutes rather
+than hours: Stryker runs only the tests that actually cover each mutant.
+`ignoreStatic: false` keeps module-level constants and default prop objects in
+scope — slower, but that is exactly where a wrong default silently ships. If
+full runs become unworkable, set it to `true` and record that decision in
+`conventions.md` so the next session knows the score is no longer full-strength.
+
+CI runs the gates in order and fails on any of them — never `continue-on-error`.
+Scope the mutation run to changed files on pull requests and run it unscoped
+nightly on main:
+
+```bash
+CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD \
+  | grep -E '^src/.*\.tsx?$' | grep -vE '\.(test|spec)\.' | paste -sd, -)
+[ -n "$CHANGED" ] && npx stryker run --mutate "$CHANGED"
+```
+
+Always upload `coverage/`, `reports/` and `.copilot/test-ledger/` as artifacts
+so a red build is diagnosable without a re-run.
+
+---
+
+## When something fails
+
+- **Network / install failure** → wrap in `retry`, which retries transient exits
+  only. If attempts are exhausted, report and stop; do not switch package
+  manager or registry on your own.
+- **A test you wrote fails** → the test is wrong until proven otherwise. Read
+  the source again. Only after re-reading may you suggest the source is buggy.
+- **A test is flaky** → find the cause from the five above. Never add a retry,
+  never raise a timeout to hide it, never skip it.
+- **You cannot determine intended behaviour** → ask. A guessed assertion that
+  happens to pass is worse than no test.
+- **Context is running short** → checkpoint the ledger immediately, then say
+  exactly where you stopped.
+
+## Definition of done
+
+A module is done when all of these hold, verified by command output you actually
+saw this session — not assumed:
+
+- [ ] the inventory grep shows the module has tests, and no `.only` / `.skip`
+- [ ] the duplicate check exits 0 for every case in the file
+- [ ] the full suite passes with no new failures against the baseline
+- [ ] coverage is 100% on statements, branches, functions and lines, with no
+      unapproved ignore comments and no uninstrumented source files
+- [ ] `stryker run` reports zero surviving mutants
+- [ ] no production source changed, or the change was agreed as a bug fix
+- [ ] `progress.json` and `conventions.md` updated
