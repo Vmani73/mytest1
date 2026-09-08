@@ -1,0 +1,449 @@
+# SKILL.md — lean_codescan (v1.1)
+
+## Metadata
+```yaml
+playbook_id: lean_codescan
+version: 1.1.0
+aliases: [lean_generation, yagni-scan, bloat-scan, ponytail-equivalent]
+classification: CodemindIDE / Discovery-Agent / Scan-Service
+taxonomy: ACS Component Taxonomy (auto-resolved via identify_component_type)
+terminology: YAGNI ladder / CCC / TABR
+determinism: strict for finding emission
+  - identical repo state at commit SHA X must yield identical findings_hash
+  - LLM may summarize findings; LLM never decides pass/fail
+idempotent: true
+mongo_writes: mandatory (one lean_scan_record per repo@sha)
+execution_modes:
+  - single_repo            # POST /api/v1/orchestrator/run
+  - batch_50k              # codemind_batch.py --playbooks lean_codescan
+  - ci_webhook             # push / PR against a registered repo
+  - incremental_pr         # scan the PR diff only, reuse graph at base SHA
+optional_consumers:
+  - patch_generator        # if CodeMind also emits a patch, it must read this record first
+kosh_hook: none required
+estimated_runtime: 20s-3min per repo (reuses graphifyy / codegraph.json; no second full index)
+```
+
+## Purpose
+
+Ponytail made coding agents write less. CodeMind is a **service**: it already ingests repos, builds a graph, and runs codescan playbooks through the orchestrator. This playbook is the missing scan family — **over-engineering / YAGNI / reinvented-platform / unused-flexibility** — produced as first-class scan findings next to security, deps, and health.
+
+It does **not** install Ponytail.
+It does **not** target Copilot, Cursor, or any IDE plugin.
+It does **not** replace `repo_health_audit`, Sonar, AgentGuard, or the dependency-intelligence suite.
+
+It adds one scan dimension those playbooks explicitly leave out: complexity that is correct but should not exist.
+
+## Why a scan service, not a prompt
+
+| Layer | Already in CodeMind | This playbook uses it for |
+|---|---|---|
+| `POST /api/v1/orchestrator/run` | job create | `playbook_names: ["lean_codescan"]` |
+| `GET /api/v1/orchestrator/runs/{id}` | poll | same contract as every other scan |
+| `codemind_batch.py` | 50k estate | `--playbooks lean_codescan` or compose with `repo_health_audit` |
+| graphifyy / `codegraph.json` | AST + call + package graph | reuse, orphan, wrapper, one-impl interface |
+| Catalog + ownership | metadata | who owns the bloat |
+| `repo_health_audit` Stage 2-3 | lockfile, dead code, churn | do not recompute; join |
+| Mongo + Discovery UI | one document shape | `lean_scan_record` |
+| CI / webhooks | existing pipeline | PR comment + optional quality gate |
+
+Ponytail's ladder is the *rule pack*. CodeMind's orchestrator + graph is the *engine*.
+
+## Explicit non-goals
+
+- IDE / Copilot / Claude Code adapters.
+- A second SAST / taint / secret scanner (`repo_health_audit` Stage 4 owns that).
+- Auto-applying deletions on the 50k sweep.
+- LLM-judged findings.
+- Injecting a "be lazy" system prompt into reviewer or search agents.
+
+## API contract (service)
+
+Submit the same way as every other playbook.
+
+```http
+POST /api/v1/orchestrator/run
+{
+  "repo_url": "https://github.com/org/svc-billing",
+  "branch": "main",
+  "playbook_names": ["lean_codescan"],
+  "goal": "scan for over-engineering",
+  "options": {
+    "mode": "full_repo",
+    "intensity": "full",
+    "base_sha": null,
+    "compose_with": ["repo_health_audit"]
+  }
+}
+```
+
+| `options.mode` | What is scanned |
+|---|---|
+| `full_repo` | Whole tree at HEAD. Estate / nightly default. |
+| `incremental_pr` | Files in the PR diff + graph neighborhood depth 2. CI default. |
+| `module` | One package / service path (`options.scope`). |
+
+`compose_with: ["repo_health_audit"]` means: one graphifyy build, two playbooks, two Mongo docs (or one merged `repo_health_record.lean` section — see Stage 6). Prefer compose on batch so the index is not built twice.
+
+Idempotency key (align with `codemind_batch.py`):
+
+```
+sha256(repo_url | branch | playbook_names | goal | commit_sha | mode)
+```
+
+Same SHA + same mode → return cached record. Do not rescan.
+
+---
+
+## Finding taxonomy (the scan output)
+
+Every finding is one row. Tags are closed. Replacement is mandatory except `delete`.
+
+| Tag | Detector (deterministic) | Example |
+|---|---|---|
+| `reuse` | Symbol / function with equivalent signature already in-graph, inbound >= 1, this copy has inbound 0 or 1 | Second `formatMoney` in `ui/utils.ts` |
+| `stdlib` | Hand-rolled helper whose body matches a stdlib / language-pack fingerprint | 20-line deep clone vs `structuredClone` / `copy.deepcopy` |
+| `native` | Dep or component whose only call sites are a platform primitive | `flatpickr` wrapping one date field; `moment` for one `format` |
+| `yagni` | Interface / abstract type with exactly one implementation; factory with one product; config key read in one place with a literal default never overridden | `AbstractRepository` + `JpaRepositoryImpl` only |
+| `wrapper` | File / class whose public methods only delegate (fan-out 1, no extra logic) | `DatePickerService` → `FlatpickrAdapter` → lib |
+| `dead_flex` | Feature flag, extra param, unused generic type parameter with zero runtime readers | `enableExperimentalCache` never read |
+| `newdep` | Direct dependency whose call-site count is <= 2 and a stdlib/native equivalent exists | `qs` next to `URLSearchParams` |
+| `shrink` | Same control flow, shorter form available from a mechanical rewrite table | manual loop → `dict(zip)` / stream collect |
+
+Out of scope (do not emit, route to the owning playbook):
+
+| Signal | Owner |
+|---|---|
+| Taint / injection / authn / crypto / secrets | `repo_health_audit` Stage 4 |
+| CVE / license / EOL | `repo_health_audit` Stage 2 + dependency-intelligence suite |
+| Flaky tests, coverage gaps | `repo_health_audit` Stage 3 |
+| Breaking API contract | `repo_health_audit` Stage 8 |
+| "This might be cleaner if we..." with no graph evidence | discarded |
+
+Confidence:
+- `confirmed` — EXTRACTED graph evidence (counts, lockfile, AST match). Emit.
+- `heuristic` — INFERRED / AMBIGUOUS / regex-only. **Do not emit** as a finding. May appear in `signals_suppressed`.
+
+That is the determinism bar. Same rule as `repo_health_audit`.
+
+---
+
+## Pipeline (sequential, gated)
+
+### Stage 0 — Preflight (service)
+
+1. Resolve `component_type` (ACS) and CCC tier.
+2. Resolve `commit_sha` from the requested branch / PR head.
+3. Cache check: Mongo `lean_scan_record` at this `repo_id + sha + mode`. Hit → return.
+4. Acquire graph. Order:
+   1. `codegraph.json` at this SHA if certified CURRENT (`dependency-intelligence-suite` Part 1 gates).
+   2. Else graphifyy index already built by a composed `repo_health_audit` run.
+   3. Else build graphifyy once under the per-pod concurrency cap. Never through an LLM context window.
+5. Language profile + analyzer adapters — identical table to `repo_health_audit` Stage 0.5. No language-specific playbook rewrite.
+6. If `compose_with` includes `repo_health_audit` and that run is `complete` at this SHA, attach pointers to its `dependency_risk` and `code_health.dead_code_candidates`. Do not rescan manifests.
+
+### Stage 1 — Graph join (deterministic)
+
+Materialize working sets from the graph. Caps: `max_nodes` per query 200; hubs truncated, `truncated: true`.
+
+```
+W_orphans     nodes with inbound 0, type in {function,class,file}, last_modified from git
+W_singletons  interfaces / abstracts with exactly one implements edge
+W_wrappers    classes where every public method has a single calls edge and no branches
+W_deps        package nodes + depends_on_package + call-site count
+W_dupes       same normalized signature hash appearing on >=2 function nodes
+W_flags       config_key / feature-flag nodes with 0 or 1 configured_by readers
+```
+
+If composed with `repo_health_audit`, seed `W_orphans` from Stage 3 dead-code candidates instead of recomputing.
+
+PR mode: intersect every W-set with (diff paths union neighbors depth 2). Estate mode: full W-sets, ranked, top N per tag (`N=50` default) so a 2M-LOC monolith does not emit 8,000 rows.
+
+### Stage 2 — Rule packs (deterministic detectors)
+
+Each detector is a script over the graph + source spans. The orchestrator agent does not read the repo to decide.
+
+**2.1 reuse / dupes**
+Signature hash = normalized name tokens + arity + return-ish shape. Two function nodes, same hash, different files, one has inbound >= 1 → finding on the low-inbound copy. Tag `reuse`.
+
+**2.2 stdlib fingerprints**
+Language pack of AST shapes (clone loops, manual querystring parse, uuid v4 concat, debounce timer, mkdir-p recursion). Match body of small functions (loc <= 40). Tag `stdlib`. Pack lives in `playbooks/lean_codescan/refs/stdlib/<lang>.yaml`. Missing language → skip this detector, do not regex-guess.
+
+**2.3 native / newdep**
+Join `W_deps` to `refs/platform-native.yaml`:
+
+```
+package: flatpickr|react-datepicker|pikaday
+native: "<input type=date>"
+min_calls_to_keep: 3
+```
+
+If call-site count < `min_calls_to_keep` and no i18n/a11y usage markers in those files → `native` or `newdep`.
+
+**2.4 yagni**
+`W_singletons` + factories with one `instantiates` target + config keys with a single literal reader. Tag `yagni`.
+
+**2.5 wrapper**
+`W_wrappers`. Tag `wrapper`. Replacement = the callee.
+
+**2.6 dead_flex**
+`W_flags` and unused type parameters. Cross-check git churn: added > 180 days ago + zero readers → `confirmed`. Added < 14 days → suppress (in-progress).
+
+**2.7 shrink**
+Tiny mechanical table only (map/filter/zip, early-return vs flag). If the rewrite cannot be expressed as a template, skip. No LLM golfing.
+
+### Stage 3 — Safety join (do not recommend a cut that is load-bearing)
+
+Before emission, drop a finding if any hold:
+
+1. The node sits on a `repo_health_audit` Stage 4 taint path as a sanitizer / validator.
+2. The node is the only authz / ownership check on an endpoint.
+3. The suggested replacement removes a boundary check (path join, SQL concat, deserializer).
+4. CCC-1 AND tag is `shrink` with no EXTRACTED equivalent — too weak for a critical service.
+
+These go to `signals_suppressed`, not `findings`. This is how the service keeps Ponytail's "never cut safety" without becoming SAST.
+
+### Stage 4 — Score and bucket
+
+```
+cut_loc_estimate    = loc(node) - loc(replacement template)   # 0 for delete
+cut_dep_estimate    = 1 if tag in {native, newdep} else 0
+tabr_bucket         = by CCC tier + cut size
+                    CCC-1 delete of a wrapper → next_sprint
+                    CCC-4 unused flag         → next_quarter
+                    newdep with native equiv  → next_sprint
+```
+
+Never `immediate` unless the finding is also a security issue — and then it belongs to `repo_health_audit` Stage 4, not here.
+
+### Stage 5 — Optional patch job (off by default)
+
+Estate and CI scans **list**. They do not patch.
+
+Patch generation is a separate orchestrator run:
+
+```json
+{
+  "playbook_names": ["lean_codescan"],
+  "goal": "apply confirmed findings from run_id=…",
+  "options": { "apply": true, "finding_ids": ["f-102", "f-110"] }
+}
+```
+
+If `apply: true`:
+- Only `confirmed` findings from an existing record at this SHA.
+- One finding per commit unless the operator passed an explicit list.
+- Stage 3 join must still pass on the working tree.
+- Leave `# lean: <ceiling>, <upgrade trigger>` if the replacement is a known-weaker native.
+- One runnable check if the replacement is non-trivial.
+- Verification gate: compile / existing unit tests. No test framework added.
+
+That is how CodeMind can also *ship* the Ponytail outcome — as a service job, not an IDE skill.
+
+### Stage 6 — Persist
+
+One Mongo document. No partial-silent write. Failed detector → `status: partial` + `failed_stages`.
+
+```json
+{
+  "playbook_id": "lean_codescan",
+  "schema_version": "1.1.0",
+  "repo_id": "org/svc-billing",
+  "commit_sha": "",
+  "mode": "full_repo",
+  "component_type": "spring-boot",
+  "ccc_tier": "2",
+  "status": "complete",
+  "failed_stages": [],
+  "graph_source": "codegraph.json|graphifyy",
+  "graph_state": "CURRENT",
+  "findings_hash": "",
+  "summary": {
+    "findings": 12,
+    "net_loc": -340,
+    "net_deps": -2,
+    "suppressed": 4
+  },
+  "findings": [
+    {
+      "id": "f-102",
+      "tag": "native",
+      "path": "web/src/Signup.tsx",
+      "line": 88,
+      "symbol": "BirthDatePicker",
+      "what": "flatpickr wrapper around a single date field",
+      "replacement": "<input type=\"date\">",
+      "cut_loc": 96,
+      "cut_deps": 1,
+      "evidence": {
+        "package": "flatpickr@4.6.13",
+        "call_sites": 1,
+        "inbound": 1,
+        "provenance": "EXTRACTED"
+      },
+      "tabr_bucket": "next_sprint",
+      "ccc_tier": "2"
+    }
+  ],
+  "signals_suppressed": [
+    {
+      "symbol": "sanitizeUploadName",
+      "reason": "sanitizer_on_taint_path",
+      "owner_playbook": "repo_health_audit"
+    }
+  ],
+  "debt_markers": [
+    {
+      "path": "web/src/Signup.tsx",
+      "line": 88,
+      "ceiling": "native date input",
+      "trigger": "i18n calendar required",
+      "no_trigger": false
+    }
+  ],
+  "composed_with": ["repo_health_audit"],
+  "run_id": ""
+}
+```
+
+`findings_hash` = stable sort of `{tag,path,line,symbol,replacement}` hashed. Stage 0 cache key.
+
+Discovery UI columns: tag, path, net loc, net deps, bucket, inbound count. Same consumer pattern as health records.
+
+---
+
+## Orchestrator + batch wiring
+
+Single repo:
+
+```bash
+python codemind_batch.py run \
+  --base-url "$ORCH_BASE_URL" \
+  --input repos.csv \
+  --playbooks lean_codescan \
+  --goal "scan for over-engineering" \
+  --state ./cm_state_lean
+```
+
+Composed estate sweep (one index, two docs):
+
+```bash
+python codemind_batch.py run \
+  --base-url "$ORCH_BASE_URL" \
+  --input repos.csv \
+  --playbooks repo_health_audit,lean_codescan \
+  --goal "health + lean scan" \
+  --state ./cm_state_nightly
+```
+
+CI / PR:
+
+```
+on: pull_request
+job: orchestrator.run
+  playbook_names: [lean_codescan]
+  options.mode: incremental_pr
+  gate: fail if any finding.tag == newdep AND ccc_tier <= 2 AND cut_deps >= 1
+  comment: "<path>:L<line>: <tag> <what>. <replacement>."
+```
+
+Quality gate is optional and narrow. Default CI is comment-only. Do not block merges on `shrink` or `yagni` until false-positive rate is measured for two sprints.
+
+Webhook after persist:
+
+```
+lean_codescan.completed
+  repo_id, commit_sha, run_id, summary.net_loc, summary.net_deps
+```
+
+Downstream: Discovery UI, TABR board, optional patch job.
+
+---
+
+## Intensity (scan, not chat)
+
+Intensity changes how aggressive the detectors are, not a persona.
+
+| Level | Effect |
+|---|---|
+| `off` | Playbook no-ops. Used when a composed run should skip lean. |
+| `lite` | Emit only `newdep`, `native`, `reuse` with inbound evidence >= 2. |
+| `full` | All tags. Default. |
+| `ultra` | Also include `wrapper` and `dead_flex` at 14-180 day age. Still confirmed-only. Still no auto-apply. |
+
+`CODEMIND_LEAN_MODE` env or `options.intensity` on the run payload.
+
+---
+
+## Relationship to CodeMind patch generation (secondary)
+
+If a CodeMind **implement / patch** playbook runs after this scan:
+
+1. Read the latest `lean_scan_record` at this SHA.
+2. Prefer `replacement` on open findings over new code.
+3. Do not add a dependency this scan tagged `newdep` / `native` unless the ticket names it.
+4. Mark leftover ceilings with `# lean:`.
+
+That is the whole generation policy. It is a pre-step of the existing implement playbook.
+
+Migration-master PHASE 3-5: pass `"options": {"intensity": "off"}`. Do not lean-scan a strangler extraction mid-flight.
+
+---
+
+## Folder layout
+
+```
+playbooks/lean_codescan/
+  SKILL.md
+  detectors/
+    reuse.py
+    stdlib.py
+    native_dep.py
+    yagni.py
+    wrapper.py
+    dead_flex.py
+    shrink.py
+    safety_join.py
+  refs/
+    platform-native.yaml
+    stdlib/
+      python.yaml
+      javascript.yaml
+      java.yaml
+      go.yaml
+      csharp.yaml
+  schemas/
+    lean_scan_record.json
+  evals/
+    E1-date-picker.md
+    E2-duplicate-helper.md
+    E3-one-impl-interface.md
+    E4-sanitizer-must-survive.md
+```
+
+Detectors are scripts. The orchestrator runs them and reads stdout summaries. It does not page source into context to "look for bloat." Same rule as codegraph Part 1.4b.
+
+---
+
+## Eval fixtures (CI of the playbook itself)
+
+| Id | Repo fixture | Must emit | Must not emit |
+|---|---|---|---|
+| E1 | Signup with `flatpickr` used once | `native` + `newdep` | — |
+| E2 | `formatMoney` exists; a second copy with 0 inbound | `reuse` on the copy | `reuse` on the original |
+| E3 | `AbstractRepo` + one impl | `yagni` | — |
+| E4 | `sanitizeUploadName` on a path-join taint path | — | any cut of the sanitizer |
+| E5 | `lru_cache` already on the fetch | Lean already for cache-class | a new cache class finding |
+
+Promotion rule: a detector ships to `full` estate only if E1-E5 stay green and PR-mode false-positive sample on 20 internal repos is < 15%.
+
+---
+
+## What this is not allowed to become
+
+- A Copilot instruction file with a seven-rung pep talk.
+- A second health-audit that re-implements taint or CVE.
+- An estate-wide auto-refactor bot.
+- A finding stream of `heuristic` guesses dressed as `confirmed`.
+
+CodeMind already scans at service scale. This playbook adds the YAGNI dimension to that scan, on the same orchestrator, the same graph, the same Mongo/UI, the same batch runner.
