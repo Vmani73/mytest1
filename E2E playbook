@@ -1,0 +1,346 @@
+# SKILL.md — repo_health_audit (v1.0)
+
+## Metadata
+```yaml
+playbook_id: repo_health_audit
+version: 1.0.0
+classification: CodemindIDE / Discovery-Agent
+taxonomy: ACS Component Taxonomy (auto-resolved via identify_component_type)
+terminology: CCC (Component Criticality Classification) / TABR (Triage-Assign-Baseline-Remediate)
+determinism: strict — identical repo state at commit SHA X must always yield identical findings hash
+idempotent: true
+mongo_writes: mandatory
+execution_modes: [single_repo, batch_50k via codemind_batch.py]
+estimated_runtime: 45s-4min per repo depending on size/history depth
+```
+
+## Purpose
+Single end-to-end playbook that produces a complete repository health record in one pass —
+deep security analysis, dependency risk, code health, config hygiene, CI/CD maturity,
+ownership risk, and license compliance — instead of orchestrating 6-8 separate playbooks per
+repo. Designed for the 50k-repo batch sweep: one graphifyy index build, one git history walk,
+one output schema. Language-agnostic by design — every stage runs against a normalized
+intermediate representation, not language-specific source parsing, so the same pipeline covers
+Java/Spring repos alongside Python, JS/TS, Go, C#, Ruby, and anything else in the estate
+without a separate playbook per language.
+
+## Why one playbook instead of many
+- graphifyy AST/code-graph indexing is the single most expensive step (OOM risk already seen
+  on uaap-codemind at 1000+ concurrent repos). Building it once and reusing the in-memory graph
+  across all sub-scans avoids re-indexing 8x per repo across 50k repos.
+- One deterministic output schema means AgentGuard, Litmus, and the Discovery Agent UI consume
+  one document shape instead of stitching together 8 playbook outputs per repo.
+- One MongoDB write transaction per repo instead of 8 reduces write amplification at 50k scale.
+
+## Pipeline stages (sequential, each stage gated on the prior)
+
+### Stage 0 — Preflight
+1. Resolve component identity via `identify_component_type` (ACS Component Taxonomy) — this
+   determines which stage-specific rule packs load (e.g. Spring Boot transaction rules only
+   load if component_type includes `spring-boot`).
+2. Resolve CCC tier for the repo (criticality classification) — determines remediation SLA
+   bucketing applied to every finding downstream, per TABR.
+3. Check MongoDB for a prior run at the same commit SHA. If found and hash-identical, short
+   circuit and return the cached record (determinism guarantee, avoids redundant compute).
+4. Acquire graphifyy index. Build if absent; reuse if present. Enforce the per-pod concurrency
+   cap fix (max N simultaneous graphifyy builds per node) to avoid the prior OOMKill class of
+   failure.
+5. **Language detection & analyzer resolution**: scan the repo tree (extensions, manifest
+   files, shebangs) to produce a `language_profile` — e.g. `{java: 62%, python: 30%, sql: 8%}`
+   for a polyglot repo. For every language present, resolve the matching analyzer adapter from
+   the table below. A repo with N languages runs N adapters feeding into the same normalized
+   graph — this is what keeps Stages 1-8 language-agnostic rather than requiring a rewrite per
+   language.
+
+   | Language | Parser / graphifyy frontend | Dependency manifest | Security rule pack |
+   |---|---|---|---|
+   | Java / Kotlin | JavaParser / tree-sitter-java | `pom.xml`, `build.gradle` | CCC-Java (Spring, JDBC, deserialization) |
+   | Python | tree-sitter-python / ast module | `requirements.txt`, `pyproject.toml`, `Pipfile` | CCC-Python (pickle, eval/exec, subprocess, Django/Flask) |
+   | JavaScript / TypeScript | tree-sitter-typescript | `package.json` + lockfiles | CCC-JS (prototype pollution, DOM XSS, Node child_process) |
+   | Go | tree-sitter-go / go/ast | `go.mod` | CCC-Go (unchecked errors, goroutine leaks, exec.Command) |
+   | C# / .NET | Roslyn / tree-sitter-c-sharp | `*.csproj`, `packages.config` | CCC-DotNet (deserialization, LINQ injection) |
+   | Ruby | tree-sitter-ruby | `Gemfile` | CCC-Ruby (Rails mass assignment, YAML.load) |
+   | C / C++ | tree-sitter-cpp | `Makefile`/`CMakeLists.txt` | CCC-Native (buffer overflow, memory safety, unsafe funcs) |
+   | SQL / PL-SQL | tree-sitter-sql | n/a | CCC-SQL (dynamic SQL construction, missing parameterization) |
+   | Shell / Bash | tree-sitter-bash | n/a | CCC-Shell (injection via unquoted vars, eval) |
+   | Terraform / YAML / Helm | HCL / YAML parsers | n/a | CCC-IaC (see Stage 5) |
+
+   A language with no adapter yet falls back to a **generic regex/entropy pass** (secrets,
+   obvious hardcoded credentials, TODO/FIXME security markers) rather than being silently
+   skipped — every file in the repo is touched by at least one pass, even without full AST
+   support.
+6. Normalize every language's AST into graphifyy's common intermediate graph representation
+   (nodes: functions/methods/classes; edges: calls, imports, data-flow) so Stages 3, 4, and 8
+   operate on one graph shape regardless of source language.
+
+### Stage 1 — Git history extraction (single walk, feeds Stages 3, 6, 7)
+Walk full commit history once; extract and cache in-memory:
+- Per-file: commit count, unique author count, last-modified date, revert count, lines
+  churned (added+removed) over trailing 90/180/365 day windows
+- Per-author: files touched, commit frequency, last-active date (feeds bus-factor calc)
+- Commit message corpus: conventional-commit compliance rate, revert-commit ratio
+- Tag/release history: release cadence, days-since-last-tag, hotfix-tag frequency (tags
+  within 48h of a prior tag, signal of unstable releases)
+- Branch metadata via GitHub API: open PR count, average PR age, average review-comment
+  count per PR, stale-branch count (no commits in 90+ days)
+
+### Stage 2 — Dependency & license scan
+1. Parse manifest files present in repo: `pom.xml`, `package.json`, `requirements.txt`,
+   `go.mod`, `Gemfile`, lockfiles for all of the above.
+2. For each resolved dependency (direct + transitive, using graphifyy's lockfile-parsing
+   enhancements for transitive resolution):
+   - Query OSV + GitHub Advisory DB for known CVEs → severity + CVSS
+   - Resolve latest available version + EOL/deprecation date from registry metadata
+   - Resolve declared license → cross-check against an allow/deny list (copyleft flagged)
+3. Compute blast radius per vulnerable/EOL dependency: count of internal modules importing
+   it, via graphifyy graph traversal — this is what separates "CVE in an unused dev-only
+   package" from "CVE in something 40 services depend on."
+4. Emit one row per dependency with: version, latest, days-to-EOL, CVE list, license,
+   blast_radius_score.
+
+### Stage 3 — Code health scan (graphifyy-powered)
+1. **Dead/orphan code**: nodes in the AST graph with zero inbound edges repo-wide, ranked by
+   last-modified date from Stage 1 (old + orphaned = high-confidence dead code; recently
+   added + orphaned = likely in-progress, lower confidence).
+2. **Resilience pattern detection**: reuse existing resilience-pattern-detection logic —
+   circuit breakers, retries, timeouts present/absent on outbound calls identified in the
+   graph.
+3. **Transaction boundary audit** (Spring components only, gated by Stage 0 component type):
+   flag `@Transactional` self-invocation, propagation misconfiguration, missing rollback
+   rules — detected via call-graph analysis of proxy-bypassing internal calls.
+4. **Test classification**: reuse existing test-classification logic; cross-reference against
+   Stage 1's revert/churn data to flag files with high churn but low/no test coverage as
+   priority gaps, and files with frequent CI reruns (if CI history available) as flaky
+   candidates rather than genuinely broken.
+
+### Stage 4 — Deep Security Analysis (core section — largest stage by design)
+This is the anchor stage of the playbook, not a thin wrapper. It runs multiple independent
+sub-scans against the normalized graph from Stage 0.6, each producing findings in the same
+CCC/TABR schema, then correlates across sub-scans before emitting. It reuses
+`ccc_security_vulnerability_scan` (v4.0) and `ise_detect_sensitive_data_exposure` as two of the
+sub-routines, not as the whole stage.
+
+**4.1 — SAST / taint analysis (deep, cross-function)**
+- Build source→sink taint paths across the whole call graph (not per-file): every user-facing
+  input source (HTTP params, headers, cookies, file uploads, message-queue payloads, gRPC
+  fields) is traced through the graph to every dangerous sink (SQL execution, shell exec,
+  file path construction, deserialization, template rendering, LDAP/XML query construction,
+  reflection/dynamic class loading).
+- Path is only reported as exploitable if it crosses the boundary with **no matching sanitizer
+  node** on the path (parameterized query, allow-list validator, encoder) — this is what
+  makes it "deep" rather than single-line pattern matching: a `String.format` building SQL is
+  only a finding if it actually reaches `Statement.execute`, not merely present in a file that
+  also happens to touch a DB somewhere else.
+- Injection classes covered per language rule pack from Stage 0.5: SQLi, NoSQLi (Mongo
+  operator injection), command injection, LDAP injection, XPath/XXE, SSTI (template engines),
+  header/CRLF injection, prototype pollution (JS), unsafe deserialization (Java
+  `ObjectInputStream`, Python `pickle`, .NET `BinaryFormatter`, Ruby `Marshal.load`/`YAML.load`).
+
+**4.2 — Authentication & authorization audit**
+- Locate every route/endpoint/handler node in the graph and check for a reachable
+  authn/authz gate (annotation, middleware, decorator per framework) between the route and
+  any sensitive operation it performs.
+- Flag: missing auth on state-changing endpoints, authz checks performed client-side only,
+  IDOR patterns (object ID taken directly from request and used in a DB lookup with no
+  ownership check on the path), privilege-escalation-shaped code (role checks that can be
+  bypassed via an alternate code path reaching the same sink).
+- JWT/session handling: flag missing signature verification, `alg: none` acceptance, hardcoded
+  signing keys, missing expiry checks — matched against the CVE/CWE class, not just keyword
+  search.
+
+**4.3 — Cryptography misuse**
+- Flag weak/broken primitives (MD5/SHA1 for anything security-relevant, DES/RC4, ECB mode),
+  hardcoded keys/IVs/salts, insufficient key length, predictable random (`Math.random`/
+  `java.util.Random` used for tokens/session IDs instead of a CSPRNG), and missing certificate
+  validation (disabled TLS verification, custom trust managers that accept all certs).
+
+**4.4 — SSRF & outbound request analysis**
+- Trace every outbound HTTP/network call node back to see if any part of the destination
+  (host, port, path) is attacker-influenced without an allow-list check on the path — the
+  same taint-path methodology as 4.1, applied to egress instead of injection sinks.
+
+**4.5 — Secrets & sensitive data exposure (deep pass)**
+- Runs `ise_detect_sensitive_data_exposure` plus an entropy-based scan across all file types
+  (not just config, per Stage 5) and git history (not just HEAD) — a secret committed and
+  later removed is still a live credential and still a finding unless there's evidence of
+  rotation (paired with a later commit touching the same key name).
+- Classifies by data sensitivity tier (credentials, PII, PCI-scoped fields, internal-only)
+  using the same taxonomy as `ise_detect_sensitive_data_exposure` so findings merge cleanly.
+
+**4.6 — Supply chain & build integrity**
+- Cross-reference Stage 2's dependency list against typosquat-pattern package names, packages
+  published to the registry in the last N days (new/low-reputation package risk), and
+  dependencies pulled from non-standard/unpinned registries or via `git+https` refs without a
+  commit-pinned SHA.
+- Flag build scripts (`postinstall` hooks, Maven/Gradle plugins, Makefile targets) that fetch
+  and execute remote content at build time.
+- Flag CI workflow files (cross-referenced with Stage 6) that use unpinned third-party Actions
+  (`uses: someaction@main` instead of a pinned SHA) — a known supply-chain vector.
+
+**4.7 — IaC & container security (in-repo only)**
+- For Terraform/Helm/K8s manifests found in-repo (full infra-registry scanning stays out of
+  scope per Explicit non-goals): flag overly permissive IAM/RBAC (`*` resource/action),
+  public-facing storage/network resources with no justification annotation, missing
+  resource limits, containers running as root/privileged, base images pinned to `latest`.
+
+**4.8 — Correlation & exploitability scoring**
+Before emission, cross-reference every finding from 4.1-4.7 against:
+- Stage 2's blast radius (a taint path ending in a vulnerable dependency is scored higher
+  than either finding alone)
+- Stage 1's churn/ownership data (a finding in a file with no active owner is flagged for
+  escalated review, since normal PR-review pressure won't catch it)
+- CCC tier from Stage 0.2 to set the TABR SLA bucket (a CCC-1 SSRF finding is `immediate`;
+  the same finding in a CCC-4 internal tool may bucket to `next_sprint`)
+
+Every finding across 4.1-4.7 carries: `cwe_id`, `owasp_category`, `taint_path` (source → sink,
+list of graph node IDs, when applicable), `exploitability_score`, `confidence` (only
+`confirmed` findings with a full traced path or an unambiguous pattern match are emitted —
+speculative/heuristic-only signals are suppressed rather than reported as findings, keeping
+the determinism guarantee from Stage 4 through Stage 9).
+
+### Stage 5 — Config & secrets hygiene
+1. Locate all `application.yml`/`.properties`, Helm `values*.yaml`, and Kubernetes manifests.
+2. Diff config values across environment variants present in-repo (dev/stage/prod) to surface
+   drift (a value present in prod but missing/different in staging, etc.).
+3. Flag hardcoded secrets/credentials not externalized (pattern + entropy based, same
+   determinism bar as Stage 4 — no fuzzy/LLM-judgment calls on what counts as a secret).
+4. Flag non-backward-compatible DB migration changes: parse Flyway/Liquibase changesets for
+   dropped columns, non-nullable columns added without defaults, against the schema baseline
+   stored from the previous run (if present in Mongo) or against migration order if no
+   baseline exists yet.
+
+### Stage 6 — CI/CD & build maturity
+1. Parse `.github/workflows/*.yml` and/or `Jenkinsfile` to inventory: build steps, test steps,
+   presence of security-scan steps, deployment gates, required-approval rules.
+2. If CI history is queryable (GitHub Actions API / Jenkins API), compute build/test duration
+   trend over trailing 90 days and correlate spikes against dependency/plugin version bumps
+   from Stage 2's data.
+3. Score CI pipeline maturity 0-100 against a fixed rubric (test step present, security scan
+   present, deploy approval gate present, build time within SLA, etc.) — rubric is fixed and
+   versioned so scores are comparable across runs and repos.
+
+### Stage 7 — Ownership & bus-factor report
+Using Stage 1's per-author data: compute bus factor per module (min authors accounting for
+80% of commits in trailing 12 months), flag single-owner modules, cross-reference against
+CCC tier (a CCC-1 single-owner module is a materially different risk than a CCC-4 one).
+
+### Stage 8 — API contract drift (if OpenAPI/Swagger spec present)
+Diff the current spec against the spec at the previous recorded commit SHA (from Mongo).
+Classify changes as breaking (removed field, tightened validation, changed type) vs.
+additive, feeding directly into AgentGuard's PR impact scoring for any repo exposing an API.
+
+### Stage 9 — Aggregation & MongoDB write
+1. Merge all stage outputs into one `repo_health_record` document (schema below).
+2. Compute a single composite `findings_hash` (stable sort + hash of all findings) —
+   this is the determinism check used by Stage 0's short-circuit on future runs.
+3. Bucket every finding into a TABR remediation SLA per its CCC tier and severity.
+4. Write one transaction to MongoDB. Never partial-write; if any stage failed, mark the
+   whole record `status: partial` with a `failed_stages` list rather than silently omitting
+   data — downstream consumers must be able to distinguish "clean" from "incomplete."
+
+## Output schema (MongoDB document)
+```json
+{
+  "repo_id": "string",
+  "commit_sha": "string",
+  "run_timestamp": "ISO8601",
+  "component_type": "string (ACS taxonomy)",
+  "ccc_tier": "1-4",
+  "status": "complete | partial",
+  "failed_stages": ["string"],
+  "findings_hash": "string",
+  "dependency_risk": {
+    "items": [
+      {"name": "", "version": "", "latest": "", "days_to_eol": 0,
+       "cves": [{"id": "", "cvss": 0.0}], "license": "", "license_flag": "allow|deny|review",
+       "blast_radius": 0}
+    ],
+    "summary_score": 0
+  },
+  "code_health": {
+    "dead_code_candidates": [{"path": "", "last_modified": "", "confidence": "high|low"}],
+    "resilience_gaps": [{"call_site": "", "missing_pattern": ""}],
+    "transaction_issues": [{"file": "", "issue_type": "", "line": 0}],
+    "test_gaps": [{"file": "", "churn_90d": 0, "coverage": "none|partial|full", "flaky": false}]
+  },
+  "language_profile": {"java": 0.0, "python": 0.0, "javascript": 0.0},
+  "security": {
+    "sast_taint_findings": [
+      {"cwe_id": "", "owasp_category": "", "language": "", "source": "", "sink": "",
+       "taint_path": [""], "exploitability_score": 0, "confidence": "confirmed|heuristic"}
+    ],
+    "authn_authz_findings": [{"endpoint": "", "issue_type": "", "cwe_id": ""}],
+    "crypto_findings": [{"file": "", "line": 0, "issue_type": "", "primitive": ""}],
+    "ssrf_findings": [{"call_site": "", "taint_path": [""]}],
+    "sensitive_data_findings": [
+      {"file": "", "line": 0, "data_type": "", "sensitivity_tier": "",
+       "in_history_only": false}
+    ],
+    "supply_chain_findings": [{"package": "", "issue_type": "", "detail": ""}],
+    "iac_findings": [{"file": "", "resource": "", "issue_type": ""}],
+    "ccc_legacy_findings": []
+  },
+  "config_hygiene": {
+    "env_drift": [{"key": "", "envs_present": [], "envs_missing": []}],
+    "hardcoded_secrets": [{"file": "", "line": 0, "type": ""}],
+    "migration_risks": [{"changeset": "", "issue": ""}]
+  },
+  "ci_maturity": {
+    "score": 0,
+    "missing_gates": [""],
+    "build_time_trend_90d": "stable|degrading|improving"
+  },
+  "ownership": {
+    "bus_factor_by_module": [{"module": "", "bus_factor": 0, "single_owner": false}]
+  },
+  "api_contract_drift": [{"endpoint": "", "change_type": "breaking|additive", "detail": ""}],
+  "remediation": {
+    "tabr_buckets": {
+      "immediate": [],
+      "next_sprint": [],
+      "next_quarter": [],
+      "accepted_risk_review": []
+    }
+  }
+}
+```
+
+## Determinism requirements
+- No stage may use an LLM to make a pass/fail judgment call on a finding — LLM use, if any,
+  is restricted to natural-language summarization of already-computed findings, never to
+  decide whether something IS a finding.
+- All thresholds (churn windows, bus-factor %, CI maturity rubric weights) are versioned
+  constants in this file, not runtime-configurable per invocation, so two runs at the same
+  commit SHA always produce the same findings_hash.
+- Stage short-circuiting (Stage 0.3) is the only caching allowed; every other stage runs
+  fresh — no partial-result caching within a run.
+
+## Batch execution (codemind_batch.py)
+- Concurrency cap: reuse the existing per-node graphifyy build cap from the uaap-codemind
+  OOMKill fix; this playbook's Stage 0.4 is the same bottleneck at greater severity since it's
+  now the only graphifyy build per repo across the whole sweep (net win vs. 8 separate
+  playbooks each building their own index).
+- Checkpointing: write Stage 9's document per-repo immediately (not batched at sweep end) so
+  a killed batch job resumes from the last completed repo via the Stage 0.3 short-circuit.
+- Failure isolation: a Stage 3-8 failure on one repo must not abort the batch; record
+  `status: partial` and continue.
+
+## Explicit non-goals
+- Not a replacement for SpotBugs/PMD/SonarQube — Stage 4.1 can ingest their output as an
+  additional signal where already configured in-repo, but the taint-analysis core does not
+  depend on them and runs standalone.
+- Not a full container-registry/cloud-posture scanner — Stage 4.7 covers IaC/container config
+  found *in the repo itself*; scanning live cloud accounts, running container images, or an
+  image registry is a separate `infra_health_audit` playbook sharing this one's Mongo schema
+  conventions but running against a different artifact set and schedule.
+- Not a CI/CD executor — Stage 6 reads pipeline definitions and history, it does not trigger
+  builds or gate merges; that enforcement lives in AgentGuard.
+- Not a dynamic scanner (DAST/IAST/fuzzing) — every finding in Stage 4 is static/source-derived
+  by design, to preserve the determinism guarantee (a DAST finding depends on runtime
+  environment state, which breaks the "same commit SHA → same findings_hash" contract). Runtime
+  verification of Stage 4 findings, if wanted, is a downstream consumer's job (e.g. feeding
+  confirmed taint paths into a targeted fuzzing/pen-test queue), not this playbook's.
+- A language with no adapter in the Stage 0.5 table is not silently excluded, but it also
+  doesn't get full taint-path analysis — it gets the generic regex/entropy fallback only, and
+  its `language_profile` entry is flagged `adapter: generic` so consumers know the coverage
+  level differs from a fully-adapted language.
