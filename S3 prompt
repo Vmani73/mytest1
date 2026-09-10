@@ -1,0 +1,94 @@
+Context:LangGraph-based agentic platform currently stores LanceDB 
+data on a persistent volume (PV) inside OCP. Because the PV is local to a 
+single OCP cluster/data center, LanceDB data is not shared across data 
+centers — this breaks multi-DC availability and any workflow that expects 
+consistent vector/table state regardless of which cluster serves the request.
+
+Goal: Migrate LanceDB's storage backend from local/PV-backed storage to S3 
+(or S3-compatible object storage), so all data centers read/write the same 
+LanceDB tables via a shared object store instead of per-cluster PVs.
+
+Step 1 — Investigate before changing anything:
+- Find every place in the codebase that calls `lancedb.connect(...)` or 
+  otherwise initializes a LanceDB connection/URI.
+- Identify how the current PV path is configured (hardcoded, env var, 
+  config file, Helm/OCP deployment YAML, etc.) and trace it end to end.
+- Identify all read/write paths: table creation, upsert/insert, search/query, 
+  index builds, and any background/batch jobs (e.g. codemind_batch.py) that 
+  touch LanceDB.
+- Check whether LanceDB usage assumes local filesystem semantics anywhere 
+  (e.g. file locking, watching the PV directory, assuming POSIX paths) that 
+  would break under an object-store backend.
+- Document current architecture and every touchpoint you find before writing 
+  code.
+
+Step 2 — Design and implement a storage service:
+- Create a dedicated service/module (e.g. `lancedb_storage_service` or 
+  similar, matching the project's existing module conventions) that owns 
+  the LanceDB connection and is the single point other code calls through — 
+  do not scatter `lancedb.connect()` calls across the codebase.
+- The service must build the LanceDB URI as `s3://<bucket>/<prefix>` and 
+  connect using LanceDB's native object_store-backed S3 support (no manual 
+  S3 client shimming for the LanceDB data path itself).
+- Load these values from `.env` (do not hardcode, do not commit real 
+  secrets): S3 endpoint/API URL, access key, secret key, AWS region, bucket 
+  name, and key prefix. Use whatever env-loading convention the rest of 
+  Codemind already uses (confirm this in Step 1 rather than assuming 
+  python-dotenv).
+- Since this is an S3 API endpoint (confirm whether it's AWS proper or an 
+  on-prem S3-compatible store like ECS/MinIO) — if it's S3-compatible with 
+  a custom endpoint, pass `endpoint_url` via LanceDB's `storage_options`, 
+  along with `aws_access_key_id`, `aws_secret_access_key`, and `aws_region`. 
+  Verify path-style vs virtual-hosted-style addressing works against the 
+  actual endpoint.
+- Add connection validation/health-check on startup: fail fast with a clear 
+  error if S3 credentials or bucket access are invalid, rather than failing 
+  silently on first query.
+- Add retry/backoff for transient S3 errors on read/write paths (network 
+  blips, throttling) — LanceDB operations that previously assumed reliable 
+  local disk now depend on network calls.
+
+Step 3 — Migration path:
+- Write a one-time migration script that copies existing table data from the 
+  OCP PV to the new S3 location, preserving table names/schemas, and verify 
+  row counts/checksums match after migration.
+- Do NOT delete the PV data automatically — migration should be additive/ 
+  verifiable first, with deletion as a separate manual step after validation.
+- Support a feature flag or config switch to fall back to PV-backed LanceDB 
+  if S3 is unreachable, at least for the initial rollout, unless you 
+  determine (and state clearly) that this adds more risk than it removes.
+
+Step 4 — Update deployment config:
+- Update OCP deployment YAML/Helm charts to inject the new env vars 
+  (S3 endpoint, access key, secret key, region, bucket, prefix) via 
+  Secrets/ConfigMaps rather than plaintext — check how existing secrets 
+  (e.g. MongoDB credentials) are injected in this project and follow the 
+  same pattern.
+- Remove or make optional the PV mount for LanceDB once the new path is 
+  validated, but don't rip it out in the same change that introduces S3 — 
+  keep this reversible.
+
+Step 5 — Testing:
+- Write tests that mock or point at a real S3-compatible endpoint (e.g. 
+  MinIO in CI) to validate connect, write, read, and query against the new 
+  storage service.
+- Add a test that simulates two "data centers" (two separate LanceDB 
+  connection instances pointed at the same S3 bucket) writing and reading 
+  the same table, to confirm the multi-DC sharing problem is actually 
+  solved.
+- Do not mark this done based on unit tests alone — include at least one 
+  integration test against a real or emulated S3 endpoint.
+
+Deliverables:
+- The storage service module, fully wired in (no placeholder credentials, 
+  no TODO stubs).
+- The migration script.
+- Updated OCP/Helm config.
+- Tests as described above.
+- A short summary of every file changed and why, plus any assumptions you 
+  had to make about the existing .env loading or secrets convention.
+
+Before writing code, report back your findings from Step 1 (current 
+LanceDB touchpoints, config mechanism, and whether it's AWS S3 or an 
+S3-compatible endpoint) so we can confirm the approach before you proceed 
+to implementation.
