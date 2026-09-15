@@ -1,0 +1,167 @@
+# PLAYBOOK: agent_spark_openhands_parity_implementation
+
+**Version:** 1.0
+**Owner:** Codemind Platform Team
+**Applies to:** Codemind repository, `agentspark/` package
+**Trigger keywords:** agent spark, openhands port, agent sdk, agentic execution engine
+
+---
+
+## 0. Purpose
+
+Implement **Agent Spark** — a first-party, standalone SDK inside the Codemind repository — as a **faithful architectural port of the OpenHands Software Agent SDK** (`openhands-sdk`, `openhands-tools`, `openhands-workspace`, `openhands-agent-server`).
+
+Agent Spark is not "inspired by" OpenHands. It is a **1:1 feature-parity reimplementation** of OpenHands' public class design, renamed and repackaged to live natively inside Codemind, with zero invented abstractions and zero omitted capabilities.
+
+This document is the acceptance contract for that work. Any implementation that deviates from it — by adding un-requested abstractions, dropping a listed feature, or reaching outside the allowed dependency boundary — is a **failed deliverable**, not a stylistic choice, and must be rejected in review.
+
+---
+
+## 1. Non-negotiable constraints
+
+These apply to every file, every module, every PR in this effort. No exceptions, no "just this once."
+
+1. **No invention.** Do not design new abstractions, new naming schemes, new class hierarchies, or "improved" versions of OpenHands' patterns. If OpenHands calls something `ConversationState`, Agent Spark calls its equivalent `SparkConversationState` (or `ConversationState` in the `agentspark` namespace) — same shape, same responsibilities, same method signatures where Python/runtime allows. Renaming the *package and product name* is expected. Renaming or redesigning *concepts* is not.
+2. **No external dependency beyond what's explicitly listed in Section 5.** Agent Spark may depend on:
+   - The existing Codemind codebase (its own modules, utilities, models) — as needed for integration points explicitly called out below (LLM gateway, Mongo, AgentGuard, graphifyy).
+   - Environment variables via `.env` / the existing Codemind config-loading mechanism — for all secrets, endpoints, and tunables.
+   - Standard library and the minimal third-party packages OpenHands itself depends on for equivalent functionality (e.g., `pydantic` for typed models, an HTTP client for the remote workspace protocol) — **only if** an equivalent capability doesn't already exist in Codemind's current dependency set, in which case the existing one must be reused instead.
+   - It must **not** depend on new SaaS integrations, new cloud services, new message queues, new databases, or any infrastructure not already present in Codemind, unless a feature in Section 3 is architecturally impossible without it (see Section 6, "Escalation," for how to handle that case — it requires explicit sign-off, not silent addition).
+3. **Loose coupling, one direction only.** Codemind may call into Agent Spark. Agent Spark must **never** import, reference, or assume the existence of Codemind-specific modules outside of the explicit integration adapters defined in Section 5.2. Agent Spark must be extractable into its own repository with a single `git subtree split` and zero code changes. If Agent Spark code contains an import like `from codemind.discovery_agent import X` anywhere outside `agentspark/integrations/`, that is a coupling violation.
+4. **Agent Spark is itself an SDK, not an app.** It ships as an installable, importable package (`agentspark`), mirroring OpenHands' own package split:
+   - `agentspark-core` (agent loop, event model, LLM abstraction, security/condenser hooks) — equivalent to `openhands-sdk`
+   - `agentspark-tools` (terminal, file editor, task tracker, MCP tool support) — equivalent to `openhands-tools`
+   - `agentspark-workspace` (local + remote workspace abstractions) — equivalent to `openhands-workspace`
+   - `agentspark-server` (REST/WebSocket server for remote execution) — equivalent to `openhands-agent-server`
+   A consumer outside Codemind should be able to `pip install agentspark-core agentspark-tools` and use it with **zero knowledge that Codemind exists**.
+5. **Production-grade only.** No stubs, no `TODO`, no `NotImplementedError` placeholders, no hardcoded values that belong in config, no bare `except:` blocks, no untyped public APIs. Every public class has type hints, a docstring, and unit test coverage. This applies even to first-draft PRs — "we'll harden it later" is not an acceptable phase.
+6. **Version discipline.** `agentspark-core` and `agentspark-tools` are a matched set (mirroring OpenHands' own documented gotcha with `openhands-sdk`/`openhands-tools` version skew). They must be versioned and released together, and CI must fail the build if their versions diverge.
+
+---
+
+## 2. Source of truth
+
+Before writing any code, the implementer (Copilot or human) must read the actual OpenHands source — not summaries, not this playbook's descriptions — from the cloned `software-agent-sdk` repository already present on the office laptop/repo mirror:
+
+- `openhands-sdk/openhands/sdk/event/` — event model
+- `openhands-sdk/openhands/sdk/agent/` — agent loop
+- `openhands-sdk/openhands/sdk/llm/` — LLM abstraction, `RouterLLM`
+- `openhands-sdk/openhands/sdk/conversation/` — `Conversation`, `ConversationState`, local/remote impls
+- `openhands-sdk/openhands/sdk/tool/` — `ToolDefinition`, `Executor`, Action/Observation base
+- `openhands-sdk/openhands/sdk/security/` — `SecurityAnalyzerBase`, confirmation policies
+- `openhands-sdk/openhands/sdk/context/` or condenser module — `CondenserBase`
+- `openhands-tools/openhands/tools/` — `TerminalTool`, `FileEditorTool`, `TaskTrackerTool`, `BrowserTool`, MCP tool support
+- `openhands-workspace/` — `LocalWorkspace`, `RemoteWorkspace`
+- `openhands-agent-server/` — REST/WebSocket server implementation, persistence model
+
+Every Agent Spark module must cite, in its module docstring, which OpenHands source file it is a port of (e.g., `"""Port of openhands-sdk/openhands/sdk/event/base.py. See ADR-0001."""`). This creates an auditable trail for parity review and for a future migration back to the real SDK if it is ever approved for direct use.
+
+---
+
+## 3. Feature parity checklist (acceptance criteria)
+
+Every item below must exist in Agent Spark with an equivalent, testable implementation. This is the literal Definition of Done — a PR that doesn't map to every applicable row is incomplete.
+
+### 3.1 Core agent loop
+- [ ] `SparkAgent` — stateless reasoning-action loop: condense (if needed) → call LLM → parse tool calls → risk-check → execute → append events
+- [ ] `SparkConversation` factory — returns local or remote conversation implementation behind one symmetric API
+- [ ] Event-sourced state: immutable `SparkEvent` base + `MessageEvent`, `ActionEvent`, `ObservationEvent`, `SystemPromptEvent` subclasses, appended to an `EventLog`
+- [ ] Multi-agent delegation — one `SparkAgent` can hand a sub-task to another `SparkAgent` and receive its result back into the parent's event log
+
+### 3.2 LLM layer
+- [ ] `SparkLLM` — provider-agnostic wrapper; must work against **Tachyon** via `base_url` + `api_key`, with no Codemind-specific branching inside `agentspark-core` (Tachyon wiring lives only in the integration adapter, Section 5.2)
+- [ ] `SparkRouterLLM` — route different steps/tasks to different underlying models
+- [ ] Retries, prompt caching, cost/usage tracking (`SparkConversationStats`)
+- [ ] Pluggable credential store interface (reads from `.env` by default)
+
+### 3.3 Tools
+- [ ] `TerminalTool` — persistent shell session, sandbox-aware
+- [ ] `FileEditorTool` — structured view/create/edit (not raw diff patching)
+- [ ] `TaskTrackerTool` — todo-list style task planning/tracking
+- [ ] `BrowserTool` — web browsing/interaction (implement even if unused initially — parity, not utility, is the requirement)
+- [ ] MCP tool consumption — Agent Spark can call any external MCP server as a tool source
+- [ ] `ToolDefinition` + `Executor` base classes — typed Action/Observation schemas
+- [ ] Dual export: every `ToolDefinition` produces both an OpenAI function-calling schema (`to_openai_tool()`) and an MCP tool schema (`to_mcp_tool()`) from one definition
+
+### 3.4 Safety / control
+- [ ] `SparkSecurityAnalyzerBase` — pluggable per-action risk scoring interface
+- [ ] Confirmation policies: `AlwaysConfirm`, `ConfirmRisky`, `NeverConfirm`
+- [ ] Human-in-the-loop pause/approve/reject on flagged actions, surfaced through whatever notification/UI channel Codemind already uses (no new channel invented)
+
+### 3.5 Context management
+- [ ] `SparkCondenserBase` — pluggable context compression when history nears context window
+- [ ] At least one concrete condenser implementation, wired to the integration adapter (Section 5.2) rather than hardcoded into core
+
+### 3.6 Execution environments
+- [ ] `LocalWorkspace` — direct host filesystem execution
+- [ ] `RemoteWorkspace` — talks to a `SparkAgentServer` over REST/WebSocket
+- [ ] Sandboxed remote execution (container- or pod-per-task) — see Section 6 if OCP-specific provisioning requires infra outside current Codemind dependencies
+
+### 3.7 Server / remote
+- [ ] `SparkAgentServer` — REST + WebSocket API for remote conversation execution
+- [ ] Persistence directory / durable store for resumable conversations across restarts
+- [ ] Support for scaling execution across multiple concurrent sandboxed workspaces
+
+### 3.8 Extensibility
+- [ ] `SparkAgentContext` (skills) — reusable domain-specific instructions injected into agent context
+- [ ] Plugin system — pluggable skill/tool/hook sources, with a defined merge strategy (skills override by name, tool configs merge by key, hooks concatenate) — mirroring OpenHands' Plugin 1.0 semantics
+- [ ] Lifecycle hooks around steps/actions/observations
+
+### 3.9 Cross-cutting
+- [ ] Fully typed (Pydantic) config and state throughout — no untyped dicts as public API surface
+- [ ] No telemetry, no phone-home, no network call not explicitly configured by the caller
+- [ ] Unit tests for every public class listed above
+- [ ] Module-level docstrings citing the OpenHands source file being ported (Section 2)
+
+**Explicitly out of scope for this phase** (do not build unless separately requested): `agentspark-cli` (terminal UI), an issue-resolver equivalent, and OpenHands Cloud–style hosted credits. Building these without being asked is itself a violation of Rule 1 ("no invention").
+
+---
+
+## 4. Architecture requirements
+
+- **Package boundary:** `agentspark-core`, `agentspark-tools`, `agentspark-workspace`, `agentspark-server` as four independently importable packages within the Codemind monorepo (or four repos, if that's Codemind's existing convention — follow whatever Codemind already does for multi-package layout, do not invent a new one).
+- **No circular imports** between the four packages beyond what OpenHands itself has (`agentspark-tools` may depend on `agentspark-core`, matching the documented `openhands-tools` → `openhands-sdk` dependency direction; nothing depends "upward").
+- **Config exclusively via `.env` / Codemind's existing config loader.** No hardcoded endpoints, no config files invented for Agent Spark specifically, no secrets in code.
+- **Integration adapters are the only coupling surface.** All Codemind-specific wiring (Tachyon, MongoDB, AgentGuard, graphifyy) lives in a clearly separated `agentspark/integrations/codemind/` module that `agentspark-core` has no knowledge of at import time — `agentspark-core` only knows about its own abstract interfaces (`SparkLLM`, `SparkSecurityAnalyzerBase`, etc.), which the integration layer implements.
+
+---
+
+## 5. Integration points (where Codemind and Agent Spark actually touch)
+
+### 5.1 What Agent Spark exposes (abstract interfaces, no Codemind knowledge)
+- `SparkLLM` — abstract; takes `model`, `base_url`, `api_key` from config, no gateway-specific logic
+- `SparkSecurityAnalyzerBase` — abstract `security_risk(action) -> SecurityRisk`
+- `SparkCondenserBase` — abstract `condense(events) -> events`
+- `ToolDefinition`/`Executor` — abstract; any tool (graphifyy, Mongo, Splunk) is a caller-supplied implementation, not something `agentspark-core` knows about
+
+### 5.2 What the Codemind integration adapter provides (the only place coupling is allowed)
+- `TachyonLLM(SparkLLM)` — configures `base_url`/`api_key` from `.env` (`TACHYON_BASE_URL`, `TACHYON_API_KEY`)
+- `AgentGuardSecurityAnalyzer(SparkSecurityAnalyzerBase)` — calls existing AgentGuard scoring logic
+- `NarrowdownCondenser(SparkCondenserBase)` — wraps existing narrowdown/t1-optimize logic
+- `GraphifyyCatalogTool(ToolDefinition)`, `MongoCatalogTool(ToolDefinition)`, `SplunkIngestTool(ToolDefinition)` — thin wrappers around existing Codemind clients
+
+This split is what makes Rule 3 (loose coupling) real rather than aspirational: delete `agentspark/integrations/codemind/` entirely, and `agentspark-core`/`agentspark-tools`/`agentspark-workspace`/`agentspark-server` must still build, still import, and still pass their unit tests.
+
+---
+
+## 6. Escalation path (when strict parity or the dependency boundary can't be met as written)
+
+If a feature in Section 3 genuinely cannot be implemented within the Section 1 dependency boundary (for example: OCP-native pod-per-task provisioning may require an infra capability Codemind doesn't currently have), the implementer must:
+1. Stop and document the specific blocker — which feature, which constraint, why.
+2. **Not** silently substitute an invented workaround.
+3. Raise it for explicit sign-off before proceeding, with the minimal viable infra addition proposed (not a redesign of the feature itself).
+
+Silence on a gap is treated the same as an invented feature: both are review-blocking.
+
+---
+
+## 7. Review checklist (for whoever approves the PR)
+
+- [ ] Every checklist item in Section 3 that applies to this PR is implemented, not stubbed
+- [ ] No import from `agentspark-core`/`tools`/`workspace`/`server` into any Codemind-specific module
+- [ ] No import from any Agent Spark module into Codemind code, except inside `agentspark/integrations/codemind/`
+- [ ] No new external dependency beyond Section 1.2's allowance
+- [ ] All config sourced from `.env` — `grep`-check for hardcoded URLs/keys
+- [ ] Every public class has a docstring citing the OpenHands source file it ports
+- [ ] Test coverage present for every new public class
+- [ ] No `agentspark-core` version drift from `agentspark-tools`
