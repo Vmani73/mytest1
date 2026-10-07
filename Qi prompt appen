@@ -1,0 +1,98 @@
+# Task: Bound every CBM tool result before it reaches Agent-Spark
+
+## Problem (already diagnosed — do not re-investigate the cause)
+Agent-Spark gap-analysis runs are slow and produce inconsistent/wrong data because individual CBM MCP tool calls return very large outputs that enter the agent's context at full size.
+
+Verified facts (from the OpenHands SDK and CBM source):
+- OpenHands `MCPToolObservation.from_call_tool_result` passes MCP text through unchanged.
+- The only cap is 50,000 chars per tool message, applied at LLM serialization by middle-truncation (`DEFAULT_TEXT_CONTENT_LIMIT`). This silently drops rows.
+- `LLMSummarizingCondenser` keeps recent events verbatim, so several oversized results stay in every prompt.
+- Large CBM outputs come from: `get_architecture` with aspects `all`/`overview`/`file_tree`/`clusters`/`cycles` (this tool has no `max_output_tokens`); `get_code_snippet` with `source_mode: "full"`; `query_graph` with high or `0` `max_rows`; `search_code` with `mode: "full"`; and any call with large `limit`/`max_output_tokens`.
+
+## Fix to implement
+Add a CRUX-owned **bounded CBM gateway**: an MCP server that sits between Agent-Spark and CBM. Point Agent-Spark at it through Agent-Spark's existing `mcp_config`, instead of pointing it at CBM directly.
+
+## Hard boundary
+- Do NOT modify, fork, copy, subclass, monkey-patch, or wrap Agent-Spark or OpenHands code: runtime, condenser, conversation loop, tools, factory, engine, or session handling.
+- Change only the CRUX/CodeMind orchestration layer, plus new gateway files.
+- Do not change the gap-analysis prompt, the report schema, public APIs, durable-job behavior, fallback behavior, or UI integration.
+- No unrelated refactors, placeholders, TODOs, stubs, or commented-out code.
+
+## Step 1 — Locate, then report before editing
+Find and list, with file paths and line numbers:
+1. Where CRUX builds the `mcp_config` (or equivalent) that Agent-Spark uses to reach CBM.
+2. How CBM is launched or connected: stdio command or HTTP URL, plus its args.
+3. Existing MCP server/client code in the repo (for example `mcp_transport.py`, `cbm_bridge_tools.py`) that the gateway should reuse.
+4. Where analysis artifacts are persisted (Mongo/MSSQL/files), and the existing scoping keys (workspace, component, project ID, branch, commit SHA).
+5. The installed versions of CBM and the `mcp` Python SDK. Call CBM `tools/list` and record the real tool names and input schemas.
+
+If Agent-Spark does not get its CBM connection from a config that CRUX supplies, STOP and report this. Do not work around it by touching Agent-Spark.
+
+## Step 2 — Implement the gateway
+Reuse existing repo patterns for MCP, config, logging, persistence, and settings.
+
+**2.1 Tool allowlist.** Expose only these tools, with schemas copied from CBM's live `tools/list`:
+`search_graph`, `query_graph`, `trace_path`, `trace_call_path`, `get_code_snippet`, `get_file_outline`, `search_code`, `get_architecture`, `index_status`.
+Do not expose `index_repository`, `delete_project`, `manage_adr`, `ingest_traces`, or any other tool. Launch CBM with `--tool-profile=analysis`.
+
+**2.2 Argument clamping.** Apply these before forwarding. All values come from settings, with these defaults:
+
+| Tool | Rule |
+|---|---|
+| All tools accepting `max_output_tokens` | Set to `min(requested, 2000)`; default 2000 when absent |
+| `search_graph` | `limit` ≤ 50 |
+| `query_graph` | `max_rows` must be 1–100; `0` or missing → 100 |
+| `trace_path` / `trace_call_path` | `depth` ≤ 3; `limit` ≤ 100 |
+| `get_code_snippet` | `source_mode: "full"` → `"auto"`; `max_lines` ≤ 150 |
+| `search_code` | `mode: "full"` → `"compact"`; `limit` ≤ 20; `source_max_lines` ≤ 40 |
+| `get_architecture` | Reject aspects `all`, `overview`, `file_tree`, `clusters`, `cycles` with an error listing the allowed aspects; missing aspects → CBM default |
+
+Leave every other argument unchanged. Preserve `cursor` / `next_cursor` paging.
+
+**2.3 Hard byte cap.** After the CBM call, if the result text exceeds `max_result_bytes` (default 16384):
+- Persist the full raw output as an analysis artifact, scoped by workspace, component, project ID, branch, commit SHA, run ID, and stage.
+- Return the first `max_result_bytes`, cut at a line boundary, followed by:
+  `[gateway: truncated at <N> bytes; full output stored as artifact <id>; continue with next_cursor or narrow the query]`
+- Never cut text from the middle.
+
+**2.4 Transparency.** Append one line to any result whose arguments were changed:
+`[gateway: <arg> clamped <old>→<new>]`
+Return rejected calls as MCP errors (`isError: true`) with an actionable message.
+
+**2.5 Deterministic cache.**
+- Key: SHA-256 of `(project_id, commit_sha, tool_name, canonical JSON of the final clamped args with sorted keys)`.
+- Store the exact response bytes. Identical key → identical response.
+- A different commit SHA must never hit an older entry.
+- Writes are idempotent: an upsert on the key, so retries don't create duplicates.
+
+**2.6 Audit log.** Per call, record: run ID, stage, tool, original args, final args, clamps applied, response byte size, truncated flag, artifact ID, cache hit/miss, and latency. Use the existing logger.
+
+**2.7 Failure handling.**
+- CBM timeout or error → return an MCP error with the cause. Do not retry inside the gateway.
+- Gateway startup failure → the analysis job fails fast with a clear message. It must not silently fall back to direct CBM.
+
+**2.8 Wiring.** Change only the CRUX code that builds Agent-Spark's `mcp_config`, so it points to the gateway instead of CBM. Behind a settings flag `CBM_GATEWAY_ENABLED` (default `true`), `false` restores the current direct-CBM wiring exactly.
+
+## Step 3 — Tests
+Add unit and integration tests using the repo's existing test framework. Cover:
+- each clamp rule in 2.2, including the default when an arg is absent
+- a rejected `get_architecture` aspect
+- a disallowed tool not being exposed
+- an oversized result: truncated at a line boundary, full output persisted, notice present, no middle cut
+- cache hit on identical args
+- cache miss on a changed commit SHA
+- an idempotent retry creating no duplicate cache or artifact rows
+- the CBM error path
+- the feature flag `false` producing the original config unchanged
+- an integration test against a fake CBM MCP server returning a 200 KB payload, asserting Agent-Spark receives ≤ `max_result_bytes` plus the notice
+
+## Step 4 — Verify and report
+1. Run the full test suite, the linter, and the type checker used in this repo. All must pass.
+2. Run `git diff --stat` and `git diff --name-only`. Prove that no file under the Agent-Spark or OpenHands packages changed.
+3. Final report:
+   - files changed, with a one-line purpose each
+   - the integration point you changed (file:line)
+   - test, lint, and type-check results
+   - any assumption you could not verify
+
+If anything is incomplete, or any premise above proved false in this repo, end with `NOT SIGNED OFF` and list the exact gaps. Do not claim completion otherwise.
