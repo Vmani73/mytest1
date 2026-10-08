@@ -1,0 +1,429 @@
+# Functional Test Generation Skills for OpenHands (Agent Spark)
+
+This file contains 8 skills. Split them at each `SKILL FILE` marker and save each one as:
+
+    .agents/skills/<name>/SKILL.md
+
+| Skill | Use |
+|---|---|
+| functional-test-generation | Core workflow and rules. Always loaded first. |
+| functional-test-playwright | Playwright (any language binding) |
+| functional-test-selenium | Selenium WebDriver (any language) |
+| functional-test-cypress | Cypress |
+| functional-test-karate | Karate |
+| functional-test-cucumber | Cucumber / Gherkin BDD (any language) |
+| functional-test-rest-assured | REST Assured |
+| functional-test-generic | Any other framework |
+
+Input to all skills: the gap analysis JSON produced by the functional gap analysis prompt (fields `project_id`, `test_frameworks`, `entry_points[].scenarios[].status`).
+
+---
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-generation/SKILL.md ==================== -->
+
+---
+name: functional-test-generation
+description: Core workflow for generating functional tests from a functional gap analysis report. Load this before any framework-specific functional-test skill. Covers input validation, fact gathering, framework selection, robustness rules, execution, and the output report.
+triggers:
+  - functional test
+  - functional tests
+  - gap analysis
+  - test generation
+---
+
+# Functional Test Generation: Core Workflow
+
+You generate functional tests that close the gaps listed in a functional gap analysis report. Every test must be correct, runnable, and consistent with the repository's existing tests. Correctness is more important than quantity: one verified test is better than ten guessed ones.
+
+## Ground rules
+
+1. Never invent anything. Every endpoint, field, selector, status code, error message, config key, helper, and credential source in a test must come from the repository (source code, config, or existing tests). If a fact cannot be found, do not guess. Mark the scenario `BLOCKED` and name the missing fact.
+2. Follow the repository, not your preferences. Use the language, framework, folder layout, naming, helpers, fixtures, and config that existing tests already use.
+3. Do not change application code. Do not change the assertions of existing tests. Only add new tests, or add new cases to existing test files.
+4. Do not weaken a test to make it pass. Never delete assertions, loosen expected values, catch and ignore errors, or skip tests to get a green run.
+5. Do not add new dependencies or plugins unless the repository already declares them.
+
+## Step 1: Read the input
+
+- Parse the gap analysis JSON.
+- Collect every scenario with status `MISSING` or `PARTIAL`. Ignore `COVERED`.
+- For `PARTIAL` scenarios, note the test files already listed. You will extend those files instead of creating new ones where the framework allows.
+
+## Step 2: Confirm each scenario against the code
+
+The report can be stale or wrong. For each scenario:
+- Read the entry point with CBM `get_code_snippet(project, qualified_name)`.
+- Trace what it calls with CBM `trace_path(project, function_name, direction="outbound")`.
+- Confirm that the code actually implements the scenario (for example, that the validation exists and returns the stated error).
+- If the code does not support the scenario, do not write a test. Record it as `NOT_CONFIRMED` with the reason.
+
+## Step 3: Gather the facts each test needs
+
+Collect these from source code only:
+
+API entry points:
+- HTTP method and full path, including path and query parameters
+- Request body structure, required fields, and validation rules (length, format, ranges, enums)
+- Authentication and authorization requirements
+- Every response status code and the response body shape for each scenario
+- Exact error codes or messages, if the code defines them
+
+UI entry points:
+- The page or route that hosts the feature
+- Selectors for each element the test touches, taken from the UI source (templates, components). Prefer the selector strategy existing tests already use.
+- The visible outcome of each scenario (message, navigation, state change)
+
+Other entry points (jobs, message consumers, CLI commands, scheduled tasks):
+- How to trigger it (message, command, schedule, API)
+- The observable result (database record, output message, file, log line, response)
+
+If any required fact is missing, mark the scenario `BLOCKED`.
+
+## Step 4: Learn the existing test conventions
+
+Before writing anything:
+- Read at least two existing tests of the same framework, preferably ones closest to the target entry point.
+- Read the framework configuration (base URL, environments, timeouts, reporters, tags).
+- Find existing helpers: authentication, API clients, page objects, step definitions, data builders, fixtures, cleanup hooks.
+- Note naming conventions for files, test names, and tags.
+- Note how tests get environment-specific values (environment variables, config files, profiles).
+
+Reuse what exists. Never write a second version of an existing helper.
+
+## Step 5: Select the framework skill
+
+For each scenario, choose the framework in this order:
+1. The framework of the existing tests for the same entry point (from the `tests` field in the report).
+2. The framework the repository uses for the same kind of entry point (API tests for APIs, UI tests for UIs).
+3. If several frameworks qualify, the one with the most existing tests for that kind of entry point.
+
+Then load the matching skill: `functional-test-playwright`, `functional-test-selenium`, `functional-test-cypress`, `functional-test-karate`, `functional-test-cucumber`, or `functional-test-rest-assured`. If none matches, load `functional-test-generic`.
+
+## Step 6: Write the tests
+
+Every test must:
+- Cover exactly one scenario, with a name that states the expected behavior.
+- Arrange its own preconditions. Create the data it needs through the application's API, existing fixtures, or existing data helpers. Do not rely on data that happens to exist in an environment unless existing tests do the same through a documented fixture.
+- Use unique values (for example a timestamp or UUID suffix) where uniqueness constraints exist, so tests can run repeatedly and in parallel.
+- Clean up the data it creates if existing tests do cleanup, using the same mechanism.
+- Assert the outcome fully: status or visible state, the important response fields or UI content, and the side effect where it is observable (for example, that a created record can be fetched).
+- For negative scenarios, assert the specific status code and error code or message defined in the source, not just "request failed".
+- Wait for conditions, never for time. No fixed sleeps.
+- Read URLs, credentials, and environment values from the existing configuration mechanism. Never hardcode secrets or environment URLs.
+- Not depend on the order in which tests run.
+
+## Step 7: Run and verify
+
+1. Find the command the repository uses to run tests (build file, package scripts, CI pipeline files, README).
+2. Run a compile, lint, or dry-run step if the framework has one.
+3. Run only the new or changed tests.
+4. If a test fails, find the cause:
+   - Test mistake (wrong selector, wrong payload, wrong path): fix the test and rerun.
+   - Environment problem (application not reachable, missing credentials): record `NOT_EXECUTED` with the exact error. Do not mock the application to work around it unless existing tests of the same framework mock it the same way.
+   - Application behaves differently from what the source code says: do not change the assertion. Keep the test, record `POSSIBLE_DEFECT`, and include the evidence (expected value with source reference, actual value).
+5. Run each passing test a second time to check that it is stable.
+
+## Step 8: Report
+
+Return exactly one JSON object:
+
+```json
+{
+  "project_id": "<from input>",
+  "generated": [
+    {
+      "entry_point": "<name>",
+      "scenario": "<scenario>",
+      "framework": "<framework>",
+      "test_file": "<path>",
+      "test_name": "<name>",
+      "execution": "PASSED|FAILED|NOT_EXECUTED",
+      "notes": "<details>"
+    }
+  ],
+  "not_generated": [
+    {
+      "entry_point": "<name>",
+      "scenario": "<scenario>",
+      "reason": "BLOCKED|NOT_CONFIRMED",
+      "details": "<the missing fact or why the code does not support it>"
+    }
+  ],
+  "possible_defects": [
+    {
+      "test_file": "<path>",
+      "test_name": "<name>",
+      "expected": "<value and source file/line>",
+      "actual": "<value>"
+    }
+  ],
+  "files_created": ["<path>"],
+  "files_modified": ["<path>"],
+  "commands_run": [{"command": "<command>", "result": "<pass/fail summary>"}]
+}
+```
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-playwright/SKILL.md ==================== -->
+
+---
+name: functional-test-playwright
+description: Rules for writing Playwright functional tests (UI or API) in any Playwright language binding. Use with functional-test-generation when the repository's tests use Playwright.
+triggers:
+  - playwright
+---
+
+# Playwright Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the Playwright rules.
+
+## Identify the setup
+- Find the binding the repository uses: TypeScript/JavaScript (`@playwright/test`), Python (`playwright`, often with `pytest-playwright`), Java (`com.microsoft.playwright`), or .NET (`Microsoft.Playwright`). Write in that binding only.
+- Read the Playwright config (for TypeScript/JavaScript: `playwright.config.ts` or `.js`): `baseURL`, `projects`, `testDir`, timeouts, `storageState`, and retries.
+- Find existing fixtures, page objects, and authentication setup (for example a setup project that saves `storageState`). Reuse them.
+
+## Locators
+- Use the locator strategy existing tests use. If there is none, prefer, in this order: role (`getByRole` with an accessible name), label (`getByLabel`), test id (`getByTestId`, which uses the attribute configured in the config), and visible text (`getByText`).
+- Take every role name, label, test id, and text from the UI source code. Never guess them.
+- Avoid CSS chains and XPath tied to layout.
+
+## Waiting and assertions
+- Use web-first assertions that retry automatically, for example `await expect(locator).toBeVisible()`, `toHaveText`, `toHaveURL` (Python: `expect(locator).to_be_visible()`; Java: `assertThat(locator).isVisible()`).
+- Do not use `waitForTimeout` or any fixed sleep.
+- When an action triggers a network call that the outcome depends on, wait for the response with `page.waitForResponse` (or the binding's equivalent) or assert on the resulting UI state.
+
+## API scenarios
+- If existing tests use Playwright for API testing, use the `request` fixture (or `APIRequestContext`) and assert the status and body.
+
+## Test structure
+- One scenario per `test(...)`. Group related tests with `test.describe` if existing tests do.
+- Use `test.beforeEach` or fixtures for setup. Do not share mutable state between tests.
+- Keep each test independent so it can run in parallel.
+
+## Run
+- Use the repository's command (package script, CI file). Otherwise, for TypeScript/JavaScript: `npx playwright test <file>`. For Python, Java, and .NET, use the repository's test runner (for example `pytest <file>`, `mvn test -Dtest=<Class>`, or `dotnet test --filter <name>`).
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-selenium/SKILL.md ==================== -->
+
+---
+name: functional-test-selenium
+description: Rules for writing Selenium WebDriver functional UI tests in any language. Use with functional-test-generation when the repository's tests use Selenium.
+triggers:
+  - selenium
+  - webdriver
+---
+
+# Selenium Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the Selenium rules.
+
+## Identify the setup
+- Find the language and test runner (for example Java with JUnit or TestNG, Python with pytest, C# with NUnit or xUnit, JavaScript with Mocha or Jest).
+- Find how the driver is created: a base test class, a driver factory, a fixture, or a Selenium Grid or remote URL. Reuse it. Never create a driver a different way.
+- Find the page object classes. If the repository uses the Page Object pattern, add new locators and actions to the existing page object for that page, or create a new page object in the same style.
+
+## Locators
+- Use the locator strategy existing tests use. If there is none, prefer, in this order: id, name, a dedicated test attribute, and a short CSS selector.
+- Take every locator value from the UI source code. Never guess them.
+- Avoid absolute XPath and selectors tied to layout or position.
+
+## Waiting
+- Use explicit waits (`WebDriverWait` with expected conditions) for every element interaction or state check that may not be ready immediately.
+- Do not use `Thread.sleep`, `time.sleep`, or any fixed delay.
+- Do not mix implicit and explicit waits. If the framework already sets an implicit wait, follow the existing tests' approach and do not add a second mechanism.
+
+## Assertions
+- Use the assertion library existing tests use.
+- Assert the visible outcome (text, element state, URL), not only that an element exists.
+
+## Lifecycle
+- Quit the driver in teardown through the existing mechanism, even when a test fails.
+- Make sure each test starts from a known state (fresh session or explicit navigation and login).
+
+## Run
+- Use the repository's command (for example `mvn test -Dtest=<Class>`, `gradle test --tests <Class>`, `pytest <file>`, or `dotnet test --filter <name>`).
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-cypress/SKILL.md ==================== -->
+
+---
+name: functional-test-cypress
+description: Rules for writing Cypress functional tests (UI or API). Use with functional-test-generation when the repository's tests use Cypress.
+triggers:
+  - cypress
+---
+
+# Cypress Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the Cypress rules.
+
+## Identify the setup
+- Read `cypress.config.js` or `cypress.config.ts`: `baseUrl`, `specPattern`, `env`, and timeouts.
+- Read the support files (for example `cypress/support/commands.js` or `.ts`) for existing custom commands such as login. Reuse them.
+- Read the fixtures folder for existing test data.
+
+## Locators
+- Use the selector strategy existing tests use. If there is none, prefer dedicated test attributes (for example `data-cy` or `data-testid`, whichever the UI source uses).
+- Take every selector from the UI source code. Never guess them.
+
+## Waiting and assertions
+- Cypress retries queries and assertions automatically. Assert with `.should(...)`.
+- Do not use `cy.wait(<milliseconds>)`. To wait for a network call, register it with `cy.intercept(...).as('name')` and wait with `cy.wait('@name')`, then assert on its response if the scenario depends on it.
+- Do not use `async`/`await` with Cypress commands. Chain commands instead.
+
+## API scenarios
+- Use `cy.request` for API scenarios or for setup data if existing tests do. Assert `status` and `body`.
+
+## Test structure
+- One scenario per `it(...)`. Use `beforeEach` for setup.
+- Set up state before each test instead of relying on cleanup from a previous test.
+- Use `cy.session` for login caching only if existing tests already use it.
+
+## Run
+- Use the repository's command. Otherwise: `npx cypress run --spec <file>`.
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-karate/SKILL.md ==================== -->
+
+---
+name: functional-test-karate
+description: Rules for writing Karate API functional tests in .feature files. Use with functional-test-generation when the repository's tests use Karate.
+triggers:
+  - karate
+---
+
+# Karate Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the Karate rules.
+
+## Identify the setup
+- Read `karate-config.js`: how `baseUrl` and other values are set per environment (`karate.env`).
+- Find the JUnit runner classes and how they select features (folder, tags).
+- Find reusable features (for example authentication or data creation) that existing features call with `call read('classpath:...')` or `callonce`. Reuse them.
+- Find shared JSON payloads, schemas, and JavaScript helper files.
+
+## Writing scenarios
+- Put new scenarios in the existing feature file for the same endpoint or resource if it exists. Otherwise create a new feature file in the same folder structure.
+- Use `Background:` for setup shared by every scenario in the file, as existing features do.
+- Build requests with `url`, `path`, `param`, `header`, `request`, and `method`. Take the path, method, and body from the source code.
+- Use `Scenario Outline` with `Examples` for validation scenarios that differ only by input, when this keeps the tests readable.
+- Generate unique values in the feature (for example with a JavaScript expression) where uniqueness constraints exist.
+
+## Assertions
+- Always assert `status`.
+- Assert the response with `match`. Use exact values where the source defines them. Use fuzzy markers (for example `#string`, `#number`, `#notnull`, `#uuid`, `#ignore`) only for values that are generated at runtime.
+- For error scenarios, `match` the error code or message defined in the source.
+- For create and update scenarios, confirm the side effect by reading the resource back.
+
+## Tags
+- Tag scenarios the way existing features do so the existing runners pick them up.
+
+## Run
+- Use the repository's command. For Maven it is typically `mvn test -Dtest=<RunnerClass>` with `-Dkarate.env=<env>`. To run only selected features or tags, use `-Dkarate.options="--tags @<tag> classpath:<path>"`.
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-cucumber/SKILL.md ==================== -->
+
+---
+name: functional-test-cucumber
+description: Rules for writing Cucumber / Gherkin BDD functional tests with step definitions in any language. Use with functional-test-generation when the repository's tests use Cucumber or Gherkin feature files with step definitions.
+triggers:
+  - cucumber
+  - gherkin
+  - bdd
+---
+
+# Cucumber Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the Cucumber rules.
+
+## Identify the setup
+- Find the implementation (for example cucumber-jvm for Java or Kotlin, `@cucumber/cucumber` for JavaScript or TypeScript, Cucumber for Ruby, or Reqnroll or SpecFlow for .NET).
+- Find the feature folder, the step definition (glue) folder, hooks, and the runner configuration (tags, glue path, plugins).
+- Find what the steps drive underneath (an API client, Selenium, Playwright, REST Assured). The rules of that tool's skill also apply to any new step code.
+
+## Writing feature files
+- Write scenarios in business language that describes behavior, not clicks or HTTP details, matching the style of existing features.
+- Add scenarios to the existing feature file for the same feature if it exists.
+- Use `Background`, `Scenario Outline`, and `Examples` the way existing features do.
+- Tag scenarios the way existing features do so the runner picks them up.
+
+## Step definitions
+- Reuse existing steps first. Search every step definition for a pattern that matches before writing a new step.
+- Write a new step only when none matches. Put it in the step definition file for the same domain area.
+- Make sure the new step pattern does not match an existing step. Ambiguous step matches make Cucumber fail.
+- Put assertions in `Then` steps only.
+- Pass data between steps through the mechanism existing steps use (for example a shared scenario context or the World object). Do not use global static state unless existing steps already do.
+
+## Verify before running
+- Run a dry run to detect undefined or ambiguous steps (for example `--dry-run` for cucumber-js, or the dry-run option of the cucumber-jvm runner).
+
+## Run
+- Use the repository's command. For example, for cucumber-jvm with Maven: `mvn test -Dcucumber.filter.tags="@<tag>"`; for JavaScript: `npx cucumber-js <feature file>`.
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-rest-assured/SKILL.md ==================== -->
+
+---
+name: functional-test-rest-assured
+description: Rules for writing REST Assured API functional tests in Java or Kotlin. Use with functional-test-generation when the repository's API tests use REST Assured.
+triggers:
+  - rest assured
+  - rest-assured
+  - restassured
+---
+
+# REST Assured Functional Tests
+
+Follow the `functional-test-generation` workflow first. This skill adds the REST Assured rules.
+
+## Identify the setup
+- Find the test runner (JUnit 4, JUnit 5, or TestNG) and the base test class.
+- Find the shared `RequestSpecification` or `ResponseSpecification` objects, base URI or port configuration, authentication helpers, and request or response model classes (POJOs). Reuse them.
+
+## Writing tests
+- Use the `given()` / `when()` / `then()` structure.
+- Build request bodies with the existing model classes or builders. If none exist, use the format existing tests use. Take every field from the source code.
+- Take the method and path from the source code. Pass path parameters with `pathParam` or the request path arguments.
+
+## Assertions
+- Always assert the status code.
+- Assert body fields with Hamcrest matchers (for example `equalTo`, `notNullValue`, `hasItem`), using exact values where the source defines them.
+- Use JSON schema validation only if the repository already includes the REST Assured json-schema-validator module and schema files.
+- For error scenarios, assert the error code or message defined in the source.
+- For create and update scenarios, confirm the side effect by reading the resource back.
+- If a value from one response is needed later, extract it with `.extract()`.
+
+## Run
+- Use the repository's command (for example `mvn test -Dtest=<Class>` or `gradle test --tests <Class>`).
+
+<!-- ==================== SKILL FILE: .agents/skills/functional-test-generic/SKILL.md ==================== -->
+
+---
+name: functional-test-generic
+description: Fallback rules for writing functional tests when the repository's test framework is not covered by a specific functional-test skill. Use with functional-test-generation.
+triggers:
+  - generic functional test
+---
+
+# Generic Functional Tests
+
+Follow the `functional-test-generation` workflow first. Use this skill when no framework-specific skill matches the repository's tests.
+
+## Identify the framework from the repository
+- Find the test framework from the build or dependency files and from the existing test files. Record the evidence (file and dependency name).
+- Read at least two existing functional tests completely. Learn from them:
+  - How the system under test is reached (HTTP client, browser driver, message client, CLI, in-process client)
+  - How configuration and environment values are loaded
+  - How setup and teardown are done
+  - How assertions are written
+  - How tests are named, tagged, and organized
+- Find the framework's documentation in the repository (README, docs folder, comments) if the conventions are unclear.
+
+## Writing tests
+- Write the new tests in exactly the same style, structure, and libraries as the existing tests.
+- Use only APIs and functions you have seen in the existing tests or in the framework's code in the repository. Do not use functions you have not seen used.
+- Apply every rule in `functional-test-generation`: one scenario per test, own test data, unique values, condition-based waiting, full assertions, no hardcoded secrets or URLs, and no order dependence.
+
+## No existing functional tests
+If the repository has no functional tests at all:
+- Do not choose and add a new framework. Record every scenario as `BLOCKED` with the reason "no functional test framework in repository".
+- List in `details` the test-related dependencies the repository already declares, so a person can decide which framework to adopt.
+
+## Run
+- Use the command from the build files, package scripts, CI pipeline files, or README. Record the exact command in the report.
