@@ -1,0 +1,67 @@
+Production-grade prompt for Devin:
+You are a senior software engineer. Make the following changes carefully and precisely.
+
+### Goal
+Add a new LangGraph-based agent for Functional Gap Analysis while keeping the existing Agent Spark completely untouched.
+
+### Strict Constraints
+- DO NOT modify, refactor, or touch any existing Agent Spark code, classes, flows, or tasks.
+- DO NOT change any current business logic, API endpoints, or task execution paths.
+- Only ADD new code for the LangGraph agent.
+- The system must support both agents side-by-side.
+- Selection between Agent Spark and LangGraph must be controlled only via environment variable.
+
+### Requirements
+
+1. Environment Variable Control
+   - Add support for a new environment variable, e.g.:
+     AGENT_ENGINE=spark | langgraph
+   - Default value should remain "spark" (so existing behavior is unchanged).
+   - When AGENT_ENGINE=langgraph, the system should use the new LangGraph agent instead of Agent Spark.
+   - When AGENT_ENGINE=spark (or not set), continue using the existing Agent Spark exactly as before.
+
+2. New LangGraph Agent
+   - Create a completely new, isolated LangGraph agent for Functional Gap Analysis.
+   - Location: create a new module/package (e.g. `agents/langgraph_gap_analysis/` or similar clean structure).
+   - The agent must implement the Hybrid Pattern:
+     a. Discovery Stage → uses CBM MCP tools to find entry points and propose functional scenarios.
+     b. Coverage Stage → takes a locked list of scenarios and checks functional test coverage (COVERED / PARTIAL / MISSING).
+   - Use only CBM MCP tools (no glob, grep, find, etc.).
+   - Force structured JSON output at every stage.
+   - Use temperature=0 and strict limits on tool calls / iterations for consistency.
+   - Support the same project_id and workspace_path that CBM already uses.
+
+3. Integration Point
+   - CBM still generates the knowledge graph as it does today.
+   - After CBM indexing is ready, instead of always invoking Agent Spark, the system should check the AGENT_ENGINE env variable.
+   - If AGENT_ENGINE=langgraph → call the new LangGraph agent.
+   - If AGENT_ENGINE=spark → call the existing Agent Spark (no changes to this path).
+
+4. Output Contract
+   - The LangGraph agent must return the same JSON schema that is currently expected by the rest of the system for gap analysis results (or a clearly documented compatible schema).
+   - Include summary fields: total entry points, total scenarios, covered, partial, missing, coverage_percent.
+
+5. Code Quality
+   - Production-grade code only.
+   - Proper error handling, logging, and timeouts.
+   - Clean separation of concerns.
+   - Type hints and clear documentation.
+   - No breaking changes to existing APIs or task definitions.
+
+6. Configuration
+   - All new configuration (model, temperature, max iterations, CBM settings, etc.) must be readable from environment variables or existing config system.
+   - Do not hardcode secrets or model names.
+
+### Deliverables
+- New LangGraph agent implementation (isolated).
+- Environment variable based switching logic.
+- Minimal, clean integration point that does not alter existing Spark flow.
+- Clear README or comments explaining how to switch between `spark` and `langgraph`.
+- Example .env entries.
+
+### Important
+- Existing Agent Spark must continue to work exactly as it does today when AGENT_ENGINE=spark.
+- Zero changes to current task definitions, flows, or orchestration logic beyond the engine selection switch.
+- Prefer composition over modification.
+
+Implement this cleanly and safely.
