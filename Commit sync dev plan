@@ -1,0 +1,228 @@
+# Commit sync — development plan
+
+## Summary
+
+Once a week per GitHub org, the platform pulls the latest tracked-branch commit of every onboarded component. For each component whose commit moved, it:
+- updates the code graph and embeddings from the diff
+- reruns `generate_catalog` only when a catalog-relevant file changed
+
+Every graph, embedding set and catalog ends up stamped with the exact commit sha it reflects.
+
+**Decisions already made**
+
+| Area | Decision |
+| --- | --- |
+| Trigger | Pull only. Neither GHE webhooks nor CI pipelines may call platform endpoints. |
+| Cadence | Each org swept weekly, orgs staggered across the 7 nights (off-peak). |
+| Detection | GraphQL lookup of onboarded repos by stored repo node ID, 100 per call; orgs are never listed in full. |
+| Matching | By immutable GitHub repo ID, resolved once per component and stored. |
+| Source access | REST/GraphQL only: compare API for diffs, contents API or zipball at an exact sha. No GitPython, no git binary. |
+| Graph | Incremental: re-parse changed files, re-link their dependents. Full rebuild fallback. |
+| Catalog | Rerun the existing `generate_catalog` playbook unchanged, gated by a path-to-section map. Token cost is out of scope for now. |
+| Stamping | Catalog, graph and embeddings record the sha and date they reflect; catalog search surfaces it. |
+| Freshness gap | Up to 7 days, covered by an on-demand single-component refresh. |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Nightly sweep<br/>orgs due this weekday] --> B[GHE GraphQL<br/>100 repos per lookup]
+    B --> C{Main moved?}
+    C -- no --> N[Record the check]
+    C -- yes --> D[Job queue<br/>global cap, coalesced]
+    R[On-demand refresh] --> D
+    D --> E[Compare and fetch<br/>diff from indexed sha]
+    E --> F[Update graph<br/>plus LanceDB rows]
+    F --> G{Catalog-relevant?}
+    G -- yes --> H[Rerun generate_catalog<br/>full zipball at the sha]
+    G -- no --> S[Stamp sha<br/>history row per sync]
+    H --> S
+```
+
+Detection runs nightly and only reads. Everything after the queue runs inside one job per component. The on-demand refresh enqueues the same job directly, skipping detection.
+
+## Data model changes
+
+All changes are additive in MongoDB; existing catalog and component documents keep their shape. Sync state lives in a new collection keyed by component ID, so existing onboarding code is untouched apart from writing one row at onboarding time.
+
+| Collection | Purpose | Key fields |
+| --- | --- | --- |
+| `component_sync_state` (new) | One row per onboarded component | `component_id`, `repo_id` (numeric), `repo_node_id` (GraphQL), `owner`, `name`, `branch`, `path_prefix` (optional, monorepos), `indexed_sha`, `indexed_at`, `indexed_file_count`, `last_seen_head`, `last_checked_at`, `status` (active, dormant, unreachable), `last_error` |
+| `org_sweep_schedule` (new) | Which night each org is swept, and its last result | `org`, `weekday` (0–6), `last_run_at`, `last_success_at`, `last_error` |
+| `component_sync_history` (new) | Audit trail, one row per completed sync | `component_id`, `from_sha`, `to_sha`, `commit_shas` (all commits in the range), `mode` (noop, incremental, full), `reason`, `changed_paths`, `catalog_rerun` (bool), `catalog_version`, `duration_ms`, `finished_at` |
+| Existing job queue | Sync jobs reuse it, with its global concurrency cap | New job type `component_sync`, payload `{component_id, target_sha}`; one live job per component |
+| Existing catalog store | Unchanged schema plus stamps | `source_sha`, `source_commit_date`, `catalog_version`, and a stored diff against the previous version |
+| Graph (graphifyy) and LanceDB rows | Unchanged schema plus a stamp | `source_sha` on every node and embedding row written |
+
+## Change detection
+
+A nightly OCP CronJob sweeps only the orgs assigned to that weekday, so each org is checked once a week and the job load stays flat. At 1,000 orgs that is about 143 orgs a night.
+
+1. Load the night's orgs from `org_sweep_schedule`, plus any org whose last sweep failed (retried the next night, not next week).
+2. For those orgs, load the `active` components from `component_sync_state`.
+3. Query GitHub GraphQL `nodes(ids: [...])` with 100 repo node IDs per call. For each repo, request:
+    - `databaseId`, `nameWithOwner`, `isArchived`, `pushedAt`
+    - the default branch's head `oid`
+4. For components tracking a non-default branch, run a batched `ref(qualifiedName:)` lookup for that branch's head instead.
+5. Compare each head `oid` with `indexed_sha`:
+    - **Equal:** record `last_checked_at` and move on.
+    - **Different:** enqueue a `component_sync` job with the new head as `target_sha`.
+6. Record the org's `last_success_at` only after all its lookups succeeded.
+
+At the planning scale, 50,000 onboarded components is about 500 GraphQL calls a week in total, independent of how many repos the orgs hold. A full listing of 1,000,000 repos is never needed.
+
+Requests go through the GHE GraphQL endpoint (`/api/graphql`) with a service token. On a rate-limit response, the sweep waits for the reset time and resumes.
+
+## Repo-to-component matching
+
+Every component is matched to its repo by GitHub's numeric repo ID and GraphQL node ID, resolved once and stored. Names can change; IDs cannot. Onboarding writes the IDs for new components, and the backfill writes them for existing ones.
+
+| Situation | How it shows up | Action |
+| --- | --- | --- |
+| Repo renamed or moved to another org | Same ID, different `nameWithOwner` | Update stored owner and name; sync as normal |
+| Repo deleted and recreated with the same name | Node lookup returns null; a name lookup finds a different ID | Mark `unreachable`, re-resolve the ID, then do a full rebuild |
+| Repo archived | `isArchived` is true | Mark `dormant`, stop sweeping it |
+| Repo deleted or token lost access | Node lookup returns null | Mark `unreachable`, log it, keep the last catalog |
+| Monorepo: several components in one repo | Several rows share a `repo_id`, each with its own `path_prefix` | One compare per repo; each component receives only the changed files under its prefix. A component with none is just stamped with the new sha |
+| Component tracks a non-default branch | Row has an explicit `branch` | Branch-specific head lookup (detection step 4) |
+
+## Sync job
+
+One job brings one component from `indexed_sha` to `target_sha`, and advances `indexed_sha` only after every step succeeds.
+
+1. **Plan.** Call `GET /repos/{owner}/{repo}/compare/{indexed_sha}...{target_sha}`. Choose a full rebuild when any of these holds:
+    - no `indexed_sha` (first sync without a baseline)
+    - compare returns 404, `diverged` or `behind` (force-push or rewritten history)
+    - the file list reaches GitHub's 300-file cap
+    - more than 30% of the repo's files changed
+2. **Fetch.**
+    - **Graph-only work** needs just the changed files: the contents API at the exact sha for up to 50 files, otherwise the zipball at the exact sha with only those paths extracted.
+    - **A catalog rerun or full rebuild** needs the whole zipball at the sha.
+    - Binary files are skipped.
+3. **Graph.** graphifyy:
+    - removes nodes and edges owned by removed, renamed and modified files
+    - parses added and modified files
+    - re-resolves edges for files that depended on any changed path
+    - re-runs transitive dependency resolution if a build file or lockfile changed
+
+    Retries must be idempotent (remove, then write).
+4. **Embeddings.** Delete LanceDB rows for removed paths; upsert rows for changed paths, keyed by component and path.
+5. **Catalog gate.** Map every changed path through the section map below.
+    - **Any match:** rerun `generate_catalog` on the full workspace at `target_sha`, at temperature 0 with its fixed template. A structural match also re-runs `identify_component_type` first.
+    - **No match:** skip the catalog and just stamp the new sha on it.
+6. **Stamp and record.**
+    - Store the new catalog version with `source_sha`, commit date and a diff against the previous version.
+    - Advance `indexed_sha` conditionally: only if it still equals the value read in step 1.
+    - Write one `component_sync_history` row listing every commit sha in the range.
+
+**Section map (catalog gate)**
+
+| Changed path matches | Catalog impact | Structural |
+| --- | --- | --- |
+| `pom.xml`, `build.gradle*`, `settings.gradle*`, `package.json`, `pyproject.toml`, `go.mod`, `*.csproj` | Dependencies, tech stack | Yes |
+| Lockfiles (`package-lock.json`, `yarn.lock`, `gradle.lockfile`, `requirements*.txt`, `go.sum`) | Dependencies | No |
+| `application*.yml/.yaml/.properties`, `bootstrap*.*` | Configuration, integrations | No |
+| Controllers, resources, `api/`, `routes/`, OpenAPI or Swagger specs, `*.proto`, `*.graphql` | APIs | No |
+| Clients, Feign, listeners, consumers, producers, `messaging/` | Integrations | No |
+| Entities, repositories, `model/`, `domain/`, SQL and migration files | Data model | No |
+| Security configs, `security/`, `auth/` | Security | No |
+| `Dockerfile`, `Containerfile` | Deployment, tech stack | Yes |
+| Helm, OpenShift, k8s manifests, `Jenkinsfile`, pipeline files | Deployment | No |
+| `README*` | Overview | No |
+
+Test files are excluded from the API, integration and data-model rows. The map ships as a config file so teams can extend it without a code change.
+
+## Backfill of existing components
+
+Existing catalogs were built from a branch zipball, so no sha was recorded. The backfill recovers one per component without regenerating anything.
+
+1. Read each onboarded component's repo reference (repo URL or zipball URL; both contain owner and name).
+2. Resolve the repo's numeric ID and node ID, and its default branch if none is recorded.
+3. Find the baseline: the newest commit on the tracked branch at or before the component's catalog-generation timestamp (`GET /repos/{o}/{r}/commits?sha={branch}&until={timestamp}&per_page=1`).
+4. Insert a `component_sync_state` row with that sha as `indexed_sha`. Rows that already exist are never overwritten, so the script is safe to re-run.
+5. Components with no usable timestamp get `indexed_sha = null`. Their first weekly sync is a full rebuild. Those rebuilds are released into the queue in small daily batches, so they never all start at once.
+
+Run it in dry-run mode first and review the counts: baselined, needs full rebuild, unparseable URL, repo not found, duplicate repo and branch.
+
+## Failure handling, concurrency and on-demand refresh
+
+**Concurrency**
+
+- Sync jobs run through the existing MongoDB job queue and its global concurrency cap. The cap guards against the out-of-memory kills previously caused by simultaneous graphifyy initialisation across many repos.
+- At most one queued and one running job per component. A newer head found while a job is queued replaces its `target_sha` instead of adding a second job.
+- Running jobs hold a lease renewed by heartbeat. A worker that dies leaves an expired lease, and another worker reclaims the job.
+
+**Failures**
+
+| Failure | Behaviour |
+| --- | --- |
+| GitHub 5xx, 429, secondary rate limit | Retry with backoff, honouring `Retry-After` and the rate-limit reset time |
+| Job step fails (fetch, graph, catalog, embeddings) | Retry up to 3 times, 5, 10, then 15 minutes apart; then mark failed and record `last_error`. `indexed_sha` stays put, so the next attempt diffs from the same baseline |
+| `indexed_sha` moved during the job | Discard the result and re-plan from the new baseline |
+| Org sweep fails | Org is retried the next night, not the next week |
+| Repo unreachable | Mark `unreachable`; keep serving the last catalog with its stamp |
+
+**On-demand refresh**
+
+An internal platform API and UI action, `POST /components/{id}/sync`, enqueues the same `component_sync` job immediately. It covers the up-to-7-day freshness gap when someone needs today's state before a migration or review. It is called by platform users, not by GHE or CI.
+
+## Observability
+
+Metrics go to Prometheus alongside the existing pipeline metrics. Logs go to Splunk as single-line JSON with `component_id`, `org`, `from_sha`, `to_sha` and `job_id` on every line.
+
+| Metric | Why it matters |
+| --- | --- |
+| `sync_sweep_orgs_total{result}` | Nightly sweep completed or failed per org |
+| `sync_components_checked_total`, `sync_components_changed_total` | Weekly change rate; drives capacity planning |
+| `sync_jobs_total{mode, result}` | Split of noop, incremental and full; failures |
+| `sync_job_duration_seconds{mode}` | Whether the week's queue drains inside the week |
+| `sync_queue_depth`, `sync_queue_oldest_age_seconds` | Backlog building up |
+| `sync_catalog_reruns_total` | How often the catalog gate fires; LLM gateway load |
+| `sync_component_staleness_days` | Gap between main and the indexed sha, per component |
+| `sync_github_rate_limit_remaining` | Headroom on the GHE token |
+
+Alert when:
+- an org sweep fails two nights running
+- the queue's oldest job is older than 7 days
+- any component's staleness exceeds 14 days
+
+## Delivery phases
+
+Each phase merges on its own and leaves the system working; a phase starts only when the previous one meets its acceptance criteria.
+
+1. **Discovery and design sign-off.** Map the existing job queue, `generate_catalog` invocation, graphifyy indexing entry points and LanceDB writer; confirm whether graphifyy can re-index single files.
+    - Accepted when: a written report names each integration point (module, function, signature) and the graphifyy capability, and the plan is approved.
+2. **Sync state and backfill.** New collections and indexes, ID resolution at onboarding, backfill script with dry-run.
+    - Accepted when: dry-run counts are reviewed, and every onboarded component has a row with repo IDs and either a baseline sha or a full-rebuild flag.
+3. **Weekly sweep.** CronJob, org weekday schedule, GraphQL node lookups, branch lookups, enqueue with coalescing.
+    - Accepted when: a sweep over a test org enqueues exactly the components whose main sha moved, and a failed org is retried the next night.
+4. **Sync job: graph and embeddings.** Compare, fetch, graph delta with full-rebuild fallback, LanceDB delta, conditional sha advance, history row.
+    - Accepted when: a test repo with an add, modify, rename and delete ends with a graph identical to a fresh full index at the same sha.
+5. **Catalog gate.** Section map config, `generate_catalog` rerun on a match, `identify_component_type` on structural changes, catalog stamping and version diff.
+    - Accepted when: a utility-class change produces no catalog rerun, a `pom.xml` change does, and both catalogs carry the new sha.
+6. **Operations.** On-demand refresh API and UI action, Prometheus metrics, Splunk logs, alerts, catalog search returning the sha and date.
+    - Accepted when: one org runs a full week in the staging OCP project with metrics visible and no stuck jobs.
+7. **Rollout.** Enable orgs in waves (10, 100, then all), watching queue age and LLM gateway load.
+    - Accepted when: all orgs are scheduled and the weekly queue drains within 7 days.
+
+## Open questions and risks
+
+**Open questions**
+
+- [ ] Does graphifyy support re-indexing individual files and re-linking dependents, or only whole repos?
+- [ ] Are any components subfolders of a shared repo (monorepo `path_prefix` needed from day one)?
+- [ ] What does a component record store today: repo URL, zipball URL, or only an app ID?
+- [ ] Is a catalog-generation timestamp stored per component, for the backfill baseline?
+- [ ] Does the GHE service token have GraphQL access and an adequate rate limit?
+- [ ] What is the LLM gateway's request and token limit per minute? It sets the catalog rerun ceiling.
+- [ ] Should orgs be spread evenly across the 7 nights automatically, or should teams pick their night?
+
+**Risks**
+
+| Risk | Mitigation |
+| --- | --- |
+| Weekly queue does not drain in 7 days | Raise the global cap within pod memory; the section-map gate skips catalog reruns for most pushes; watch the queue's oldest job age |
+| Catalog wording churns on every rerun | Temperature 0, fixed template, stored version diff; section-level updates kept as a later option |
+| First-sync full rebuilds swamp the queue | Released in daily batches; global cap still applies |
+| graphifyy cannot index incrementally | Graph falls back to a full rebuild per changed repo; plan capacity for it |
+| Catalog up to a week stale | Sha and date stamped and shown in catalog search; on-demand refresh |
