@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+cbm_entrypoints.py - find entry-point candidates in any repo using the
+codebase-memory-mcp (CBM) knowledge graph. Standalone: Python 3.9+ standard
+library only, plus the `codebase-memory-mcp` binary on PATH.
+
+Usage:
+    python cbm_entrypoints.py <repo_path>
+    python cbm_entrypoints.py <repo_path> --json out.json
+    python cbm_entrypoints.py <repo_path> --public-root src/pkg/__init__.py   # library repos
+    python cbm_entrypoints.py <repo_path> --no-index                          # reuse existing index
+
+What it does (code only, no LLM, deterministic):
+  1. Indexes the repo with CBM (or reuses the index) over one MCP stdio session.
+  2. Runs fixed graph queries, following next_cursor so no rows are lost
+     (query_graph silently truncates large results).
+  3. Applies 10 language-independent graph signals to produce candidates.
+  4. Lists git-tracked files CBM did not index (they are invisible to the graph).
+
+Output tiers:
+  STRONG - registration evidence (route handler, passed as value, called from
+           top level, imported-but-never-called, top-level program, bootstrap
+           file, exported public API). Very likely real entry points.
+  WEAK   - only "nothing in production calls it" (no-caller function, orphan
+           class). Contains real framework-invoked entry points (controller
+           actions, Razor handlers, interface methods, lazy UI components)
+           AND dead code. Needs review or an LLM classification pass.
+
+Tested on CBM 0.11.0 (Python agent, FastAPI/LangGraph, Spring, .NET, React,
+Angular, a Python library): 100% recall of independently verified entry
+points (STRONG + WEAK together) across all seven repos.
+
+Do NOT use STRONG alone. Where frameworks invoke code by convention, most real
+entry points are WEAK (measured: .NET 37/50, Angular 17/18, React 7/10; Spring
+1/18). This script does not decide which WEAK candidates are real; that needs
+reading the code (human review or one bounded LLM call per batch).
+"""
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Generic, framework-independent conventions
+# --------------------------------------------------------------------------
+TEST_PATH = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs|e2e|integration[-_]?tests?|"
+    r"functional[-_]?tests?|src/test)(/|$)"
+    r"|(_test|_spec|\.test|\.spec|Tests?|Specs?|IT)\.[A-Za-z0-9]+$"
+    r"|(^|/)test_[^/]+$",
+    re.IGNORECASE,
+)
+# CBM models elements of these formats as Class/Module nodes (e.g. pom.xml
+# elements become Class nodes), so they are never code entry points.
+NON_CODE_EXT = {
+    "xml", "json", "yaml", "yml", "toml", "ini", "properties", "csproj", "props",
+    "targets", "sln", "css", "scss", "sass", "less", "md", "txt", "bicep", "tf",
+    "html", "htm", "svg", "lock", "env", "cfg", "conf",
+}
+BINARY_EXT = {
+    "png", "jpg", "jpeg", "gif", "ico", "webp", "bmp", "pdf", "zip", "gz", "jar",
+    "dll", "exe", "so", "dylib", "woff", "woff2", "ttf", "eot", "otf", "mp4", "mp3",
+    "class", "pyc",
+}
+CALLABLE = ("Function", "Method")
+STRONG = {"S1_route_handler", "S2_passed_as_value", "S3_called_from_top_level",
+          "S4_imported_not_called", "S7_top_level_program", "S8_bootstrap_file",
+          "S10_public_api"}
+
+
+def norm(path: str | None) -> str:
+    return (path or "").replace("\\", "/")
+
+
+def is_test(path: str | None) -> bool:
+    return bool(path) and bool(TEST_PATH.search(norm(path)))
+
+
+def is_external(path: str | None) -> bool:
+    return not path or path.startswith("<")  # e.g. <python-builtins>
+
+
+def is_code(path: str | None) -> bool:
+    return bool(path) and norm(path).rsplit(".", 1)[-1].lower() not in NON_CODE_EXT
+
+
+# --------------------------------------------------------------------------
+# CBM MCP stdio session
+# --------------------------------------------------------------------------
+class CBM:
+    def __init__(self, binary: str = "codebase-memory-mcp"):
+        exe = shutil.which(binary)
+        if not exe:
+            sys.exit(f"ERROR: '{binary}' not found on PATH. Install codebase-memory-mcp first.")
+        self.proc = subprocess.Popen(
+            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+        )
+        self.ids = itertools.count(1)
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "cbm-entrypoints", "version": "1.0"}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, msg: dict) -> None:
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def _rpc(self, method: str, params: dict) -> dict:
+        rid = next(self.ids)
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("CBM process exited unexpectedly")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    raise RuntimeError(f"CBM {method} error: {msg['error']}")
+                return msg["result"]
+
+    def call(self, tool: str, args: dict) -> dict:
+        res = self._rpc("tools/call", {"name": tool, "arguments": args})
+        if res.get("isError"):
+            raise RuntimeError(f"CBM {tool} failed: {res['content'][0]['text']}")
+        if res.get("structuredContent") is not None:
+            return res["structuredContent"]
+        return json.loads(res["content"][0]["text"])
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+
+    def cypher(self, project: str, query: str) -> list[list]:
+        """All rows of a read-only query. Follows next_cursor because
+        query_graph truncates at an output budget (verified: 104 of 446 rows)."""
+        rows: list[list] = []
+        cursor = None
+        expected = None
+        while True:
+            args = {"project": project, "query": query, "format": "json",
+                    "max_rows": 99998, "max_output_tokens": 4000000}
+            if cursor:
+                args["cursor"] = cursor
+            data = self.call("query_graph", args)
+            rows.extend(data.get("rows", []))
+            if expected is None and data.get("total_relation") == "eq":
+                expected = data.get("total")
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                raise RuntimeError(f"has_more without next_cursor: {query}")
+        if expected is not None and len(rows) != expected:
+            raise RuntimeError(f"incomplete result {len(rows)}/{expected}: {query}")
+        return rows
+
+
+# --------------------------------------------------------------------------
+# Candidate generation
+# --------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    qn: str
+    name: str
+    label: str
+    file: str
+    start: int
+    end: int
+    signals: set = field(default_factory=set)
+    evidence: list = field(default_factory=list)
+
+    @property
+    def tier(self) -> str:
+        return "STRONG" if self.signals & STRONG else "WEAK"
+
+
+def to_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def generate(cbm: CBM, project: str, public_roots: list[str]) -> tuple[list[Candidate], dict]:
+    q = lambda s: cbm.cypher(project, s)
+
+    nodes = {r[0]: r for r in q(
+        "MATCH (f:Function|Method) RETURN f.qualified_name, f.name, f.label, "
+        "f.file_path, f.start_line, f.end_line")}
+    prod = {k: r for k, r in nodes.items() if not is_test(r[3]) and not is_external(r[3])}
+
+    inbound = defaultdict(lambda: defaultdict(list))
+    for etype in ("CALLS", "CALL_REFERENCE"):
+        for src_qn, src_label, src_file, tgt_qn in q(
+            f"MATCH (a)-[:{etype}]->(f:Function|Method) RETURN a.qualified_name, "
+            "a.label, a.file_path, f.qualified_name"):
+            if src_qn == tgt_qn:
+                continue  # CBM can emit spurious self-loops
+            inbound[tgt_qn][etype].append((src_qn, src_label, src_file))
+
+    decorated = defaultdict(list)
+    for f_qn, d_name in q("MATCH (f:Function|Method)-[:DECORATES]->(d) "
+                          "RETURN f.qualified_name, d.name"):
+        decorated[f_qn].append(d_name)
+
+    route_handlers = defaultdict(list)
+    for r_name, h_qn in q("MATCH (r:Route)-[:HANDLES]-(h:Function|Method) "
+                          "RETURN r.qualified_name, h.qualified_name"):
+        route_handlers[h_qn].append(r_name)
+
+    imported_by = defaultdict(set)
+    for src_file, tgt_qn in q("MATCH (a:File)-[:IMPORTS]->(f:Function|Method) "
+                              "RETURN a.file_path, f.qualified_name"):
+        imported_by[tgt_qn].add(src_file)
+    calls_from_file = defaultdict(set)
+    for src_file, tgt_qn in q("MATCH (a)-[:CALLS]->(f:Function|Method) "
+                              "RETURN a.file_path, f.qualified_name"):
+        calls_from_file[src_file].add(tgt_qn)
+
+    cands: dict[str, Candidate] = {}
+
+    def add(qn, name, label, file, start, end, signal, ev):
+        c = cands.setdefault(qn, Candidate(qn, name, label, file, to_int(start), to_int(end)))
+        c.signals.add(signal)
+        c.evidence.append(ev)
+
+    # Callable signals S1-S6
+    for qn, r in prod.items():
+        inb = inbound.get(qn, {})
+        calls = inb.get("CALLS", [])
+        prod_callers = [s for s in calls if not is_test(s[2]) and s[1] in CALLABLE + ("Class",)]
+        module_callers = [s for s in calls if not is_test(s[2]) and s[1] in ("Module", "File")]
+        refs = [s for s in inb.get("CALL_REFERENCE", []) if not is_test(s[2])]
+        base = (qn, r[1], r[2], r[3], r[4], r[5])
+        if qn in route_handlers:
+            add(*base, "S1_route_handler", f"routes={sorted(route_handlers[qn])}")
+        if refs:
+            add(*base, "S2_passed_as_value", f"referenced_by={sorted({s[0] for s in refs})}")
+        if module_callers:
+            add(*base, "S3_called_from_top_level", f"from={sorted({s[2] for s in module_callers})}")
+        importers = {f for f in imported_by.get(qn, ()) if not is_test(f)}
+        not_called = sorted(f for f in importers if qn not in calls_from_file.get(f, set()))
+        if not_called and not prod_callers:
+            add(*base, "S4_imported_not_called", f"imported_by={not_called}")
+        if decorated.get(qn):
+            add(*base, "S5_decorated", f"decorators={sorted(set(decorated[qn]))}")
+        if not prod_callers and not module_callers and not refs:
+            add(*base, "S6_no_production_caller",
+                "called_only_by_tests" if calls else "no_inbound_calls")
+
+    # S7 top-level programs
+    for m_qn, m_file in q("MATCH (m:Module)-[:CALLS]->() RETURN DISTINCT m.qualified_name, m.file_path"):
+        if not (is_test(m_file) or is_external(m_file) or not is_code(m_file)):
+            add(m_qn, "<module>", "Module", m_file, 1, 0, "S7_top_level_program",
+                "module executes calls at top level")
+
+    # S4 for classes (incl. directory imports resolving to Folder nodes)
+    all_classes = q("MATCH (c:Class) RETURN c.qualified_name, c.name, c.file_path, "
+                    "c.start_line, c.end_line")
+    class_rows = q("MATCH (a:File)-[:IMPORTS]->(c:Class) RETURN a.file_path, c.qualified_name, "
+                   "c.name, c.file_path, c.start_line, c.end_line")
+    folder_classes = defaultdict(list)
+    for row in all_classes:
+        if row[2]:
+            folder_classes[norm(row[2]).rsplit("/", 1)[0]].append(row)
+    for imp_file, folder in q("MATCH (a:File)-[:IMPORTS]->(d:Folder) RETURN a.file_path, d.file_path"):
+        for c_qn, c_name, c_file, c_s, c_e in folder_classes.get(norm(folder), []):
+            class_rows.append([imp_file, c_qn, c_name, c_file, c_s, c_e])
+    class_used = {r[0] for r in q(
+        "MATCH (a)-[:CALLS|INHERITS|IMPLEMENTS]->(c:Class) RETURN DISTINCT c.qualified_name")}
+    for imp_file, c_qn, c_name, c_file, c_s, c_e in class_rows:
+        if (is_test(imp_file) or is_test(c_file) or is_external(c_file)
+                or not is_code(c_file) or c_qn in class_used):
+            continue
+        add(c_qn, c_name, "Class", c_file, c_s, c_e, "S4_imported_not_called", f"imported_by={imp_file}")
+
+    # S9 orphan classes
+    referenced = {r[1] for r in q(
+        "MATCH (a)-[:CALLS|USAGE|USES_TYPE|INHERITS|IMPLEMENTS|IMPORTS|CALL_REFERENCE]->(c:Class) "
+        "RETURN DISTINCT a.file_path, c.qualified_name") if not is_test(r[0])}
+    imported_classes = {r[1] for r in class_rows}
+    for c_qn, c_name, c_file, c_s, c_e in all_classes:
+        if (is_test(c_file) or is_external(c_file) or not is_code(c_file)
+                or c_qn in referenced or c_qn in imported_classes):
+            continue
+        add(c_qn, c_name, "Class", c_file, c_s, c_e, "S9_orphan_class",
+            "no production code references this class")
+
+    # S10 library public API (only when --public-root given)
+    for root in public_roots:
+        root = norm(root)
+        for x_qn, x_name, x_label, x_file, x_s, x_e in q(
+            f'MATCH (a:File)-[:IMPORTS]->(x:Function|Method|Class) WHERE a.file_path = "{root}" '
+            "RETURN x.qualified_name, x.name, x.label, x.file_path, x.start_line, x.end_line"):
+            if is_external(x_file):
+                continue
+            add(x_qn, x_name, x_label, x_file, x_s, x_e, "S10_public_api", f"exported_by={root}")
+            if x_label == "Class":
+                for m_qn, m_name, m_file, m_s, m_e in q(
+                    f'MATCH (c:Class)-[:DEFINES_METHOD]->(m:Method) WHERE c.qualified_name = "{x_qn}" '
+                    "RETURN m.qualified_name, m.name, m.file_path, m.start_line, m.end_line"):
+                    if not m_name.startswith("_"):
+                        add(m_qn, m_name, "Method", m_file, m_s, m_e, "S10_public_api",
+                            f"method_of_exported={x_name}")
+
+    # S8 bootstrap-only root files
+    imported_files = {r[1] for r in q("MATCH (a:File)-[:IMPORTS]->(b) RETURN DISTINCT a.file_path, b.file_path")
+                      if r[1] and r[0] != r[1] and not is_test(r[0])}
+    defines_code = {r[0] for r in q("MATCH (f:File)-[:DEFINES]->(x:Function|Method|Class) "
+                                    "RETURN DISTINCT f.file_path")}
+    importers = {}
+    for f, fq in q("MATCH (a:File)-[:IMPORTS]->() RETURN DISTINCT a.file_path, a.qualified_name"):
+        importers.setdefault(f, fq)
+    for f in importers:
+        if (is_test(f) or is_external(f) or not is_code(f) or f in imported_files
+                or f in defines_code):
+            continue
+        add(f"{importers[f]}#file", "<file>", "File", f, 1, 0, "S8_bootstrap_file",
+            "imports code, defines nothing, imported by no production file")
+
+    ordered = sorted(cands.values(), key=lambda c: (c.file, c.start, c.qn))
+    stats = {"callables_total": len(nodes), "callables_production": len(prod)}
+    return ordered, stats
+
+
+def unindexed_files(cbm: CBM, project: str, repo: Path) -> list[str]:
+    """Git-tracked text files with no CBM File node. CBM does not always report
+    these (verified: a Karate .feature file was not indexed while
+    not_indexed_files_count was 0)."""
+    try:
+        tracked = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True,
+                                 text=True, check=True).stdout.splitlines()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ["<not a git repo: unindexed-file check skipped>"]
+    indexed = {norm(r[0]) for r in cbm.cypher(project, "MATCH (f:File) RETURN f.file_path")}
+    return sorted(f for f in tracked
+                  if norm(f) not in indexed and f.rsplit(".", 1)[-1].lower() not in BINARY_EXT)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Find entry-point candidates with CBM.")
+    ap.add_argument("repo", help="path to the repository")
+    ap.add_argument("--json", metavar="FILE", help="write full results as JSON")
+    ap.add_argument("--public-root", action="append", default=[],
+                    help="library package root file (repeatable), e.g. src/pkg/__init__.py")
+    ap.add_argument("--no-index", action="store_true", help="reuse the existing CBM index")
+    ap.add_argument("--show-weak", action="store_true", help="print WEAK candidates too")
+    args = ap.parse_args()
+
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        sys.exit(f"ERROR: not a directory: {repo}")
+
+    cbm = CBM()
+    try:
+        if args.no_index:
+            projects = cbm.call("list_projects", {"format": "json"}).get("projects", [])
+            match = [p for p in projects if Path(p.get("root_path", "") or "").resolve() == repo]
+            if not match:
+                sys.exit("ERROR: repo not indexed yet; run without --no-index")
+            project = match[0]["name"]
+        else:
+            print(f"Indexing {repo} ...", file=sys.stderr)
+            res = cbm.call("index_repository", {"repo_path": str(repo), "format": "json"})
+            project = res["project"]
+            if res.get("status") not in ("indexed", None):
+                print(f"WARNING: index status = {res.get('status')}", file=sys.stderr)
+
+        cands, stats = generate(cbm, project, args.public_root)
+        missing = unindexed_files(cbm, project, repo)
+    finally:
+        cbm.close()
+
+    strong = [c for c in cands if c.tier == "STRONG"]
+    weak = [c for c in cands if c.tier == "WEAK"]
+    sig = Counter(s for c in cands for s in c.signals)
+
+    print(f"\nProject: {project}")
+    print(f"Production callables: {stats['callables_production']} | candidates: {len(cands)} "
+          f"(STRONG {len(strong)}, WEAK {len(weak)})")
+    print("Signals: " + ", ".join(f"{k}={v}" for k, v in sorted(sig.items())))
+
+    def show(items):
+        for c in items:
+            short = ",".join(s.split("_")[0] for s in sorted(c.signals))
+            print(f"  {c.file}:{c.start:<5} {c.label:8} {c.name:34} [{short}]")
+
+    print(f"\n== STRONG candidates ({len(strong)}) ==")
+    show(strong)
+    if args.show_weak:
+        print(f"\n== WEAK candidates ({len(weak)}): framework-invoked OR dead code; review ==")
+        show(weak)
+    else:
+        print(f"\n({len(weak)} WEAK candidates hidden; use --show-weak or --json)")
+    print(f"\n== Git-tracked files CBM did NOT index ({len(missing)}): read these directly ==")
+    for f in missing:
+        print(f"  {f}")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps({
+            "project": project, "stats": stats, "unindexed_files": missing,
+            "candidates": [{"tier": c.tier, "qualified_name": c.qn, "name": c.name,
+                            "label": c.label, "file": c.file, "lines": [c.start, c.end],
+                            "signals": sorted(c.signals), "evidence": c.evidence}
+                           for c in cands],
+        }, indent=2), encoding="utf-8")
+        print(f"\nJSON written to {args.json}")
+
+
+if __name__ == "__main__":
+    main()
