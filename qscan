@@ -1,0 +1,2263 @@
+#!/usr/bin/env python3
+"""
+qscan - functional quality scan of a Git repository using the
+codebase-memory-mcp (CBM) knowledge graph.
+
+For one repository it reports:
+  1. entry points (with the registration evidence that makes each one an entry point)
+  2. business flows (in-repo call chain from each entry point, grouped by capability)
+  3. expected functional scenarios, derived from code evidence (error branches,
+     status codes, auth and validation checks) with file:line for every scenario
+  4. existing functional tests and which entry points / scenarios they exercise
+  5. gaps (untested entry points and untested scenarios), each with evidence
+  6. limitations (what could not be analysed and why)
+
+Deterministic: no LLM, no network. Same commit + same rules file -> same output.
+All framework/ecosystem knowledge is in DEFAULT_RULES below (data, not code).
+
+Requirements: Python 3.9+, git, and the `codebase-memory-mcp` binary on PATH.
+
+Usage:
+    python qscan.py <repo_path> [--json out.json] [--rules my_rules.json]
+                    [--public-root pkg/__init__.py] [--no-index] [--limit 50] [-v]
+
+Exit codes: 0 ok, 2 usage error, 3 CBM unavailable/failed, 4 indexing failed, 5 internal error.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import itertools
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+__version__ = "1.0.0"
+log = logging.getLogger("qscan")
+
+EXIT_OK, EXIT_USAGE, EXIT_CBM, EXIT_INDEX, EXIT_INTERNAL = 0, 2, 3, 4, 5
+CALLABLE = ("Function", "Method")
+STRONG_SIGNALS = frozenset({
+    "S1_route_handler", "S2_passed_as_value", "S3_called_from_top_level",
+    "S4_imported_not_called", "S7_top_level_program", "S8_bootstrap_file",
+    "S10_public_api", "S11_named_in_string", "S14_convention_route"})
+SIGNAL_MEANING = {
+    "S1": "route node linked to this handler",
+    "S2": "passed as a value (callback / handler registration)",
+    "S3": "called from top-level code (script main)",
+    "S4": "function imported but never called (e.g. tools=[...] lists)",
+    "S4c": "class imported but never called (UI component or type-only use)",
+    "S5": "carries a non-language decorator/annotation",
+    "S6": "no production code calls it",
+    "S7": "top-level program code calling in-repo functions",
+    "S8": "bootstrap-only file (imports code, defines nothing)",
+    "S9": "class nothing in production references",
+    "S10": "library public API (exported by the package root)",
+    "S11": "named in a string (route file, config, console-script entry)",
+    "S12": "function value bound to a name (JS handlers, lambdas)",
+    "S13": "module nothing imports (lazy/runtime loaded, script)",
+    "S14": "route by framework convention (see rules: conventions)",
+}
+
+
+class QScanError(Exception):
+    """Fatal, user-facing error with an exit code."""
+
+    def __init__(self, message: str, code: int = EXIT_INTERNAL):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# Built-in rules: every regex, file-type list, limit and framework convention.
+# This is the only place framework/ecosystem knowledge lives. Override with --rules.
+# --------------------------------------------------------------------------
+DEFAULT_RULES: dict = json.loads(r'''
+{
+ "rules_version": "1.0.0",
+ "_comment": "All framework/ecosystem knowledge used by qscan.py. Edit to extend; qscan.py contains only generic mechanisms.",
+ "limits": {
+  "max_line_chars": 2000,
+  "max_file_bytes": 1000000,
+  "trace_depth": 3,
+  "max_flows": 500,
+  "scenario_callee_depth": 2,
+  "assert_window_lines": 15,
+  "max_negative_scenarios_per_entry_point": 12,
+  "trace_timeout_s": 60
+ },
+ "files": {
+  "test_path_regex": "(^|/)(tests?|__tests__|spec|specs|e2e|integration[-_]?tests?|functional[-_]?tests?|src/test|step_definitions|bdd|cucumber|karate|playwright|cypress|selenium)(/|$)|(_test|_spec|\\.test|\\.spec|Tests?|Specs?|IT)\\.[A-Za-z0-9]+$|(^|/)test_[^/]+$|(^|/)features/(steps(/|$)|environment\\.py$)|(^|/)conftest\\.py$",
+  "non_code_ext": [
+   "xml",
+   "json",
+   "yaml",
+   "yml",
+   "toml",
+   "ini",
+   "properties",
+   "csproj",
+   "props",
+   "targets",
+   "sln",
+   "css",
+   "scss",
+   "sass",
+   "less",
+   "md",
+   "txt",
+   "bicep",
+   "tf",
+   "html",
+   "htm",
+   "svg",
+   "lock",
+   "env",
+   "cfg",
+   "conf"
+  ],
+  "binary_ext": [
+   "png",
+   "jpg",
+   "jpeg",
+   "gif",
+   "ico",
+   "webp",
+   "bmp",
+   "pdf",
+   "zip",
+   "gz",
+   "jar",
+   "dll",
+   "exe",
+   "so",
+   "dylib",
+   "woff",
+   "woff2",
+   "ttf",
+   "eot",
+   "otf",
+   "mp4",
+   "mp3",
+   "class",
+   "pyc"
+  ],
+  "build_files": [
+   "gradlew",
+   "gradlew.bat",
+   "mvnw",
+   "mvnw.cmd",
+   "build.gradle",
+   "build.gradle.kts",
+   "settings.gradle",
+   "settings.gradle.kts",
+   "makefile",
+   "cmakelists.txt"
+  ],
+  "generated_name_regex": "(\\.gen\\.|\\.g\\.|_pb2(_grpc)?\\.py$|\\.pb\\.go$|\\.designer\\.cs$|(^|/)(generated|__generated__|migrations|alembic/versions)(/|$))",
+  "generated_header_regex": "auto-?generated|do not edit|<auto-generated|@generated",
+  "string_scan_ext": [
+   "py",
+   "js",
+   "jsx",
+   "ts",
+   "tsx",
+   "mjs",
+   "cjs",
+   "java",
+   "kt",
+   "cs",
+   "go",
+   "rb",
+   "php",
+   "rs",
+   "scala",
+   "groovy",
+   "vue",
+   "svelte",
+   "toml",
+   "yaml",
+   "yml",
+   "json",
+   "xml",
+   "ini",
+   "cfg",
+   "conf",
+   "properties",
+   "gradle",
+   "kts"
+  ],
+  "package_init_names": [
+   "__init__"
+  ],
+  "ui_import_extensions": [
+   ".vue",
+   ".tsx",
+   ".ts",
+   ".jsx",
+   ".js",
+   ".svelte"
+  ],
+  "ui_index_files": [
+   "index.ts",
+   "index.js",
+   "index.tsx"
+  ]
+ },
+ "signals": {
+  "language_decorators": [
+   "property",
+   "staticmethod",
+   "classmethod",
+   "abstractmethod",
+   "override",
+   "Override",
+   "cached_property",
+   "functools.cached_property",
+   "functools.wraps",
+   "wraps",
+   "lru_cache",
+   "functools.lru_cache",
+   "cache",
+   "functools.cache",
+   "dataclass",
+   "dataclasses.dataclass",
+   "overload",
+   "typing.overload",
+   "final",
+   "typing.final",
+   "contextmanager",
+   "contextlib.contextmanager",
+   "asynccontextmanager",
+   "contextlib.asynccontextmanager",
+   "total_ordering",
+   "singledispatch",
+   "singledispatchmethod",
+   "abc.abstractmethod",
+   "SuppressWarnings",
+   "Deprecated",
+   "deprecated",
+   "FunctionalInterface",
+   "SafeVarargs",
+   "Nullable",
+   "NonNull",
+   "Obsolete",
+   "MethodImpl",
+   "DebuggerStepThrough"
+  ],
+  "function_value_regex": "=\\s*(?:async\\s*)?(?:\\([^)]*\\)\\s*=>|[\\w$]+\\s*=>|function\\b)|=\\s*[\\w$.]+\\(\\s*(?:async\\s*)?(?:\\([^)]*\\)\\s*=>|[\\w$]+\\s*=>|function\\b)|=\\s*lambda\\b",
+  "string_ref_regex": "(['\"])([A-Za-z_][\\w\\\\./-]*?)(@|#|::|:)([A-Za-z_]\\w*)\\1"
+ },
+ "routing": {
+  "verbs": [
+   "GET",
+   "POST",
+   "PUT",
+   "PATCH",
+   "DELETE",
+   "HEAD",
+   "OPTIONS"
+  ],
+  "verb_call_regex": "(?<![\\w$])(?:[\\w$\\]\\)]+\\s*(?:\\.|->|::)\\s*)?(get|post|put|patch|delete|head|options|all|any|map(?:get|post|put|patch|delete)|handlefunc|add_api_route|add_url_rule|route)\\s*\\(\\s*(['\"`])([^'\"`\\n]*)\\2",
+  "annotation_regex": "[@\\[]\\s*(get|post|put|patch|delete|request|http(?:get|post|put|patch|delete))(?:mapping)?\\b\\s*(?:\\(\\s*(?:(?:value|path)\\s*=\\s*)?\\{?\\s*(['\"`])([^'\"`]*)\\2)?",
+  "class_prefix_regex": "[@\\[]\\s*(?:requestmapping|controller|route|path|restcontroller)\\s*\\(\\s*(?:(?:value|path)\\s*=\\s*)?\\{?\\s*(['\"`])([^'\"`]*)\\1",
+  "class_declaration_regex": "^\\s*(?:export\\s+|public\\s+|internal\\s+|abstract\\s+|sealed\\s+|partial\\s+|final\\s+|data\\s+|open\\s+)*(class|interface|struct|object|record|impl|trait)\\b",
+  "class_name_regex": "(?:class|interface|struct|object|record)\\s+(\\w+)",
+  "controller_token": {
+   "token": "[controller]",
+   "strip_suffix": "Controller"
+  },
+  "methods_keyword_regex": "methods?\\s*=\\s*\\[?\\s*(?:RequestMethod\\.)?['\"]?(GET|POST|PUT|PATCH|DELETE)",
+  "ui_route_path_regex": "(?<![\\w$])path\\s*:\\s*(['\"`])([^'\"`]*)\\1",
+  "ui_route_component_regex": "(?:component|element|loadComponent|loadChildren)\\s*:\\s*(?:\\(\\)\\s*=>\\s*import\\(\\s*['\"`]([^'\"`]+)['\"`]\\)|<?\\s*([A-Z][\\w$]*))",
+  "binding_skip_identifiers": [
+   "function",
+   "async",
+   "await",
+   "req",
+   "res",
+   "return",
+   "validate",
+   "auth",
+   "next",
+   "ctx",
+   "c",
+   "r",
+   "w"
+  ],
+  "same_file_prefix_regex": "([\\w$]+)\\s*[:=]\\s*[\\w$.]*(?:router|blueprint|group|controller)[\\w$]*\\s*\\((?:[^)]*?\\b(?:url_)?prefix\\s*=\\s*|\\s*)(['\"])(/[^'\"]*)\\2",
+  "mount_literal_regex": "(['\"`])(/[^'\"`\\s]*)\\1",
+  "import_binding_regex": "(?:const|let|var)\\s+([\\w$]+)\\s*=\\s*require\\(\\s*['\"](\\.[^'\"]+)['\"]\\s*\\)|import\\s+([\\w$]+)\\s+from\\s+['\"](\\.[^'\"]+)['\"]|from\\s+([\\w.]+)\\s+import\\s+([\\w, ]+)",
+  "definition_line_regex": "\\s*(?:func|def|function|public|private|static)\\b",
+  "mount_max_depth": 3,
+  "openapi_detect_regex": "^\\s*[\"']?(openapi|swagger)[\"']?\\s*:",
+  "capability_ignored_segments": [
+   "api",
+   "v1",
+   "v2",
+   "v3",
+   "rest",
+   "public"
+  ]
+ },
+ "conventions": {
+  "_comment": "Frameworks that route by convention (no route string in code). Each adapter is generic code driven by these tables.",
+  "enabled": [
+   "rails_routes",
+   "laravel_resource",
+   "django_urls",
+   "razor_pages",
+   "file_based_ui_routes"
+  ],
+  "rest_actions_plural": {
+   "index": [
+    [
+     "GET",
+     ""
+    ]
+   ],
+   "create": [
+    [
+     "POST",
+     ""
+    ]
+   ],
+   "store": [
+    [
+     "POST",
+     ""
+    ]
+   ],
+   "new": [
+    [
+     "GET",
+     "/new"
+    ]
+   ],
+   "show": [
+    [
+     "GET",
+     "/{id}"
+    ]
+   ],
+   "edit": [
+    [
+     "GET",
+     "/{id}/edit"
+    ]
+   ],
+   "update": [
+    [
+     "PUT",
+     "/{id}"
+    ],
+    [
+     "PATCH",
+     "/{id}"
+    ]
+   ],
+   "destroy": [
+    [
+     "DELETE",
+     "/{id}"
+    ]
+   ]
+  },
+  "rest_actions_singular": {
+   "show": [
+    [
+     "GET",
+     ""
+    ]
+   ],
+   "create": [
+    [
+     "POST",
+     ""
+    ]
+   ],
+   "update": [
+    [
+     "PUT",
+     ""
+    ],
+    [
+     "PATCH",
+     ""
+    ]
+   ],
+   "destroy": [
+    [
+     "DELETE",
+     ""
+    ]
+   ],
+   "new": [
+    [
+     "GET",
+     "/new"
+    ]
+   ],
+   "edit": [
+    [
+     "GET",
+     "/edit"
+    ]
+   ]
+  },
+  "rails": {
+   "routes_file_suffix": "config/routes.rb",
+   "controllers_dir": "app/controllers",
+   "controller_suffix": "_controller.rb"
+  },
+  "laravel": {
+   "routes_dir": "routes/",
+   "controllers_dir_token": "Controllers",
+   "resource_create_extra": [
+    [
+     "GET",
+     "/create"
+    ]
+   ]
+  },
+  "django": {
+   "urls_file": "urls.py",
+   "views_file": "views.py",
+   "drf_router_actions": {
+    "list": [
+     "GET",
+     ""
+    ],
+    "create": [
+     "POST",
+     ""
+    ],
+    "retrieve": [
+     "GET",
+     "/{id}"
+    ],
+    "update": [
+     "PUT",
+     "/{id}"
+    ],
+    "partial_update": [
+     "PATCH",
+     "/{id}"
+    ],
+    "destroy": [
+     "DELETE",
+     "/{id}"
+    ]
+   },
+   "class_view_methods": {
+    "get": "GET",
+    "post": "POST",
+    "put": "PUT",
+    "patch": "PATCH",
+    "delete": "DELETE",
+    "list": "GET",
+    "create": "POST",
+    "retrieve": "GET",
+    "update": "PUT",
+    "partial_update": "PATCH",
+    "destroy": "DELETE"
+   }
+  },
+  "razor": {
+   "pages_dir_token": "/Pages/",
+   "page_suffix": ".cshtml.cs",
+   "areas_regex": "/Areas/(\\w+)/Pages/",
+   "handler_regex": "On(Get|Post|Put|Delete|Patch)(\\w*?)(Async)?$",
+   "page_directive_regex": "@page\\s+\"([^\"]+)\\\""
+  },
+  "file_routes": {
+   "dir_regex": "(?:^|/)(?:routes|pages|app)/",
+   "extensions": [
+    "tsx",
+    "jsx",
+    "vue",
+    "svelte",
+    "ts",
+    "js"
+   ],
+   "ignored_segment_prefixes": [
+    "_",
+    "(",
+    "+"
+   ],
+   "ignored_segments": [
+    "index",
+    "page",
+    "route",
+    "layout"
+   ],
+   "param_prefixes": [
+    "[",
+    "$"
+   ],
+   "min_files": 3
+  }
+ },
+ "tests": {
+  "extra_test_extensions": [
+   "feature",
+   "http",
+   "jmx"
+  ],
+  "postman_marker": "\"_postman_id\"",
+  "test_declaration_regex": "(^\\s*(?:async\\s+)?def\\s+test\\w*|^\\s*func\\s+Test\\w*|(?<![\\w$.])(?:it|test|specify)\\s*\\(\\s*['\"`]|@Test\\b|\\[(?:Fact|Theory|Test|TestMethod)\\b|^\\s*Scenario(?: Outline)?:|public\\s+function\\s+(?:test\\w*|it_\\w*)|@test\\b)",
+  "jmx_path_regex": "name=\"HTTPSampler\\.path\">([^<]*)<",
+  "jmx_method_regex": "name=\"HTTPSampler\\.method\">([A-Z]+)<",
+  "karate_path_regex": "^\\s*(?:Given|And|When|\\*)\\s+path\\s+(.+)$",
+  "karate_method_regex": "^\\s*(?:Given|And|When|Then|\\*)\\s+method\\s+(\\w+)",
+  "karate_def_regex": "^\\s*(?:Given|And|When|Then|\\*)\\s+def\\s+(\\w+)\\s*=\\s*(['\"])([^'\"]*)\\2\\s*$",
+  "ui_navigation_regex": "\\b(?:goto|visit|navigate(?:To|ByUrl)?|go_to|open)\\s*\\(\\s*(['\"`])([^'\"`]+)\\1",
+  "http_file_request_regex": "^\\s*(GET|POST|PUT|PATCH|DELETE)\\s+(\\S+)",
+  "string_literal_regex": "([\"'`])([^\"'`\\n]{1,300})\\1",
+  "path_like_regex": "^(?:https?://[^/\\s]+)?(/[^\\s\"'<>]*|api/[^\\s\"'<>]*)$",
+  "variable_prefix_regex": "^(?:\\{\\{[\\w.\\-]+\\}\\}|\\{[\\w.]+\\}|\\$\\{[\\w.()]+\\}|%s|#\\{[\\w.]+\\})(?=/)",
+  "method_word_regex": "\\b(get|post|put|patch|delete)(?:async|json|_json|request)?\\b",
+  "method_lookback_regex": "(get|post|put|patch|delete)(?:async|json|_json|request)?\\s*\\(\\s*$",
+  "postman_method_regex": "\"method\"\\s*:\\s*\"(\\w+)\"",
+  "static_asset_regex": "\\.(png|jpe?g|css|js|svg|ico|json|ya?ml|properties|txt)$",
+  "method_lookback_lines": 2,
+  "max_mapped_handlers": 2,
+  "status_assert_names": {
+   "isOk": 200,
+   "isCreated": 201,
+   "isNoContent": 204,
+   "isBadRequest": 400,
+   "isUnauthorized": 401,
+   "isForbidden": 403,
+   "isNotFound": 404,
+   "isConflict": 409,
+   "isUnprocessableEntity": 422
+  },
+  "status_assert_regex": "(?:status(?:_code|Code)?\\W{0,40}?|expect\\(\\s*|assert\\w*\\(?\\s*\\w*\\.?status\\w*\\W{0,20}|toBe\\(\\s*|isEqualTo\\(\\s*|\\.status\\(\\s*)([1-5]\\d\\d)\\b|\\b(isOk|isCreated|isNoContent|isBadRequest|isUnauthorized|isForbidden|isNotFound|isConflict|isUnprocessableEntity|HTTP_(\\d{3})\\w*)\\b"
+ },
+ "scenarios": {
+  "_comment": "Expected functional scenarios are derived from code evidence in the handler and its in-repo callees. Each scenario carries the file:line it came from.",
+  "error_line_regex": "\\b(raise|throw|abort|HTTPException|HttpException|ResponseStatusException|NotFound|BadRequest|Unauthorized|Forbidden|Conflict|ValidationError|PermissionDenied|status\\s*\\(\\s*[45]\\d\\d|status_code\\s*=\\s*[45]\\d\\d|\\.status\\(\\s*[45]\\d\\d|StatusCode\\(\\s*[45]\\d\\d|res\\.sendStatus\\(\\s*[45]\\d\\d|http\\.Status(BadRequest|NotFound|Unauthorized|Forbidden|Conflict|UnprocessableEntity|InternalServerError))\\b",
+  "condition_regex": "^\\s*(?:\\}\\s*)?(?:if|elif|else\\s+if|unless|guard|when|catch)\\b(.*)$",
+  "condition_lookback_lines": 3,
+  "status_number_regex": "(?:\\b|_)([45]\\d\\d)(?:\\b|_)",
+  "status_names": {
+   "BAD_REQUEST": 400,
+   "BadRequest": 400,
+   "UNAUTHORIZED": 401,
+   "Unauthorized": 401,
+   "FORBIDDEN": 403,
+   "Forbidden": 403,
+   "PermissionDenied": 403,
+   "NOT_FOUND": 404,
+   "NotFound": 404,
+   "CONFLICT": 409,
+   "Conflict": 409,
+   "UNPROCESSABLE_ENTITY": 422,
+   "UnprocessableEntity": 422,
+   "ValidationError": 422,
+   "INTERNAL_SERVER_ERROR": 500,
+   "InternalServerError": 500
+  },
+  "auth_regex": "(?i)(auth|login_required|permission|secured|preauthorize|rolesallowed|authorize|jwt|requires?_?(user|role|admin)|current_user|isAuthenticated|bearer)",
+  "auth_status": [
+   401,
+   403
+  ],
+  "validation_regex": "(?i)(@Valid\\b|\\bvalidate\\w*\\(|\\bValidator\\b|is_valid\\(|\\.validate\\b|schema\\.|Joi\\.|BindingResult|ModelState\\.IsValid|class-validator|pydantic|Body\\()",
+  "validation_status": [
+   400,
+   422
+  ],
+  "message_regex": "(['\"])([^'\"]{4,120})\\1"
+ }
+}
+''')
+
+
+# --------------------------------------------------------------------------
+# Rules (all framework / ecosystem knowledge, loaded from JSON)
+# --------------------------------------------------------------------------
+class Rules:
+    """Rules come from the built-in DEFAULT_RULES, or from a JSON file (--rules)
+    with the same structure when an organisation needs to change them."""
+
+    def __init__(self, path: Optional[Path] = None):
+        try:
+            raw = path.read_bytes() if path else json.dumps(DEFAULT_RULES, sort_keys=True).encode()
+            self.data: dict = json.loads(raw)
+        except FileNotFoundError as e:
+            raise QScanError(f"rules file not found: {path}", EXIT_USAGE) from e
+        except json.JSONDecodeError as e:
+            raise QScanError(f"rules file is not valid JSON: {path}: {e}", EXIT_USAGE) from e
+        self.path = path or Path("built-in")
+        self.sha256 = hashlib.sha256(raw).hexdigest()[:12]
+        self._rx: dict[str, re.Pattern] = {}
+
+    def get(self, dotted: str) -> Any:
+        node: Any = self.data
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                raise QScanError(f"rules file {self.path} is missing '{dotted}'", EXIT_USAGE)
+            node = node[part]
+        return node
+
+    def rx(self, dotted: str, flags: int = 0) -> re.Pattern:
+        key = f"{dotted}/{flags}"
+        if key not in self._rx:
+            try:
+                self._rx[key] = re.compile(self.get(dotted), flags)
+            except re.error as e:
+                raise QScanError(f"invalid regex '{dotted}' in rules: {e}", EXIT_USAGE) from e
+        return self._rx[key]
+
+
+# --------------------------------------------------------------------------
+# Repository context: tracked files, file cache, path classification
+# --------------------------------------------------------------------------
+def norm(path: Optional[str]) -> str:
+    return (path or "").replace("\\", "/")
+
+
+def to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+class RepoContext:
+    def __init__(self, root: Path, rules: Rules):
+        self.root = root
+        self.rules = rules
+        self.tracked = self._git(["ls-files"]).splitlines()
+        self.tracked_set = set(self.tracked)
+        try:
+            self.commit = self._git(["rev-parse", "HEAD"]).strip()
+        except QScanError:
+            self.commit = "unknown"
+        self._lines: dict[str, list[str]] = {}
+        self._generated: dict[str, bool] = {}
+        self._test_rx = rules.rx("files.test_path_regex", re.I)
+        self._non_code = set(rules.get("files.non_code_ext"))
+        self._build_files = set(rules.get("files.build_files"))
+        self._gen_name = rules.rx("files.generated_name_regex", re.I)
+        self._gen_head = rules.rx("files.generated_header_regex", re.I)
+        self.max_line = int(rules.get("limits.max_line_chars"))
+        self.max_bytes = int(rules.get("limits.max_file_bytes"))
+
+    def _git(self, args: list[str]) -> str:
+        try:
+            proc = subprocess.run(["git", "-C", str(self.root), *args], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=120)
+        except FileNotFoundError as e:
+            raise QScanError("git is not installed or not on PATH", EXIT_USAGE) from e
+        except subprocess.TimeoutExpired as e:
+            raise QScanError(f"git {' '.join(args)} timed out", EXIT_INTERNAL) from e
+        if proc.returncode != 0:
+            raise QScanError(f"{self.root} is not a git repository ({proc.stderr.strip()})", EXIT_USAGE)
+        return proc.stdout
+
+    def lines(self, rel: str) -> list[str]:
+        """File lines (cached). Oversized/unreadable files return []."""
+        rel = norm(rel)
+        if rel not in self._lines:
+            path = self.root / rel
+            try:
+                if path.stat().st_size > self.max_bytes:
+                    log.debug("skipping large file %s", rel)
+                    self._lines[rel] = []
+                else:
+                    self._lines[rel] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError as e:
+                log.debug("cannot read %s: %s", rel, e)
+                self._lines[rel] = []
+        return self._lines[rel]
+
+    def is_test(self, path: Optional[str]) -> bool:
+        return bool(path) and bool(self._test_rx.search(norm(path)))
+
+    @staticmethod
+    def is_external(path: Optional[str]) -> bool:
+        return not path or path.startswith("<")  # CBM pseudo-paths such as <python-builtins>
+
+    def is_generated(self, path: Optional[str]) -> bool:
+        p = norm(path)
+        if not p:
+            return False
+        if p not in self._generated:
+            result = bool(self._gen_name.search(p))
+            if not result and p in self.tracked_set:
+                head = "\n".join(self.lines(p)[:5])
+                result = bool(self._gen_head.search(head))
+            self._generated[p] = result
+        return self._generated[p]
+
+    def is_code(self, path: Optional[str]) -> bool:
+        p = norm(path)
+        if not p:
+            return False
+        if p.rsplit("/", 1)[-1].lower() in self._build_files:
+            return False
+        if p.rsplit(".", 1)[-1].lower() in self._non_code:
+            return False
+        return not self.is_generated(p)
+
+    def is_production_code(self, path: Optional[str]) -> bool:
+        return not self.is_test(path) and not self.is_external(path) and self.is_code(path)
+
+
+# --------------------------------------------------------------------------
+# CBM MCP client (stdio JSON-RPC) with timeouts and complete pagination
+# --------------------------------------------------------------------------
+def cypher_str(value: str) -> str:
+    """Quote a value as a Cypher string literal."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class CBMClient:
+    def __init__(self, binary: str = "codebase-memory-mcp", timeout_s: float = 300.0):
+        exe = shutil.which(binary)
+        if not exe:
+            raise QScanError(f"'{binary}' not found on PATH; install codebase-memory-mcp", EXIT_CBM)
+        self.timeout_s = timeout_s
+        try:
+            self.proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                         errors="replace", bufsize=1)
+        except OSError as e:
+            raise QScanError(f"cannot start {exe}: {e}", EXIT_CBM) from e
+        self._ids = itertools.count(1)
+        self._out: "queue.Queue[Optional[str]]" = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "qscan", "version": __version__}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _pump(self) -> None:
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self._out.put(line)
+        self._out.put(None)
+
+    def _send(self, msg: dict) -> None:
+        assert self.proc.stdin is not None
+        try:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise QScanError(f"CBM process is not accepting input: {e}", EXIT_CBM) from e
+
+    def _rpc(self, method: str, params: dict, timeout_s: Optional[float] = None) -> dict:
+        rid = next(self._ids)
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        wait = timeout_s or self.timeout_s
+        while True:
+            try:
+                line = self._out.get(timeout=wait)
+            except queue.Empty as e:
+                raise QScanError(f"CBM did not answer '{method}' within {wait:.0f}s", EXIT_CBM) from e
+            if line is None:
+                raise QScanError("CBM process exited unexpectedly", EXIT_CBM)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                log.debug("ignoring non-JSON CBM output: %.120s", line)
+                continue
+            if msg.get("id") != rid:
+                continue
+            if "error" in msg:
+                raise QScanError(f"CBM {method} error: {msg['error']}", EXIT_CBM)
+            return msg["result"]
+
+    def call(self, tool: str, args: dict, timeout_s: Optional[float] = None) -> dict:
+        res = self._rpc("tools/call", {"name": tool, "arguments": args}, timeout_s)
+        if res.get("isError"):
+            text = (res.get("content") or [{}])[0].get("text", "")
+            raise QScanError(f"CBM tool {tool} failed: {text[:300]}", EXIT_CBM)
+        if res.get("structuredContent") is not None:
+            return res["structuredContent"]
+        try:
+            return json.loads(res["content"][0]["text"])
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            raise QScanError(f"CBM tool {tool} returned an unexpected payload", EXIT_CBM) from e
+
+    def cypher(self, project: str, query: str) -> list[list]:
+        """All rows of a read-only query. query_graph truncates at an output
+        budget, so follow next_cursor and verify the count against `total`."""
+        rows: list[list] = []
+        cursor: Optional[str] = None
+        expected: Optional[int] = None
+        while True:
+            args = {"project": project, "query": query, "format": "json",
+                    "max_rows": 99998, "max_output_tokens": 4000000}
+            if cursor:
+                args["cursor"] = cursor
+            data = self.call("query_graph", args)
+            rows.extend(data.get("rows", []))
+            if expected is None and data.get("total_relation") == "eq":
+                expected = data.get("total")
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            if not cursor:
+                raise QScanError(f"CBM reported more rows but no cursor for: {query}", EXIT_CBM)
+        if expected is not None and len(rows) != expected:
+            raise QScanError(f"incomplete CBM result ({len(rows)}/{expected}) for: {query}", EXIT_CBM)
+        return rows
+
+    def close(self) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            log.debug("CBM did not exit cleanly; terminating")
+            self.proc.kill()
+
+
+# --------------------------------------------------------------------------
+# Entry-point discovery (graph signals)
+# --------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    qn: str
+    name: str
+    label: str
+    file: str
+    start: int
+    end: int
+    signals: set = field(default_factory=set)
+    evidence: list = field(default_factory=list)
+    triggers: list = field(default_factory=list)
+
+    @property
+    def confirmed(self) -> bool:
+        return bool(self.signals & STRONG_SIGNALS) or bool(self.triggers)
+
+
+@dataclass
+class Graph:
+    """Graph facts reused across stages."""
+    callables: dict  # qn -> (qn, name, label, file, start, end), all callables
+    prod: dict       # subset in production code
+    decorated: dict  # qn -> [decorator names]
+    imports_of: dict  # file -> set(imported file)
+    imported_files: set
+    defines_code: set
+    classes: list = field(default_factory=list)  # (name, file, start, end) of production classes
+
+
+def discover(ctx: RepoContext, cbm: CBMClient, project: str, public_roots: list[str]
+             ) -> tuple[dict[str, Candidate], Graph]:
+    rules = ctx.rules
+    q: Callable[[str], list[list]] = lambda s: cbm.cypher(project, s)
+
+    callables = {r[0]: r for r in q("MATCH (f:Function|Method) RETURN f.qualified_name, f.name, "
+                                    "f.label, f.file_path, f.start_line, f.end_line")}
+    prod = {k: r for k, r in callables.items() if ctx.is_production_code(r[3])}
+
+    inbound: dict = defaultdict(lambda: defaultdict(list))
+    for etype in ("CALLS", "CALL_REFERENCE"):
+        for src_qn, src_label, src_file, tgt_qn in q(
+                f"MATCH (a)-[:{etype}]->(f:Function|Method) RETURN a.qualified_name, "
+                "a.label, a.file_path, f.qualified_name"):
+            if src_qn != tgt_qn:  # CBM can emit spurious self-loops
+                inbound[tgt_qn][etype].append((src_qn, src_label, src_file))
+
+    decorated: dict = defaultdict(list)
+    for f_qn, d_name in q("MATCH (f:Function|Method)-[:DECORATES]->(d) RETURN f.qualified_name, d.name"):
+        decorated[f_qn].append(d_name)
+
+    route_handlers: dict = defaultdict(list)
+    for r_qn, h_qn in q("MATCH (r:Route)-[:HANDLES]-(h:Function|Method) RETURN r.qualified_name, h.qualified_name"):
+        route_handlers[h_qn].append(r_qn)
+
+    imported_by: dict = defaultdict(set)
+    for src_file, tgt_qn in q("MATCH (a:File)-[:IMPORTS]->(f:Function|Method) RETURN a.file_path, f.qualified_name"):
+        imported_by[tgt_qn].add(src_file)
+    calls_from_file: dict = defaultdict(set)
+    for src_file, tgt_qn in q("MATCH (a)-[:CALLS]->(f:Function|Method) RETURN a.file_path, f.qualified_name"):
+        calls_from_file[src_file].add(tgt_qn)
+
+    # CBM links every Python file to builtin classes with DEFINES; count only
+    # definitions whose own path is the file.
+    defines_code = {r[0] for r in q("MATCH (f:File)-[:DEFINES]->(x:Function|Method|Class) "
+                                    "RETURN DISTINCT f.file_path, x.file_path") if r[0] == r[1]}
+    imports_of: dict = defaultdict(set)
+    imported_files = set()
+    for a, b in q("MATCH (a:File)-[:IMPORTS]->(b) RETURN DISTINCT a.file_path, b.file_path"):
+        if a and b and a != b:
+            imports_of[a].add(b)
+            if not ctx.is_test(a) and ctx.is_code(a):  # only production code importers count
+                imported_files.add(b)
+    public_set = {norm(r) for r in public_roots}
+    reexport_hubs = {f for f in {f for fs in imported_by.values() for f in fs}
+                     if f not in defines_code and f in imported_files and norm(f) not in public_set}
+
+    cands: dict[str, Candidate] = {}
+
+    def add(qn: str, name: str, label: str, file: str, start: Any, end: Any, signal: str, ev: str) -> None:
+        c = cands.setdefault(qn, Candidate(qn, name, label, norm(file), to_int(start), to_int(end)))
+        c.signals.add(signal)
+        c.evidence.append(ev)
+
+    lang_decorators = set(rules.get("signals.language_decorators"))
+    for qn, r in prod.items():
+        inb = inbound.get(qn, {})
+        calls = inb.get("CALLS", [])
+        prod_callers = [s for s in calls if not ctx.is_test(s[2]) and s[1] in CALLABLE + ("Class",)]
+        module_callers = [s for s in calls if not ctx.is_test(s[2]) and s[1] in ("Module", "File")]
+        refs = [s for s in inb.get("CALL_REFERENCE", []) if not ctx.is_test(s[2])]
+        base = (qn, r[1], r[2], r[3], r[4], r[5])
+        if qn in route_handlers:
+            add(*base, "S1_route_handler", f"route node(s) {sorted(route_handlers[qn])[:3]}")
+        if refs:
+            add(*base, "S2_passed_as_value", f"referenced by {sorted({s[0].rsplit('.', 1)[-1] for s in refs})[:5]}")
+        if module_callers:
+            add(*base, "S3_called_from_top_level", f"called at top level of {sorted({s[2] for s in module_callers})[:3]}")
+        importers = {f for f in imported_by.get(qn, ()) if not ctx.is_test(f) and f not in reexport_hubs}
+        not_called = sorted(f for f in importers if qn not in calls_from_file.get(f, set()))
+        if not_called and not prod_callers:
+            add(*base, "S4_imported_not_called", f"imported but not called by {not_called[:3]}")
+        if not prod_callers and not module_callers and not refs:
+            add(*base, "S6_no_production_caller", "called only by tests" if calls else "no inbound calls")
+        # CBM's name-based resolution can invent callers, so a non-language
+        # decorator keeps the symbol a candidate even when callers exist.
+        app_decos = sorted({d for d in decorated.get(qn, []) if d not in lang_decorators})
+        if app_decos:
+            add(*base, "S5_decorated", f"decorators {app_decos}")
+
+    by_name: dict = defaultdict(list)
+    for qn, r in prod.items():
+        by_name[r[1]].append(qn)
+
+    # S11: named in a string ('Ctrl@method', 'ctrl#action', 'pkg.mod:function')
+    string_ref = rules.rx("signals.string_ref_regex")
+    scan_ext = set(rules.get("files.string_scan_ext"))
+    for f in ctx.tracked:
+        if ctx.is_test(f) or f.rsplit(".", 1)[-1].lower() not in scan_ext:
+            continue
+        for lineno, line in enumerate(ctx.lines(f), 1):
+            if len(line) > ctx.max_line or not any(ch in line for ch in "@#:"):
+                continue
+            for m in string_ref.finditer(line):
+                container, member = m.group(2), m.group(4)
+                if member not in by_name:
+                    continue
+                key = re.split(r"[\\/.]", container)[-1].lower().replace("_", "")
+                dotted = container.replace("/", ".").replace("\\", ".").lower()
+                for qn in by_name[member]:
+                    if key and (key in qn.lower().replace("_", "") or dotted in qn.lower()):
+                        r = prod[qn]
+                        add(qn, r[1], r[2], r[3], r[4], r[5], "S11_named_in_string", f"{f}:{lineno} {m.group(0)}")
+
+    # S12: function values bound to names (CBM stores them as Variable nodes)
+    func_value = rules.rx("signals.function_value_regex")
+    var_in = {r[0] for r in q("MATCH (a)-[:CALLS|USAGE|CALL_REFERENCE]->(v:Variable) "
+                              "RETURN DISTINCT v.qualified_name, a.file_path, a.label, v.file_path")
+              if not ctx.is_test(r[1]) and not (r[2] in ("Module", "File") and r[1] == r[3])}
+    for v_qn, v_name, v_file, v_line in q("MATCH (v:Variable) RETURN v.qualified_name, v.name, v.file_path, v.start_line"):
+        if v_qn in var_in or not ctx.is_production_code(v_file):
+            continue
+        src = ctx.lines(v_file)
+        ln = to_int(v_line)
+        if not 0 < ln <= len(src):
+            continue
+        text = src[ln - 1]
+        if re.search(r"\b" + re.escape(v_name) + r"\s*=", text) and func_value.search(text):
+            end = ln
+            while end < len(src) and end - ln < 400:  # body ends at next top-level line
+                nxt = src[end]
+                if nxt and not nxt[0].isspace():
+                    if nxt.lstrip().startswith(("}", ")", "]")):
+                        end += 1
+                    break
+                end += 1
+            add(v_qn, v_name, "Function", v_file, ln, end, "S12_function_value", "function value bound to a name")
+
+    # S13: modules nothing imports and that define no class
+    class_files = {r[0] for r in q("MATCH (f:File)-[:DEFINES]->(c:Class) RETURN DISTINCT f.file_path, c.file_path")
+                   if r[0] == r[1]}
+    init_names = set(rules.get("files.package_init_names"))
+    for m_qn, m_file in q("MATCH (m:Module) RETURN m.qualified_name, m.file_path"):
+        if (not ctx.is_production_code(m_file) or m_file in imported_files or m_file in class_files
+                or Path(norm(m_file)).stem in init_names):
+            continue
+        add(m_qn, "<module>", "Module", m_file, 1, 0, "S13_unimported_module", "no production file imports this module")
+
+    # S7: top-level code calling in-repo production functions
+    mod_targets: dict = defaultdict(set)
+    for m_qn, m_file, t_qn in q("MATCH (m:Module)-[:CALLS]->(t:Function|Method) "
+                                "RETURN m.qualified_name, m.file_path, t.qualified_name"):
+        if t_qn in prod:
+            mod_targets[(m_qn, m_file)].add(prod[t_qn][1])
+    for (m_qn, m_file), names in sorted(mod_targets.items()):
+        if ctx.is_production_code(m_file):
+            add(m_qn, "<module>", "Module", m_file, 1, 0, "S7_top_level_program", f"top level calls {sorted(names)[:5]}")
+
+    # S4c / S9: classes
+    all_classes = q("MATCH (c:Class) RETURN c.qualified_name, c.name, c.file_path, c.start_line, c.end_line")
+    class_rows = q("MATCH (a:File)-[:IMPORTS]->(c:Class) RETURN a.file_path, c.qualified_name, "
+                   "c.name, c.file_path, c.start_line, c.end_line")
+    folder_classes: dict = defaultdict(list)
+    for row in all_classes:
+        if row[2]:
+            folder_classes[norm(row[2]).rsplit("/", 1)[0]].append(row)
+    for imp_file, folder in q("MATCH (a:File)-[:IMPORTS]->(d:Folder) RETURN a.file_path, d.file_path"):
+        for c_qn, c_name, c_file, c_s, c_e in folder_classes.get(norm(folder), []):
+            class_rows.append([imp_file, c_qn, c_name, c_file, c_s, c_e])
+    class_used = {r[0] for r in q("MATCH (a)-[:CALLS|INHERITS|IMPLEMENTS]->(c:Class) RETURN DISTINCT c.qualified_name")}
+    for imp_file, c_qn, c_name, c_file, c_s, c_e in class_rows:
+        if ctx.is_test(imp_file) or not ctx.is_production_code(c_file) or c_qn in class_used:
+            continue
+        add(c_qn, c_name, "Class", c_file, c_s, c_e, "S4c_imported_class_not_called", f"imported by {imp_file}")
+    referenced = {r[1] for r in q("MATCH (a)-[:CALLS|USAGE|USES_TYPE|INHERITS|IMPLEMENTS|IMPORTS|CALL_REFERENCE]->(c:Class) "
+                                  "RETURN DISTINCT a.file_path, c.qualified_name") if not ctx.is_test(r[0])}
+    imported_classes = {r[1] for r in class_rows}
+    for c_qn, c_name, c_file, c_s, c_e in all_classes:
+        if not ctx.is_production_code(c_file) or c_qn in referenced or c_qn in imported_classes:
+            continue
+        add(c_qn, c_name, "Class", c_file, c_s, c_e, "S9_orphan_class", "no production code references this class")
+
+    # S10: library public API
+    for root in public_roots:
+        root = norm(root)
+        for x_qn, x_name, x_label, x_file, x_s, x_e in q(
+                "MATCH (a:File)-[:IMPORTS]->(x:Function|Method|Class|Variable) WHERE a.file_path = "
+                f"{cypher_str(root)} RETURN x.qualified_name, x.name, x.label, x.file_path, x.start_line, x.end_line"):
+            if ctx.is_external(x_file):
+                continue
+            add(x_qn, x_name, x_label, x_file, x_s, x_e, "S10_public_api", f"exported by {root}")
+            if x_label == "Class":
+                for m_qn, m_name, m_file, m_s, m_e in q(
+                        "MATCH (c:Class)-[:DEFINES_METHOD]->(m:Method) WHERE c.qualified_name = "
+                        f"{cypher_str(x_qn)} RETURN m.qualified_name, m.name, m.file_path, m.start_line, m.end_line"):
+                    if not m_name.startswith("_"):
+                        add(m_qn, m_name, "Method", m_file, m_s, m_e, "S10_public_api", f"method of exported {x_name}")
+
+    # S8: bootstrap-only files
+    importer_qn: dict = {}
+    for f, fq in q("MATCH (a:File)-[:IMPORTS]->() RETURN DISTINCT a.file_path, a.qualified_name"):
+        importer_qn.setdefault(f, fq)
+    for f, fq in sorted(importer_qn.items()):
+        if ctx.is_production_code(f) and f not in imported_files and f not in defines_code:
+            add(f"{fq}#file", "<file>", "File", f, 1, 0, "S8_bootstrap_file",
+                "imports code, defines nothing, imported by no production file")
+
+    graph = Graph(callables, prod, dict(decorated), dict(imports_of), imported_files, defines_code)
+    return cands, graph
+
+
+# --------------------------------------------------------------------------
+# Triggers: external URL/route for each entry point
+# --------------------------------------------------------------------------
+def norm_path(p: str) -> str:
+    p = re.sub(r"^https?://[^/]+", "", p.strip())
+    if "/#/" in p or p.startswith("#/"):  # hash routing: the route follows '#'
+        p = p.split("#", 1)[1]
+    p = p.split("?", 1)[0].split("#", 1)[0]
+    if not p.startswith("/"):
+        p = "/" + p
+    p = re.sub(r"/{2,}", "/", p)
+    return (p.rstrip("/") or "/").lower()
+
+
+def is_param(seg: str) -> bool:
+    return bool(re.fullmatch(r"\{[^}]*\}|:[\w]+\??|<[^>]*>|\*+|\[[^\]]*\]|\(.*\)", seg))
+
+
+def static_len(path: str) -> int:
+    return len([x for x in norm_path(path).split("/") if x and not is_param(x)])
+
+
+def join_path(*parts: str) -> str:
+    segs = [p.strip("/") for p in parts if p and p.strip("/")]
+    return "/" + "/".join(segs)
+
+
+def path_match(test_path: str, template: str, max_prefix: int = 3) -> Optional[str]:
+    """'exact', 'suffix' (one side has extra leading segments such as /api or a
+    context path), or None. Parameters match any single segment."""
+    t = [x for x in norm_path(test_path).split("/") if x]
+    r = [x for x in norm_path(template).split("/") if x]
+
+    def eq(a: list, b: list) -> bool:
+        return len(a) == len(b) and all(is_param(y) or is_param(x) or x == y for x, y in zip(a, b))
+
+    if eq(t, r):
+        return "exact"
+    if not [x for x in r if not is_param(x)]:
+        return None
+    for k in range(1, max_prefix + 1):
+        if len(t) - k == len(r) and eq(t[k:], r):
+            return "suffix"
+        if len(r) - k == len(t) and t and eq(t, r[k:]):
+            return "suffix"
+    return None
+
+
+def resolve_import(ctx: RepoContext, base_file: str, spec: str) -> Optional[str]:
+    if not spec.startswith("."):
+        return None
+    target = os.path.normpath(str(Path(norm(base_file)).parent / spec)).replace("\\", "/")
+    exts = ctx.rules.get("files.ui_import_extensions")
+    idx = ctx.rules.get("files.ui_index_files")
+    for cand in (target, *(target + e for e in exts), *(f"{target}/{i}" for i in idx)):
+        if cand in ctx.tracked_set:
+            return cand
+    return None
+
+
+def openapi_operations(ctx: RepoContext) -> list[tuple[str, str, str, str]]:
+    """(METHOD, path, operationId, where) from OpenAPI/Swagger documents."""
+    detect = ctx.rules.rx("routing.openapi_detect_regex", re.M)
+    verbs = {v.lower() for v in ctx.rules.get("routing.verbs")}
+    ops = []
+    for f in ctx.tracked:
+        low = f.lower()
+        if ctx.is_test(f) or not low.endswith((".yml", ".yaml", ".json")):
+            continue
+        lines = ctx.lines(f)
+        text = "\n".join(lines)
+        if not detect.search(text):
+            continue
+        if low.endswith(".json"):
+            try:
+                doc = json.loads(text)
+            except json.JSONDecodeError:
+                log.warning("OpenAPI document %s is not valid JSON; skipped", f)
+                continue
+            paths = doc.get("paths") if isinstance(doc, dict) else None
+            for path, item in (paths or {}).items():
+                for m, op in (item or {}).items():
+                    if m in verbs and isinstance(op, dict) and op.get("operationId"):
+                        ops.append((m.upper(), path, op["operationId"], f))
+            continue
+        in_paths, path, path_ind, method = False, None, None, None
+        for i, line in enumerate(lines, 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            ind = len(line) - len(line.lstrip())
+            if re.match(r"^paths:\s*$", line):
+                in_paths, path = True, None
+                continue
+            if in_paths and ind == 0:
+                in_paths = False
+            if not in_paths:
+                continue
+            mp = re.match(r"""^\s*['"]?(/[^'":]*)['"]?:\s*$""", line)
+            if mp and (path_ind is None or ind <= path_ind):
+                path, path_ind, method = mp.group(1), ind, None
+                continue
+            mm = re.match(r"^\s*(\w+):\s*$", line)
+            if mm and mm.group(1) in verbs and path and ind > (path_ind or 0):
+                method = mm.group(1).upper()
+                continue
+            mo = re.match(r"""^\s*operationId:\s*['"]?([\w$]+)""", line)
+            if mo and path and method:
+                ops.append((method, path, mo.group(1), f"{f}:{i}"))
+    return ops
+
+
+def bind_triggers(ctx: RepoContext, cbm: CBMClient, project: str, cands: dict[str, Candidate], graph: Graph) -> None:
+    rules = ctx.rules
+    verbs = set(rules.get("routing.verbs"))
+    rx_verb = rules.rx("routing.verb_call_regex", re.I)
+    rx_annot = rules.rx("routing.annotation_regex", re.I)
+    rx_class_prefix = rules.rx("routing.class_prefix_regex", re.I)
+    rx_class_decl = rules.rx("routing.class_declaration_regex")
+    rx_class_name = rules.rx("routing.class_name_regex")
+    rx_methods_kw = rules.rx("routing.methods_keyword_regex", re.I)
+    rx_ui_path = rules.rx("routing.ui_route_path_regex")
+    rx_ui_comp = rules.rx("routing.ui_route_component_regex")
+    rx_string_ref = rules.rx("signals.string_ref_regex")
+    ctrl_token = rules.get("routing.controller_token")
+    skip_ids = set(rules.get("routing.binding_skip_identifiers"))
+    ident = re.compile(r"[A-Za-z_$][\w$]*")
+
+    by_name: dict = defaultdict(list)
+    by_file: dict = defaultdict(list)
+    for c in cands.values():
+        by_name[c.name].append(c)
+        by_file[c.file].append(c)
+
+    for r_qn, r_name, h_qn in cbm.cypher(project, "MATCH (h:Function|Method)-[:HANDLES]->(r:Route) "
+                                                  "RETURN r.qualified_name, r.name, h.qualified_name"):
+        c = cands.get(h_qn)
+        if c is None:
+            continue
+        m = re.match(r"__route__(\w+)__(.*)", r_qn or "")
+        method = m.group(1).upper() if m else None
+        c.triggers.append({"method": None if method in (None, "ANY") else method,
+                           "path": m.group(2) if m else r_name, "source": "cbm_route"})
+
+    for method, path, op_id, where in openapi_operations(ctx):
+        for c in by_name.get(op_id, []):
+            if c.label in CALLABLE:
+                c.triggers.append({"method": method, "path": path, "source": f"openapi {where}"})
+
+    def pick(name: str, reg_file: str) -> Optional[Candidate]:
+        opts = by_name.get(name, [])
+        if len(opts) == 1:
+            return opts[0]
+        near = [c for c in opts if c.file == reg_file or c.file in graph.imports_of.get(reg_file, ())]
+        return near[0] if len(near) == 1 else None
+
+    funcs_by_file: dict = defaultdict(list)
+    for r in graph.callables.values():
+        if r[3]:
+            funcs_by_file[norm(r[3])].append((to_int(r[4]), to_int(r[5]), r[1]))
+
+    for f in ctx.tracked:
+        if not ctx.is_production_code(f):
+            continue
+        raw = ctx.lines(f)
+        if not raw:
+            continue
+        lines = [l + " " + raw[k + 1].strip() if l.rstrip().endswith("(") and k + 1 < len(raw) else l
+                 for k, l in enumerate(raw)]
+        joined = "\n".join(lines)
+        if not (rx_verb.search(joined) or rx_annot.search(joined) or rx_ui_path.search(joined)):
+            continue
+        class_prefix = ""
+        file_cands = sorted(by_file.get(f, []), key=lambda c: c.start)
+        for i, line in enumerate(lines):
+            if len(line) > ctx.max_line:
+                continue
+            mp = rx_class_prefix.search(line)
+            decl = next((l for l in lines[i + 1:i + 5] if rx_class_decl.match(l)), None) if mp else None
+            if mp and decl is not None:
+                cname_m = rx_class_name.search(decl)
+                cname = cname_m.group(1) if cname_m else ""
+                short = re.sub(re.escape(ctrl_token["strip_suffix"]) + "$", "", cname).lower()
+                class_prefix = mp.group(2).replace(ctrl_token["token"], short)
+                continue
+            ma = rx_annot.search(line)
+            if ma:  # method-level annotation (a class-level one was handled above)
+                verb = ma.group(1).upper().replace("HTTP", "")
+                if verb == "REQUEST":
+                    mk = rx_methods_kw.search(" ".join(lines[i:i + 3]))
+                    verb = mk.group(1).upper() if mk else None
+                target = next((c for c in file_cands if c.label in CALLABLE and i + 1 <= c.start <= i + 8), None)
+                if target and (verb in verbs or verb is None):
+                    target.triggers.append({"method": verb, "path": join_path(class_prefix, ma.group(3) or ""),
+                                            "source": f"{f}:{i + 1}"})
+                continue
+            mv = rx_verb.search(line)
+            if mv:
+                word = mv.group(1).upper()
+                method = word.replace("MAP", "") if word.replace("MAP", "") in verbs else None
+                if method is None:
+                    mk = rx_methods_kw.search(" ".join(lines[i:i + 3]))
+                    method = mk.group(1).upper() if mk else None
+                window, depth, k = line[mv.end():], line.count("(") - line.count(")"), i + 1
+                while depth > 0 and k < len(lines) and k < i + 6:
+                    window += " " + lines[k]
+                    depth += lines[k].count("(") - lines[k].count(")")
+                    k += 1
+                receiver = re.search(r"([\w$]+)\s*(?:\.|->|::)\s*" + re.escape(mv.group(1)) + r"\s*\(", line)
+                decorator_style = line.lstrip().startswith("@")
+                bound = None
+                if decorator_style:
+                    bound = next((c for c in file_cands if c.label in CALLABLE and i + 1 < c.start <= i + 8), None)
+                else:
+                    for sm in rx_string_ref.finditer(line + " " + window):
+                        member, container = sm.group(4), sm.group(2)
+                        key = re.split(r"[\\/.]", container)[-1].lower().replace("_", "")
+                        opts = [c for c in by_name.get(member, []) if key and key in c.qn.lower().replace("_", "")]
+                        bound = opts[0] if len(opts) == 1 else (bound or pick(member, f))
+                    if bound is None:
+                        for name in reversed(ident.findall(window)):
+                            if name.lower() in skip_ids:
+                                continue
+                            bound = pick(name, f)
+                            if bound:
+                                break
+                if bound is not None:
+                    encl = next((n for a, b, n in sorted(funcs_by_file.get(f, []), reverse=True) if a <= i + 1 <= b), None)
+                    bound.triggers.append({"method": method, "path": mv.group(3), "source": f"{f}:{i + 1}",
+                                           "_reg": (f, encl, receiver.group(1) if receiver else None)})
+                continue
+            mu = rx_ui_path.search(line)
+            if mu:
+                for l2 in lines[i:i + 5]:
+                    mc = rx_ui_comp.search(l2)
+                    if not mc:
+                        continue
+                    target = None
+                    if mc.group(1):
+                        tf = resolve_import(ctx, f, mc.group(1))
+                        target = next((c for c in by_file.get(tf, []) if c.label in ("Module", "File", "Class")), None)
+                    elif mc.group(2):
+                        target = pick(mc.group(2), f)
+                    if target is not None:
+                        target.triggers.append({"method": "UI", "path": mu.group(2), "source": f"{f}:{i + 1}"})
+                    break
+
+
+def resolve_prefixes(ctx: RepoContext, cands: dict[str, Candidate]) -> None:
+    """Apply router prefixes: same-file router prefix, then mount lines in other
+    files that name the registering function or import the registering module."""
+    rules = ctx.rules
+    rx_same = rules.rx("routing.same_file_prefix_regex", re.I)
+    rx_mount = rules.rx("routing.mount_literal_regex")
+    rx_import = rules.rx("routing.import_binding_regex")
+    rx_verb = rules.rx("routing.verb_call_regex", re.I)
+    rx_def = rules.rx("routing.definition_line_regex")
+    max_depth = int(rules.get("routing.mount_max_depth"))
+    ident = re.compile(r"[A-Za-z_$][\w$]*")
+    texts = {f: ctx.lines(f) for f in ctx.tracked if ctx.is_production_code(f)}
+
+    same_prefix: dict = {}
+    prefixes_by_file: dict = defaultdict(set)
+    for f, lines in texts.items():
+        for line in lines:
+            for m in rx_same.finditer(line):
+                same_prefix[(f, m.group(1))] = m.group(3)
+                prefixes_by_file[f].add(m.group(3))
+
+    aliases_cache: dict = {}
+
+    def aliases_in(g: str, f: str) -> set:
+        key = (g, f)
+        if key not in aliases_cache:
+            names = set()
+            for line in texts.get(g, []):
+                for m in rx_import.finditer(line):
+                    name, spec = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+                    if name and spec and resolve_import(ctx, g, spec) == f:
+                        names.add(name)
+                    if m.group(5):
+                        for n in (x.strip() for x in m.group(6).split(",")):
+                            if n and f.endswith(f"{m.group(5).replace('.', '/')}/{n}.py"):
+                                names.add(n)
+            aliases_cache[key] = names
+        return aliases_cache[key]
+
+    def mounts_of(f: str, encl: Optional[str]) -> list[tuple[str, str]]:
+        found = []
+        for g, lines in texts.items():
+            if g == f:
+                continue
+            aliases = aliases_in(g, f)
+            if not encl and not aliases:
+                continue
+            for line in lines:
+                # keyword-argument names (tags=..., prefix=...) are not references
+                ids = set(ident.findall(re.sub(r"\b[\w$]+\s*=(?!=)", " ", line)))
+                if not ((encl and encl in ids) or (aliases & ids)):
+                    continue
+                if rx_verb.search(line) or rx_def.match(line) or rx_import.search(line):
+                    continue
+                lit = rx_mount.search(line)
+                if lit and lit.group(2) != "/":
+                    found.append((lit.group(2), g))
+        return found
+
+    for c in cands.values():
+        new = []
+        for t in c.triggers:
+            reg = t.pop("_reg", None)
+            if not reg:
+                if t.get("source") == "cbm_route" and len(prefixes_by_file.get(c.file, ())) == 1:
+                    pre = next(iter(prefixes_by_file[c.file]))
+                    if not norm_path(t["path"]).startswith(norm_path(pre)):
+                        t = {**t, "path": join_path(pre, t["path"]), "source": "cbm_route+file_prefix"}
+                new.append(t)
+                continue
+            f, encl, var = reg
+            local = same_prefix.get((f, var), "") if var else ""
+            chains, results = [(join_path(local, t["path"]), f, encl, 0)], []
+            while chains:
+                path, file_, e, depth = chains.pop()
+                ms = mounts_of(file_, e) if depth < max_depth else []
+                if not ms:
+                    results.append(path)
+                for prefix, g in ms:
+                    chains.append((join_path(prefix, path), g, None, depth + 1))
+            for pth in sorted(set(results)):
+                new.append({**t, "path": pth})
+        c.triggers = new
+
+
+def apply_conventions(ctx: RepoContext, cands: dict[str, Candidate], graph: Graph) -> None:
+    """Convention-routed frameworks. Each adapter is driven by rules.conventions."""
+    conv = ctx.rules.get("conventions")
+    enabled = set(conv["enabled"])
+    methods_by_file: dict = defaultdict(list)
+    for r in graph.prod.values():
+        methods_by_file[norm(r[3])].append((r[1], r[0], r[2], to_int(r[4]), to_int(r[5])))
+    classes: dict = defaultdict(list)
+    for name, fp, a, b in graph.classes:
+        classes[name].append((fp, a, b))
+
+    def attach(file: str, name: str, method: Optional[str], path: str, src: str, cls: Optional[str] = None) -> bool:
+        rng = next(((a, b) for f_, a, b in classes.get(cls, []) if f_ == file), None) if cls else None
+        for n, qn, label, a, b in methods_by_file.get(file, []):
+            if n != name or (rng and not rng[0] <= a <= rng[1]):
+                continue
+            c = cands.get(qn)
+            if c is None:
+                c = cands[qn] = Candidate(qn, n, label, file, a, b)
+            c.signals.add("S14_convention_route")
+            c.evidence.append(f"convention route {method or 'ANY'} {path} ({src})")
+            c.triggers.append({"method": method, "path": path, "source": src})
+            return True
+        return False
+
+    plural, singular = conv["rest_actions_plural"], conv["rest_actions_singular"]
+    if "rails_routes" in enabled:
+        _rails(ctx, conv["rails"], plural, singular, attach)
+    if "laravel_resource" in enabled:
+        _laravel(ctx, conv["laravel"], plural, attach)
+    if "django_urls" in enabled:
+        _django(ctx, conv["django"], classes, methods_by_file, attach)
+    if "razor_pages" in enabled:
+        _razor(ctx, conv["razor"], methods_by_file, attach)
+    if "file_based_ui_routes" in enabled:
+        _file_routes(ctx, conv["file_routes"], cands)
+
+
+def _plural(word: str) -> str:
+    if word.endswith("s"):
+        return word
+    return word[:-1] + "ies" if word.endswith("y") else word + "s"
+
+
+def _rails(ctx: RepoContext, cfg: dict, plural: dict, singular: dict, attach: Callable) -> None:
+    for f in ctx.tracked:
+        if not f.endswith(cfg["routes_file_suffix"]):
+            continue
+        stack: list[tuple] = []
+        for i, raw in enumerate(ctx.lines(f)):
+            line = raw.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            opens = bool(re.search(r"\bdo\b(\s*\|[^|]*\|)?\s*$", line))
+            if re.match(r"^\s*end\b", line):
+                if stack:
+                    stack.pop()
+                continue
+            prefix = "".join(e[1] for e in stack)
+            m = re.match(r"^\s*(?:scope|namespace)\s+[:'\"]?(\w+)", line)
+            if m:
+                if opens:
+                    stack.append(("scope", "/" + m.group(1)))
+                continue
+            m = re.match(r"^\s*(resources|resource)\s+:(\w+)(.*)$", line)
+            if m:
+                kind, name, rest = m.groups()
+                is_singular = kind == "resource"
+                pm = re.search(r"param:\s*:(\w+)", rest)
+                param = "{" + (pm.group(1) if pm else "id") + "}"
+                table = singular if is_singular else plural
+                acts = [a for a in table if a != "store"]
+                only = re.search(r"only:\s*\[([^\]]*)\]", rest)
+                exc = re.search(r"except:\s*\[([^\]]*)\]", rest)
+                if only:
+                    acts = [a.strip(" :") for a in only.group(1).split(",")]
+                if exc:
+                    excluded = {a.strip(" :") for a in exc.group(1).split(",")}
+                    acts = [a for a in acts if a not in excluded]
+                ctrl = _plural(name) + cfg["controller_suffix"]
+                cfile = next((t for t in ctx.tracked if t.endswith("/" + ctrl) and cfg["controllers_dir"] in t), None)
+                if cfile:
+                    for a in acts:
+                        for verb, suf in table.get(a, []):
+                            attach(cfile, a, verb, f"{prefix}/{name}" + suf.replace("{id}", param), f"{f}:{i + 1}")
+                if opens:
+                    stack.append(("res", f"/{name}" if is_singular else f"/{name}/{param}", name))
+                continue
+            m = re.match(r"^\s*(get|post|put|patch|delete)\s+[:'\"]([\w/]+)['\"]?(.*)$", line)
+            if m:
+                verb, pth, rest = m.group(1).upper(), m.group(2), m.group(3)
+                to = re.search(r"to:\s*['\"](\w+)#(\w+)", rest)
+                res = next((e for e in reversed(stack) if e[0] == "res"), None)
+                if to:
+                    ctrl, action = to.group(1), to.group(2)
+                elif res:
+                    ctrl, action = _plural(res[2]), pth.split("/")[-1]
+                else:
+                    continue
+                cfile = next((t for t in ctx.tracked if t.endswith(f"/{ctrl}{cfg['controller_suffix']}")), None)
+                base = prefix
+                if res and "on: :collection" in rest:
+                    base = "".join(e[1] for e in stack[:-1]) + f"/{res[2]}"
+                if cfile:
+                    attach(cfile, action, verb, f"{base}/{pth}", f"{f}:{i + 1}")
+                continue
+            if opens:
+                stack.append(("block", ""))
+
+
+def _laravel(ctx: RepoContext, cfg: dict, plural: dict, attach: Callable) -> None:
+    table = dict(plural, create=[tuple(x) for x in cfg["resource_create_extra"]])
+    for f in ctx.tracked:
+        if not (f.endswith(".php") and cfg["routes_dir"] in f) or ctx.is_test(f):
+            continue
+        joined = "\n".join(ctx.lines(f))
+
+        def controller_file(ctrl: str) -> Optional[str]:
+            short = ctrl.split("\\")[-1]
+            return next((t for t in ctx.tracked if t.endswith(f"/{short}.php") and cfg["controllers_dir_token"] in t), None)
+
+        for m in re.finditer(r"Route::(resource|apiResource)\(\s*'([^']+)'\s*,\s*'([\w\\\\]+)'(.*?)\);", joined, re.S):
+            kind, path, ctrl, rest = m.groups()
+            acts = [a for a in plural if a not in ("store", "create", "edit")] + ["store"]
+            if kind == "resource":
+                acts += ["create", "edit"]
+            only = re.search(r"'only'\s*=>\s*\[([^\]]*)\]", rest)
+            exc = re.search(r"'except'\s*=>\s*\[([^\]]*)\]", rest)
+            if only:
+                acts = [a.strip(" '\"") for a in only.group(1).split(",")]
+            if exc:
+                excluded = {a.strip(" '\"") for a in exc.group(1).split(",")}
+                acts = [a for a in acts if a not in excluded]
+            cfile = controller_file(ctrl)
+            line_no = joined[:m.start()].count("\n") + 1
+            if cfile:
+                for a in acts:
+                    for verb, suf in table.get(a, []):
+                        attach(cfile, a, verb, join_path(path) + suf, f"{f}:{line_no}")
+        for m in re.finditer(r"Route::match\(\s*\[([^\]]*)\]\s*,\s*'([^']*)'\s*,\s*'([\w\\\\]+)@(\w+)'", joined):
+            verbs, path, ctrl, action = m.groups()
+            cfile = controller_file(ctrl)
+            if cfile:
+                for v in re.findall(r"\w+", verbs):
+                    attach(cfile, action, v.upper(), join_path(path), f"{f}:{joined[:m.start()].count(chr(10)) + 1}")
+
+
+def _django(ctx: RepoContext, cfg: dict, classes: dict, methods_by_file: dict, attach: Callable) -> None:
+    url_files = [f for f in ctx.tracked if f.endswith(cfg["urls_file"]) and not ctx.is_test(f)]
+    include_prefix: dict = defaultdict(list)
+    for f in url_files:
+        for line in ctx.lines(f):
+            m = re.search(r"""(?:path|re_path|url)\(\s*r?['"]([^'"]*)['"]\s*,\s*include\(\s*['"]([\w.]+)['"]""", line)
+            if m:
+                target = m.group(2).replace(".", "/") + ".py"
+                tf = next((t for t in ctx.tracked if t.endswith(target)), None)
+                if tf:
+                    include_prefix[tf].append(m.group(1))
+
+    def dj(p: str) -> str:
+        p = re.sub(r"\(\?P<(\w+)>[^)]*\)", r"{\1}", p)
+        p = re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", p)
+        return p.replace("^", "").replace("$", "").replace("/?", "").replace("\\", "")
+
+    def full(f: str, p: str) -> list[str]:
+        pres = include_prefix.get(f) or [""]
+        return [join_path(dj(pre), dj(p)) for pre in pres]
+
+    actions = cfg["drf_router_actions"]
+    view_methods = cfg["class_view_methods"]
+    for f in url_files:
+        joined = "\n".join(ctx.lines(f))
+        for m in re.finditer(r"""\.register\(\s*r?['"]([^'"]+)['"]\s*,\s*(\w+)""", joined):
+            prefix, cls = m.groups()
+            loc = next(iter(classes.get(cls, [])), None)
+            if loc:
+                for action, (verb, suf) in actions.items():
+                    for pth in full(f, prefix):
+                        attach(loc[0], action, verb, pth + suf, f"{f}:{joined[:m.start()].count(chr(10)) + 1}", cls)
+        for m in re.finditer(r"""(?:path|re_path|url)\(\s*r?['"]([^'"]*)['"]\s*,\s*([\w.]+?)(\.as_view\(|\s*[,)])""", joined):
+            pth, target, as_view = m.groups()
+            name = target.split(".")[-1]
+            line_no = joined[:m.start()].count("\n") + 1
+            for full_p in full(f, pth):
+                if as_view.startswith(".as_view"):
+                    loc = next(iter(classes.get(name, [])), None)
+                    if loc:
+                        for meth, verb in view_methods.items():
+                            attach(loc[0], meth, verb, full_p, f"{f}:{line_no}", name)
+                else:
+                    for fp, ms in methods_by_file.items():
+                        if fp.endswith(cfg["views_file"]) and any(n == name for n, *_ in ms):
+                            attach(fp, name, None, full_p, f"{f}:{line_no}")
+
+
+def _razor(ctx: RepoContext, cfg: dict, methods_by_file: dict, attach: Callable) -> None:
+    rx_handler = re.compile(cfg["handler_regex"])
+    rx_area = re.compile(cfg["areas_regex"])
+    rx_directive = re.compile(cfg["page_directive_regex"])
+    token, suffix = cfg["pages_dir_token"], cfg["page_suffix"]
+    for f in ctx.tracked:
+        if not f.endswith(suffix) or token not in f or ctx.is_test(f):
+            continue
+        rel = f.split(token, 1)[1][: -len(suffix)]
+        area = rx_area.search(f)
+        route = join_path(*(([area.group(1)] if area else []) + rel.split("/")))
+        route = re.sub(r"(^|/)Index$", "", route) or "/"
+        page = f[: -len(".cs")]
+        directive = rx_directive.search("\n".join(ctx.lines(page))) if page in ctx.tracked_set else None
+        if directive:
+            d = directive.group(1)
+            route = d if d.startswith("/") else join_path(route, d)
+        for n, _qn, _label, _a, _b in methods_by_file.get(f, []):
+            m = rx_handler.match(n)
+            if m:
+                attach(f, n, m.group(1).upper(), route, f"razor page {f}")
+
+
+def _file_routes(ctx: RepoContext, cfg: dict, cands: dict[str, Candidate]) -> None:
+    rx_dir = re.compile(cfg["dir_regex"])
+    files = [f for f in ctx.tracked if rx_dir.search(f) and not ctx.is_test(f)
+             and f.rsplit(".", 1)[-1] in cfg["extensions"] and not f.endswith(".d.ts") and not ctx.is_generated(f)]
+    if len(files) < int(cfg["min_files"]):
+        return
+    by_file: dict = defaultdict(list)
+    for c in cands.values():
+        by_file[c.file].append(c)
+    for f in files:
+        rel = rx_dir.split(f, maxsplit=1)[1]
+        segs = [s for s in rel.rsplit(".", 1)[0].split("/")
+                if not s.startswith(tuple(cfg["ignored_segment_prefixes"])) and s not in cfg["ignored_segments"]]
+        segs = ["{" + s.strip("[]$").lstrip(".") + "}" if s.startswith(tuple(cfg["param_prefixes"])) else s for s in segs]
+        target = (next((c for c in by_file.get(f, []) if c.label in ("Module", "File")), None)
+                  or next(iter(sorted(by_file.get(f, []), key=lambda c: c.start)), None))
+        if target is None:
+            target = cands[f"{f}#ui"] = Candidate(f"{f}#ui", Path(f).stem, "Module", f, 1, 0)
+        target.signals.add("S14_convention_route")
+        target.triggers.append({"method": "UI", "path": join_path(*segs), "source": f"file-based route {f}"})
+
+
+def dedupe_triggers(cands: dict[str, Candidate]) -> None:
+    """Per HTTP method keep the most specific path (CBM Route nodes can drop
+    class-level/router prefixes)."""
+    for c in cands.values():
+        if len(c.triggers) < 2:
+            continue
+        best: dict = {}
+        for t in c.triggers:
+            k = t["method"] or "ANY"
+            score = (static_len(t["path"]), not t["source"].startswith("cbm_route"))
+            if k not in best or score > best[k][0]:
+                best[k] = (score, t)
+        kept = [v[1] for v in best.values()]
+        specific = {norm_path(t["path"]) for t in kept if t["method"]}
+        has_method = bool(specific)
+        # A method-less CBM route next to a method-specific registration of the
+        # same handler is CBM failing to read the method, not a second route.
+        c.triggers = sorted((t for t in kept if t["method"] or not (
+            norm_path(t["path"]) in specific or (has_method and t["source"].startswith("cbm_route")))),
+            key=lambda t: (t["method"] is None, t["method"] or "", t["path"]))
+
+
+# --------------------------------------------------------------------------
+# Existing functional tests
+# --------------------------------------------------------------------------
+def extract_invocations(ctx: RepoContext, f: str) -> list[dict]:
+    """External-contract calls in one test file: HTTP paths, UI navigation,
+    Karate/JMeter/.http/Postman requests."""
+    t = ctx.rules
+    lines = ctx.lines(f)
+    ext = f.rsplit(".", 1)[-1].lower()
+    rx_lit = t.rx("tests.string_literal_regex")
+    rx_path = t.rx("tests.path_like_regex", re.I)
+    rx_var = t.rx("tests.variable_prefix_regex")
+    rx_method = t.rx("tests.method_word_regex", re.I)
+    rx_lookback = t.rx("tests.method_lookback_regex", re.I)
+    rx_postman = t.rx("tests.postman_method_regex")
+    rx_asset = t.rx("tests.static_asset_regex", re.I)
+    rx_nav = t.rx("tests.ui_navigation_regex")
+    lookback = int(t.get("tests.method_lookback_lines"))
+    out: list[dict] = []
+    if ext == "jmx":
+        text = "\n".join(lines)
+        for mp, mm in zip(t.rx("tests.jmx_path_regex").finditer(text), t.rx("tests.jmx_method_regex").finditer(text)):
+            out.append({"line": text[:mp.start()].count("\n") + 1, "method": mm.group(1), "path": mp.group(1), "kind": "http"})
+        return out
+    rx_kpath, rx_kmethod = t.rx("tests.karate_path_regex", re.I), t.rx("tests.karate_method_regex", re.I)
+    rx_httpreq = t.rx("tests.http_file_request_regex", re.I)
+    karate_vars: dict[str, str] = {}
+    if ext == "feature":
+        rx_kdef = t.rx("tests.karate_def_regex")
+        for line in lines:
+            md = rx_kdef.match(line)
+            if md:
+                karate_vars[md.group(1)] = md.group(3)
+    for i, line in enumerate(lines):
+        if len(line) > ctx.max_line:
+            continue
+        if ext == "feature":
+            mk = rx_kpath.match(line)
+            if mk:
+                # 'literal', variable defined in this file, or concatenations of those;
+                # an unresolvable variable becomes a path parameter
+                segs = []
+                for part in (x.strip() for x in mk.group(1).split(",")):
+                    if not part or part.startswith("#"):
+                        continue
+                    pieces = [x.strip() for x in part.split("+")]
+                    if all(x[:1] in "'\"" or x in karate_vars for x in pieces):
+                        segs.append("".join(karate_vars.get(x, x.strip("'\"")) for x in pieces))
+                    else:
+                        segs.append("{" + part + "}")
+                method = None
+                for l2 in lines[i + 1:i + 8]:
+                    mm = rx_kmethod.match(l2)
+                    if mm:
+                        method = mm.group(1).upper()
+                        break
+                    if rx_kpath.match(l2):
+                        break
+                out.append({"line": i + 1, "method": method, "kind": "http",
+                            "path": join_path(*(x for x in segs if x and not x.startswith("#")))})
+            continue
+        if ext == "http":
+            mh = rx_httpreq.match(line)
+            if mh:
+                out.append({"line": i + 1, "method": mh.group(1).upper(), "kind": "http",
+                            "path": rx_var.sub("", re.sub(r"^\{\{[^}]+\}\}", "", mh.group(2)))})
+            continue
+        nav = rx_nav.search(line)
+        if nav and rx_path.match(rx_var.sub("", nav.group(2))):
+            out.append({"line": i + 1, "method": "UI", "path": rx_var.sub("", nav.group(2)), "kind": "ui"})
+            continue
+        for m in rx_lit.finditer(line):
+            lit = rx_var.sub("", m.group(2))
+            if not rx_path.match(lit) or "/" not in lit or rx_asset.search(lit):
+                continue
+            mw = rx_method.search(line[:m.start()]) or rx_method.search(line)
+            if not mw:
+                for back in range(1, lookback + 1):
+                    if i - back < 0:
+                        break
+                    prev = lines[i - back]
+                    mw = rx_lookback.search(prev)
+                    if mw or prev.rstrip().endswith((";", ")", "}")):
+                        break
+            if not mw and ext == "json":
+                mw = next((x for x in (rx_postman.search(l2) for l2 in lines[max(0, i - 6):i + 6]) if x), None)
+            out.append({"line": i + 1, "method": mw.group(1).upper() if mw else None, "path": lit, "kind": "http"})
+    return out
+
+
+def match_invocation(inv: dict, bound: list[Candidate], max_handlers: int) -> None:
+    hits = []
+    if static_len(inv["path"]) == 0 and norm_path(inv["path"]) != "/":
+        bound = []  # e.g. an unresolved variable: nothing to match on
+    for c in bound:
+        for t in c.triggers:
+            if (t["method"] == "UI") != (inv["method"] == "UI"):
+                continue
+            if t["method"] and inv["method"] and inv["method"] != "UI" and t["method"] != inv["method"]:
+                continue
+            if static_len(t["path"]) == 0 and not (t["method"] and inv["method"] == t["method"]):
+                continue
+            how = path_match(inv["path"], t["path"])
+            if how:
+                hits.append((how, c, t))
+    use = [h for h in hits if h[0] == "exact"] or hits
+    if use:
+        best = max(static_len(h[2]["path"]) for h in use)
+        use = [h for h in use if static_len(h[2]["path"]) == best]
+    qns = sorted({h[1].qn for h in use})
+    inv["mapped"] = qns if 0 < len(qns) <= max_handlers else []
+    inv["match"] = use[0][0] if inv["mapped"] else ("ambiguous" if qns else "none")
+
+
+def analyze_tests(ctx: RepoContext, cbm: CBMClient, project: str, cands: dict[str, Candidate], graph: Graph) -> dict:
+    t = ctx.rules
+    extra_ext = set(t.get("tests.extra_test_extensions"))
+    marker = t.get("tests.postman_marker")
+    rx_decl = t.rx("tests.test_declaration_regex", re.I | re.M)
+    max_handlers = int(t.get("tests.max_mapped_handlers"))
+    bound = [c for c in cands.values() if c.triggers]
+    files: dict[str, dict] = {}
+    for f in ctx.tracked:
+        ext = f.rsplit(".", 1)[-1].lower()
+        postman = ext == "json" and "postman" in f.lower()
+        if not ((ctx.is_test(f) and (ctx.is_code(f) or ext in extra_ext or ext == "json")) or ext in extra_ext or postman):
+            continue
+        text = "\n".join(ctx.lines(f))
+        if ext == "json" and marker not in text and not postman:
+            continue
+        invs = extract_invocations(ctx, f)
+        structured = ext in extra_ext or ext == "json"
+        for inv in invs:
+            inv["strong"] = structured or inv["method"] is not None
+            match_invocation(inv, bound, max_handlers)
+        cases = max(len(rx_decl.findall(text)), len(invs) if structured else 0)
+        files[f] = {"file": f, "cases": cases, "invocations": invs, "via_helpers": []}
+
+    public_api = {c.qn: c for c in cands.values() if "S10_public_api" in c.signals}
+    if public_api:
+        for t_file, t_line, tgt in cbm.cypher(project, "MATCH (t)-[:CALLS]->(f) RETURN t.file_path, t.start_line, f.qualified_name"):
+            if tgt in public_api and ctx.is_test(t_file):
+                tf = files.setdefault(norm(t_file), {"file": norm(t_file), "cases": 0, "invocations": [], "via_helpers": []})
+                tf["invocations"].append({"line": to_int(t_line), "method": "CALL", "path": public_api[tgt].name,
+                                          "kind": "api", "strong": True, "mapped": [tgt], "match": "graph_call"})
+
+    for f, tf in files.items():  # helpers/page objects imported by a test file
+        seen, frontier = set(), list(graph.imports_of.get(f, ()))
+        while frontier and len(seen) < 50:
+            h = frontier.pop()
+            if h in seen or h not in files:
+                continue
+            seen.add(h)
+            for inv in files[h]["invocations"]:
+                if inv.get("mapped") and inv.get("strong"):
+                    tf["via_helpers"].append({**inv, "line": f"{h}:{inv['line']}"})
+            frontier.extend(graph.imports_of.get(h, ()))
+
+    for tf in files.values():
+        own_strong = any(i.get("strong") for i in tf["invocations"])
+        if tf["cases"] == 0:
+            tf["type"] = "helper" if (tf["invocations"] or tf["via_helpers"]) else "other"
+        elif own_strong or tf["via_helpers"]:
+            tf["type"] = "functional"
+        else:
+            tf["type"] = "unit_or_other"
+    return files
+
+
+# --------------------------------------------------------------------------
+# Flows and expected scenarios (from code evidence)
+# --------------------------------------------------------------------------
+def trace_callees(cbm: CBMClient, project: str, c: Candidate, depth: int, timeout_s: float) -> list[tuple[str, int]]:
+    try:
+        res = cbm.call("trace_path", {"project": project, "function_name": c.qn, "direction": "outbound",
+                                      "depth": depth, "format": "json"}, timeout_s)
+    except QScanError as e:
+        log.warning("trace_path failed for %s: %s", c.qn, e)
+        return []
+    out = []
+    callees = res.get("callees") or {}
+    for g in (callees.get("groups", []) if isinstance(callees, dict) else []):
+        prefix = g.get("qn_prefix", "")
+        for row in g.get("rows", []):
+            qn = f"{prefix}.{row[0]}" if prefix else row[0]
+            if qn != c.qn:  # CBM lists the function as its own callee
+                out.append((qn, to_int(row[1]) if len(row) > 1 else 0))
+    return sorted(set(out), key=lambda x: (x[1], x[0]))
+
+
+def capability_of(ctx: RepoContext, c: Candidate) -> str:
+    ignored = set(ctx.rules.get("routing.capability_ignored_segments"))
+    if c.triggers:
+        segs = [x for x in norm_path(c.triggers[0]["path"]).split("/") if x and not is_param(x) and x not in ignored]
+        if segs:
+            return segs[0]
+    parent = Path(c.file).parent
+    return parent.name or "root"
+
+
+def derive_scenarios(ctx: RepoContext, c: Candidate, callees: list[tuple[str, int]], graph: Graph) -> list[dict]:
+    s = ctx.rules
+    rx_err = s.rx("scenarios.error_line_regex")
+    rx_cond = s.rx("scenarios.condition_regex")
+    rx_num = s.rx("scenarios.status_number_regex")
+    rx_msg = s.rx("scenarios.message_regex")
+    rx_auth = s.rx("scenarios.auth_regex")
+    rx_valid = s.rx("scenarios.validation_regex")
+    names = s.get("scenarios.status_names")
+    lookback = int(s.get("scenarios.condition_lookback_lines"))
+    max_neg = int(s.get("limits.max_negative_scenarios_per_entry_point"))
+    callee_depth = int(s.get("limits.scenario_callee_depth"))
+    trig = c.triggers[0] if c.triggers else None
+    action = f"{trig['method'] or 'ANY'} {trig['path']}" if trig else f"invoke {c.name}"
+    scenarios = [{"type": "happy_path", "title": f"valid request: {action} succeeds",
+                  "expect": "success (2xx)" if trig and trig["method"] not in ("UI",) else "completes successfully",
+                  "statuses": [200, 201, 202, 204] if trig and trig["method"] != "UI" else [],
+                  "evidence": f"{c.file}:{c.start}"}]
+    if c.label not in CALLABLE or c.end < c.start:
+        return scenarios
+    lines = ctx.lines(c.file)
+    above = lines[max(0, c.start - 4):c.start]
+    decos = graph.decorated.get(c.qn, [])
+    annotations = [l.strip() for l in above if l.strip().startswith(("@", "[", "#["))]
+    annotations += [l.strip() for l in lines[c.start - 1:c.start] if l.strip().startswith(("@", "[", "#["))]
+    # route registration lines carry paths/names ("/login", "auth:login") that are not auth checks
+    rx_verb, rx_annot = s.rx("routing.verb_call_regex", re.I), s.rx("routing.annotation_regex", re.I)
+    annotations = [l for l in annotations if not (rx_verb.search(l) or rx_annot.search(l))]
+    auth_hit = next((d for d in decos if rx_auth.search(d)), None) or next((l for l in annotations if rx_auth.search(l)), None)
+    if auth_hit:
+        scenarios.append({"type": "auth", "title": f"request without valid authentication/permission: {action} is rejected",
+                          "expect": "/".join(str(x) for x in s.get("scenarios.auth_status")),
+                          "statuses": list(s.get("scenarios.auth_status")), "evidence": f"{c.file}:{c.start} ({auth_hit[:60]})"})
+    body = lines[c.start - 1:c.end]
+    valid_hit = next(((k, l.strip()) for k, l in enumerate(body[:15]) if rx_valid.search(l)), None)
+    if valid_hit:
+        scenarios.append({"type": "validation", "title": f"invalid or missing input: {action} is rejected",
+                          "expect": "/".join(str(x) for x in s.get("scenarios.validation_status")),
+                          "statuses": list(s.get("scenarios.validation_status")),
+                          "evidence": f"{c.file}:{c.start + valid_hit[0]} ({valid_hit[1][:60]})"})
+    scopes = [(c.file, c.start, c.end, c.name)]
+    for qn, hop in callees:
+        r = graph.prod.get(qn)
+        if r and hop <= callee_depth and to_int(r[5]) >= to_int(r[4]):
+            scopes.append((norm(r[3]), to_int(r[4]), to_int(r[5]), r[1]))
+    seen = set()
+    negatives = []
+    for file_, start, end, owner in scopes:
+        src = ctx.lines(file_)
+        for ln in range(max(start, 1), min(end, len(src)) + 1):
+            line = src[ln - 1]
+            if len(line) > ctx.max_line or not rx_err.search(line):
+                continue
+            k, depth = ln, line.count("(") - line.count(")")
+            while depth > 0 and k < min(len(src), ln + 6):  # include the rest of a multi-line call
+                line += " " + src[k].strip()
+                depth += src[k].count("(") - src[k].count(")")
+                k += 1
+            status = None
+            mn = rx_num.search(line)
+            if mn:
+                status = int(mn.group(1))
+            else:
+                status = next((v for k, v in names.items() if re.search(r"\b" + re.escape(k) + r"\b", line)), None)
+            cond = None
+            for back in range(0, lookback + 1):
+                if ln - 1 - back < 0:
+                    break
+                mc = rx_cond.match(src[ln - 1 - back])
+                if mc:
+                    cond = mc.group(1).strip().rstrip(":{").strip()[:100]
+                    break
+            mm = rx_msg.search(line)
+            msg = mm.group(2) if mm else None
+            key = (status, msg, cond)
+            if key in seen:
+                continue
+            seen.add(key)
+            when = f"when {cond}" if cond else "on this error path"
+            negatives.append({"type": "negative", "title": f"{action} fails {when}",
+                              "expect": " ".join(x for x in (str(status) if status else "error", f'"{msg}"' if msg else "") if x),
+                              "statuses": [status] if status else [],
+                              "evidence": f"{file_}:{ln}" + ("" if owner == c.name else f" (in {owner})")})
+    scenarios.extend(negatives[:max_neg])
+    return scenarios
+
+
+def asserted_statuses(ctx: RepoContext, ref: str, window: int) -> set:
+    """Status codes asserted near a test call (file:line or helper ref)."""
+    file_, _, line = ref.rpartition(":")
+    lines = ctx.lines(file_)
+    ln = to_int(line)
+    rx = ctx.rules.rx("tests.status_assert_regex")
+    names = ctx.rules.get("tests.status_assert_names")
+    found = set()
+    for text in lines[max(0, ln - 2):ln + window]:
+        for m in rx.finditer(text):
+            if m.group(1):
+                found.add(int(m.group(1)))
+            elif m.group(2) in names:
+                found.add(names[m.group(2)])
+            elif m.group(3):
+                found.add(int(m.group(3)))
+    return found
+
+
+def scenario_coverage(ctx: RepoContext, scenarios: list[dict], test_refs: list[str], assessable: bool = True) -> None:
+    """assessable=False: the entry point has no resolved external trigger, so a
+    missing test mapping says nothing about coverage."""
+    window = int(ctx.rules.get("limits.assert_window_lines"))
+    if not assessable:
+        for sc in scenarios:
+            sc["status"], sc["tests"] = "NOT ASSESSED (no external trigger resolved)", []
+        return
+    asserted = {ref: asserted_statuses(ctx, ref, window) for ref in test_refs}
+    for sc in scenarios:
+        if not test_refs:
+            sc["status"], sc["tests"] = "NOT COVERED", []
+            continue
+        want = set(sc.get("statuses") or [])
+        hits = [r for r, st in asserted.items() if want & st]
+        if sc["type"] == "happy_path":
+            if hits:
+                sc["status"], sc["tests"] = "COVERED", hits[:5]
+            else:
+                sc["status"], sc["tests"] = "EXERCISED (no success status asserted)", test_refs[:5]
+        elif hits:
+            sc["status"], sc["tests"] = "COVERED", hits[:5]
+        elif not want:
+            sc["status"], sc["tests"] = "CANNOT VERIFY (no status code in code evidence)", []
+        else:
+            sc["status"], sc["tests"] = "NOT COVERED", []
+
+
+# --------------------------------------------------------------------------
+# Unindexed files (CBM does not always report them)
+# --------------------------------------------------------------------------
+def unindexed_files(ctx: RepoContext, cbm: CBMClient, project: str) -> list[str]:
+    indexed = {norm(r[0]) for r in cbm.cypher(project, "MATCH (f:File) RETURN f.file_path")}
+    binary = set(ctx.rules.get("files.binary_ext"))
+    return sorted(f for f in ctx.tracked if f not in indexed and f.rsplit(".", 1)[-1].lower() not in binary)
+
+
+# --------------------------------------------------------------------------
+# Orchestration
+# --------------------------------------------------------------------------
+def entry_kind(c: Candidate) -> str:
+    """Evidence-based label (no inference beyond the signals)."""
+    if c.triggers:
+        return "ui_route" if c.triggers[0]["method"] == "UI" else "http_route"
+    for sig, kind in (("S10_public_api", "library_api"), ("S2_passed_as_value", "registered_callback"),
+                      ("S4_imported_not_called", "registered_function"), ("S11_named_in_string", "named_in_config"),
+                      ("S3_called_from_top_level", "script_main"), ("S7_top_level_program", "program_root"),
+                      ("S8_bootstrap_file", "program_root"), ("S1_route_handler", "http_route")):
+        if sig in c.signals:
+            return kind
+    return "other"
+
+
+def scan(repo: Path, rules: Rules, public_roots: list[str], no_index: bool, timeout_s: float) -> dict:
+    ctx = RepoContext(repo, rules)
+    cbm = CBMClient(timeout_s=timeout_s)
+    try:
+        if no_index:
+            projects = cbm.call("list_projects", {"format": "json"}).get("projects", [])
+            want = norm(str(repo)).lower()
+            match = [p for p in projects if norm(str(Path(p.get("root_path") or ".").resolve())).lower() == want]
+            if not match:
+                raise QScanError(f"{repo} is not indexed; run without --no-index", EXIT_USAGE)
+            project = match[0]["name"]
+        else:
+            log.info("indexing %s", repo)
+            res = cbm.call("index_repository", {"repo_path": str(repo), "format": "json"}, timeout_s=max(timeout_s, 3600))
+            project = res.get("project")
+            if not project or res.get("status") not in ("indexed", None):
+                raise QScanError(f"indexing failed: {json.dumps(res)[:300]}", EXIT_INDEX)
+        log.info("discovering entry points")
+        cands, graph = discover(ctx, cbm, project, public_roots)
+        graph.classes = [(r[1], norm(r[2]), to_int(r[3]), to_int(r[4])) for r in cbm.cypher(
+            project, "MATCH (c:Class) RETURN c.qualified_name, c.name, c.file_path, c.start_line, c.end_line")
+            if ctx.is_production_code(r[2])]
+        log.info("resolving routes")
+        bind_triggers(ctx, cbm, project, cands, graph)
+        resolve_prefixes(ctx, cands)
+        apply_conventions(ctx, cands, graph)
+        dedupe_triggers(cands)
+        log.info("analysing tests")
+        test_files = analyze_tests(ctx, cbm, project, cands, graph)
+        missing = unindexed_files(ctx, cbm, project)
+
+        confirmed = sorted((c for c in cands.values() if c.confirmed), key=lambda c: (c.file, c.start, c.qn))
+        review = sorted((c for c in cands.values() if not c.confirmed), key=lambda c: (c.file, c.start, c.qn))
+        covered: dict = defaultdict(list)
+        for tf in test_files.values():
+            if tf["type"] == "functional":
+                for inv in tf["invocations"] + tf["via_helpers"]:
+                    for qn in inv.get("mapped", []):
+                        covered[qn].append(inv["line"] if isinstance(inv["line"], str) else f"{tf['file']}:{inv['line']}")
+
+        depth = int(rules.get("limits.trace_depth"))
+        max_flows = int(rules.get("limits.max_flows"))
+        trace_timeout = float(rules.get("limits.trace_timeout_s"))
+        log.info("tracing flows and deriving scenarios for %d entry points", len(confirmed))
+        entries, flows_by_cap = [], defaultdict(list)
+        for idx, c in enumerate(confirmed):
+            callees = trace_callees(cbm, project, c, depth, trace_timeout) if c.label in CALLABLE and idx < max_flows else []
+            refs = sorted(set(covered.get(c.qn, [])))
+            scenarios = derive_scenarios(ctx, c, callees, graph)
+            scenario_coverage(ctx, scenarios, refs, assessable=bool(c.triggers) or bool(refs))
+            steps = []
+            for qn, hop in callees:
+                r = graph.prod.get(qn)
+                if r:
+                    steps.append({"step": r[1], "at": f"{norm(r[3])}:{to_int(r[4])}", "hop": hop})
+            cap = capability_of(ctx, c)
+            entry = {"id": f"EP{idx + 1}", "kind": entry_kind(c), "name": c.name, "handler": f"{c.file}:{c.start}",
+                     "file": c.file, "lines": [c.start, c.end], "label": c.label,
+                     "triggers": [f"{t['method'] or 'ANY'} {t['path']}" for t in c.triggers],
+                     "trigger_sources": [t["source"] for t in c.triggers],
+                     "signals": sorted(c.signals), "evidence": c.evidence[:6], "capability": cap,
+                     "flow": steps[:25], "tests": refs, "scenarios": scenarios, "qualified_name": c.qn}
+            entries.append(entry)
+            flows_by_cap[cap].append(entry["id"])
+
+        gaps = []
+        for e in entries:
+            if not e["triggers"]:
+                continue  # no external trigger resolved: test coverage cannot be assessed
+            if not e["tests"]:
+                gaps.append({"entry_point": e["id"], "what": f"{e['triggers'][0]} ({e['name']}) has no functional test",
+                             "evidence": f"handler {e['handler']}; registered at {e['trigger_sources'][0]}"})
+            else:
+                for sc in e["scenarios"]:
+                    if sc["status"] == "NOT COVERED":
+                        gaps.append({"entry_point": e["id"], "what": f"scenario not tested: {sc['title']} -> {sc['expect']}",
+                                     "evidence": sc["evidence"]})
+        func_files = [tf for tf in test_files.values() if tf["type"] == "functional"]
+        return {
+            "tool": {"name": "qscan", "version": __version__, "rules": str(rules.path), "rules_sha256": rules.sha256},
+            "repo": {"path": str(repo), "commit": ctx.commit, "cbm_project": project},
+            "summary": {
+                "entry_points": len(entries),
+                "entry_points_by_kind": dict(sorted(Counter(e["kind"] for e in entries).items())),
+                "needs_review_candidates": len(review),
+                "functional_test_files": len(func_files),
+                "functional_test_calls": sum(len(t["invocations"]) for t in func_files),
+                "entry_points_with_trigger": sum(1 for e in entries if e["triggers"]),
+                "entry_points_with_tests": sum(1 for e in entries if e["tests"]),
+                "expected_scenarios": sum(len(e["scenarios"]) for e in entries),
+                "scenarios_covered": sum(1 for e in entries for s in e["scenarios"] if s["status"] == "COVERED"),
+                "gaps": len(gaps),
+                "unindexed_files": len(missing),
+            },
+            "entry_points": entries,
+            "business_flows": {k: v for k, v in sorted(flows_by_cap.items())},
+            "functional_tests": [{"file": t["file"], "cases": t["cases"],
+                                  "calls": [{"line": i["line"], "call": f"{i['method'] or '?'} {i['path']}",
+                                             "mapped_to": i.get("mapped", []), "match": i.get("match")}
+                                            for i in t["invocations"]],
+                                  "via_helpers": [{"at": i["line"], "call": f"{i['method'] or '?'} {i['path']}",
+                                                   "mapped_to": i.get("mapped", [])} for i in t["via_helpers"]]}
+                                 for t in sorted(func_files, key=lambda x: x["file"])],
+            "gaps": gaps,
+            "needs_review": [{"name": c.name, "qualified_name": c.qn, "at": f"{c.file}:{c.start}", "file": c.file, "lines": [c.start, c.end],
+                              "label": c.label, "signals": sorted(c.signals),
+                              "evidence": c.evidence[:3]} for c in review],
+            "limitations": {
+                "unindexed_files": missing,
+                "entry_points_without_trigger": [e["id"] for e in entries if not e["triggers"]],
+                "notes": [
+                    "Entry points are listed only when registration evidence exists (signals S1-S4, S7, S8, S10, S11, S14) or a route was resolved.",
+                    "needs_review candidates have no production caller; they are framework-invoked entry points OR dead code and must be reviewed.",
+                    "Scenarios come from code evidence (error branches, status codes, auth/validation checks) in the handler and in-repo callees; business rules not visible in code are not inferred.",
+                    "Test mapping uses literal URLs/paths in tests; tests that use named route helpers, URL constants, GraphQL documents or plain-English BDD steps are not mapped.",
+                ],
+            },
+        }
+    finally:
+        cbm.close()
+
+
+# --------------------------------------------------------------------------
+# Text report
+# --------------------------------------------------------------------------
+def render(report: dict, limit: int) -> str:
+    out: list[str] = []
+    w = out.append
+    s = report["summary"]
+    bar = "=" * 100
+
+    def more(n: int) -> None:
+        if n > limit:
+            w(f"  ... {n - limit} more (see --json)")
+
+    w(bar)
+    w(f"QUALITY SCAN  {report['repo']['path']}  commit {report['repo']['commit'][:12]}")
+    w(f"qscan {report['tool']['version']}  rules {Path(report['tool']['rules']).name} ({report['tool']['rules_sha256']})")
+    w(bar)
+    w("SUMMARY")
+    w(f"  Entry points ............................ {s['entry_points']}  "
+      + ", ".join(f"{k} {v}" for k, v in s["entry_points_by_kind"].items()))
+    w(f"  Candidates needing review ............... {s['needs_review_candidates']} (no caller found: framework-invoked or dead code)")
+    w(f"  Functional test files / external calls .. {s['functional_test_files']} / {s['functional_test_calls']}")
+    w(f"  Entry points with a resolved trigger .... {s['entry_points_with_trigger']}")
+    w(f"  Entry points exercised by tests ......... {s['entry_points_with_tests']}")
+    w(f"  Expected scenarios / covered ............ {s['expected_scenarios']} / {s['scenarios_covered']}")
+    w(f"  Gaps .................................... {s['gaps']}")
+    w(f"  Files CBM did not index ................. {s['unindexed_files']}")
+
+    eps = report["entry_points"]
+    w(f"\n{bar}\n1. ENTRY POINTS ({len(eps)})\n{bar}")
+    for e in eps[:limit]:
+        trig = e["triggers"][0] if e["triggers"] else "-"
+        w(f"  {e['id']:>5}  {e['kind']:20} {trig[:40]:40} {e['name'][:28]:28} {e['handler']}")
+        w(f"         evidence: {e['evidence'][0][:110] if e['evidence'] else '-'}")
+    more(len(eps))
+
+    w(f"\n{bar}\n2. BUSINESS FLOWS (by capability)\n{bar}")
+    by_id = {e["id"]: e for e in eps}
+    caps = list(report["business_flows"].items())
+    for cap, ids in caps[:limit]:
+        w(f"  [{cap}]  {len(ids)} entry point(s)")
+        for i in ids[:5]:
+            e = by_id[i]
+            chain = " -> ".join(st["step"] for st in e["flow"][:6]) or "(no in-repo callees)"
+            w(f"     {(e['triggers'][0] if e['triggers'] else e['name'])[:40]:40} : {e['name']} -> {chain[:120]}")
+        if len(ids) > 5:
+            w(f"     ... {len(ids) - 5} more in this capability")
+    more(len(caps))
+
+    w(f"\n{bar}\n3. EXPECTED FUNCTIONAL SCENARIOS AND WHAT IS PRESENT\n{bar}")
+    for e in eps[:limit]:
+        w(f"  {e['id']} {e['triggers'][0] if e['triggers'] else e['name']}  ({e['handler']})")
+        for sc in e["scenarios"]:
+            tests = f"  <- {sc['tests'][0]}" if sc.get("tests") else ""
+            w(f"     [{sc['status']}] {sc['type']}: {sc['title'][:90]} => {sc['expect'][:40]}")
+            w(f"         evidence {sc['evidence']}{tests}")
+    more(len(eps))
+
+    ft = report["functional_tests"]
+    w(f"\n{bar}\n4. EXISTING FUNCTIONAL TESTS ({len(ft)} files)\n{bar}")
+    for t in ft[:limit]:
+        mapped = sorted({q.rsplit('.', 1)[-1] for c in t["calls"] for q in c["mapped_to"]})
+        w(f"  {t['file']}  cases={t['cases']} calls={len(t['calls'])} -> {', '.join(mapped)[:100] or '(no entry point matched)'}")
+    more(len(ft))
+
+    gaps = report["gaps"]
+    w(f"\n{bar}\n5. GAPS ({len(gaps)})\n{bar}")
+    for g in gaps[:limit]:
+        w(f"  {g['entry_point']:>5}  {g['what'][:110]}")
+        w(f"         evidence {g['evidence'][:120]}")
+    more(len(gaps))
+
+    lim = report["limitations"]
+    w(f"\n{bar}\n6. LIMITATIONS\n{bar}")
+    w(f"  Entry points with no resolved trigger (coverage not assessed): {len(lim['entry_points_without_trigger'])}")
+    w(f"  Files CBM did not index ({len(lim['unindexed_files'])}): " + ", ".join(lim["unindexed_files"][:8])
+      + (" ..." if len(lim["unindexed_files"]) > 8 else ""))
+    for n in lim["notes"]:
+        w(f"  - {n}")
+    return "\n".join(out)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="qscan", description="Functional quality scan of a repository (CBM-based).")
+    ap.add_argument("repo", help="path to a git repository")
+    ap.add_argument("--rules", help="optional rules JSON file (default: the rules built into this script; "
+                                    "--dump-rules prints them as a starting point)")
+    ap.add_argument("--dump-rules", action="store_true", help="print the built-in rules as JSON and exit")
+    ap.add_argument("--json", metavar="FILE", help="also write the full report as JSON")
+    ap.add_argument("--public-root", action="append", default=[], help="library package root file (repeatable)")
+    ap.add_argument("--no-index", action="store_true", help="reuse the existing CBM index")
+    ap.add_argument("--limit", type=int, default=50, help="max rows printed per section (JSON is always complete)")
+    ap.add_argument("--timeout", type=float, default=300.0, help="seconds to wait for each CBM call")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--version", action="version", version=f"qscan {__version__}")
+    args = ap.parse_args(argv)
+    if args.dump_rules:
+        print(json.dumps(DEFAULT_RULES, indent=2))
+        return EXIT_OK
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s", stream=sys.stderr)
+    repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        log.error("not a directory: %s", repo)
+        return EXIT_USAGE
+    try:
+        rules = Rules(Path(args.rules) if args.rules else None)
+        report = scan(repo, rules, args.public_root, args.no_index, args.timeout)
+    except QScanError as e:
+        log.error("%s", e)
+        return e.code
+    except KeyboardInterrupt:
+        log.error("interrupted")
+        return EXIT_INTERNAL
+    print(render(report, max(1, args.limit)))
+    if args.json:
+        try:
+            Path(args.json).write_text(json.dumps(report, indent=2, sort_keys=False), encoding="utf-8")
+        except OSError as e:
+            log.error("cannot write %s: %s", args.json, e)
+            return EXIT_USAGE
+        log.info("JSON report written to %s", args.json)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
