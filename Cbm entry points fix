@@ -1,0 +1,461 @@
+# CBM Entry Points, Business Flows & Functional Tests Playbook
+
+> **codebase-memory-mcp (CBM)** – Complete guide to discovering **all entry points**, **business flows**, and **functional tests** across every kind of application repository and language (including monoliths, agentic systems, and frontend apps).
+
+**Last updated:** 2026-10-16
+
+---
+
+## Table of Contents
+
+1. [Why `get_architecture` is not enough](#1-why-get_architecture-is-not-enough)
+2. [Full taxonomy of application kinds](#2-full-taxonomy-of-application-kinds)
+3. [Universal CBM recipe – Entry points & business flows](#3-universal-cbm-recipe--entry-points--business-flows)
+4. [Finding all functional tests](#4-finding-all-functional-tests)
+5. [App-type-specific pattern cheatsheet](#5-app-type-specific-pattern-cheatsheet)
+6. [Recommended permanent workflow (copy-paste)](#6-recommended-permanent-workflow-copy-paste)
+7. [Key principles](#7-key-principles)
+8. [How `name-pattern` works](#8-how-name-pattern-works)
+9. [Copilot / Agent prompt to keep this document updated](#9-copilot--agent-prompt-to-keep-this-document-updated)
+
+---
+
+## 1. Why `get_architecture` is not enough
+
+| Repo type                | `get_architecture` (default) | Explicit `--aspects '["entry_points"]'` |
+|--------------------------|------------------------------|----------------------------------------|
+| Tiny package             | Often shows 1–3 entry points | Same                                   |
+| Real library / framework | Frequently **omits** entry points section | Still sparse or empty            |
+| Large / hybrid app       | Incomplete                   | Incomplete                             |
+
+**Root cause:** CBM’s entry-point detection is heuristic. It works reasonably on small packages that export a couple of top-level functions, but is sparse on frameworks, microservices, workers, and hybrid apps.
+
+**Conclusion:** Treat `get_architecture` as a **high-level overview** (languages, packages, hotspots, routes).  
+For a complete list of entry points, business flows, **and functional tests**, always combine the multi-signal recipes below.
+
+---
+
+## 2. Full taxonomy of application kinds
+
+Cover these categories so nothing is missed:
+
+| #  | Kind of application                    | Typical languages / stacks                                                                 |
+|----|----------------------------------------|--------------------------------------------------------------------------------------------|
+| 1  | **CLI tools / command-line apps**      | Python (Click, Typer, argparse), Go, Rust (clap), Node (Commander, yargs), Java (picocli)  |
+| 2  | **Web / HTTP APIs (REST, GraphQL, RPC)** | FastAPI, Flask, Django, Express, NestJS, Spring Boot, Gin, Echo, Actix, Rails, Laravel, ASP.NET |
+| 3  | **Full-stack web apps / SSR**          | Next.js, Nuxt, Remix, SvelteKit, Django templates, Rails, Laravel Blade                    |
+| 4  | **Microservices / multi-service**      | Any language + gRPC, Kafka, HTTP, message queues                                           |
+| 5  | **Background workers / job processors**| Celery, Sidekiq, Bull, RQ, Temporal, Hangfire, custom consumers                            |
+| 6  | **Event-driven / message-driven**      | Kafka consumers, RabbitMQ, SQS, NATS, EventBridge handlers                                 |
+| 7  | **Desktop / GUI apps**                 | Electron, Tauri, Qt, GTK, WPF, SwiftUI, WinForms                                           |
+| 8  | **Mobile apps**                        | React Native, Flutter, native Android (Kotlin/Java), iOS (Swift)                           |
+| 9  | **Libraries / SDKs / frameworks**      | Pure packages with public API surface (no single “main”)                                   |
+| 10 | **Serverless / FaaS**                  | AWS Lambda, Azure Functions, Cloudflare Workers, Google Cloud Functions                    |
+| 11 | **Batch / ETL / data pipelines**       | Airflow, dbt, Prefect, custom scripts, Spark jobs                                          |
+| 12 | **Infrastructure / IaC / operators**   | Terraform providers, Kubernetes operators, Ansible, Pulumi                                 |
+| 13 | **Games / engines**                    | Unity, Unreal, custom game loops                                                           |
+| 14 | **Embedded / firmware / IoT**          | C/C++, Rust (no_std), MicroPython                                                          |
+| 15 | **Monorepos / multi-package**          | Turborepo, Nx, Lerna, Cargo workspace, Go modules, Python monorepos                        |
+| 16 | **Plugins / extensions**               | VS Code, browser extensions, WordPress, IDE plugins                                        |
+| 17 | **Schedulers / cron-like**             | APScheduler, node-cron, systemd timers, Kubernetes CronJobs                                |
+| 18 | **Hybrid (CLI + API + worker)**        | Very common in real companies                                                              |
+| 19 | **Agentic systems**                    | LangGraph, AutoGen, CrewAI, custom agents, MCP servers, tool-using agents                  |
+| 20 | **Frontend / SPA / SSR**               | React, Next.js, Vue, Nuxt, Svelte, Angular, Solid                                          |
+
+---
+
+## 3. Universal CBM recipe – Entry points & business flows
+
+Run these steps in order. Do **not** rely only on `get_architecture`.
+
+### Step A – Index
+
+```bash
+codebase-memory-mcp cli index_repository --repo-path /path/to/repo
+codebase-memory-mcp cli list_projects          # note the exact project name
+```
+
+### Step B – High-level map
+
+```bash
+codebase-memory-mcp cli get_architecture --project PROJECT \
+  --aspects '["hotspots","routes","structure","languages"]'
+```
+
+### Step C – Structural roots (functions nothing calls)
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --label Function --max-degree 0 --limit 50
+```
+
+### Step D – Name-pattern sweeps (broad → specific)
+
+**Universal first pass (covers most apps):**
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --name-pattern "main|cli|app|server|start|run|handler|router|controller|entrypoint|entry_point|bootstrap|init|listen|serve|worker|consumer|process|job|task|lambda|handler" \
+  --label Function --limit 60
+```
+
+**Class / type level:**
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --name-pattern "Application|App|Server|Router|Controller|Command|Group|Worker|Consumer|Handler|Service|Job|Task" \
+  --label Class --limit 40
+```
+
+### Step E – Route / HTTP / RPC entry points
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT --label Route
+```
+
+### Step F – Process / executable entry points
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT --label Process
+```
+
+### Step G – Text search for language idioms
+
+```bash
+# Python
+codebase-memory-mcp cli search_code --project PROJECT --pattern '__name__\s*==\s*[\'"]__main__[\'"]'
+
+# Go
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'func\s+main\s*\('
+
+# Node / JS / TS
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'require\.main\s*===\s*module|#\!/usr/bin/env'
+
+# Java / Kotlin
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'public\s+static\s+void\s+main'
+
+# Rust
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'fn\s+main\s*\('
+
+# General shebang / scripts
+codebase-memory-mcp cli search_code --project PROJECT --pattern '^#!/'
+```
+
+### Step H – Expand the real business flows
+
+```bash
+codebase-memory-mcp cli trace_path --project PROJECT \
+  --function-name "ExactFunctionName" \
+  --direction outbound --depth 4 --limit 30
+```
+
+---
+
+## 4. Finding all functional tests
+
+Functional tests (also called integration tests, end-to-end tests, feature tests, system tests, acceptance tests) verify behaviour through real or near-real entry points.  
+Unit tests are usually more numerous; this section focuses on **functional / integration / e2e** style tests while still showing how to surface the broader test surface.
+
+### 4.1 What CBM already knows about tests
+
+CBM frequently creates `TESTS` edges and can surface test functions/classes.  
+However, automatic classification is incomplete, so we again use a **multi-signal** approach.
+
+### 4.2 Universal test-discovery recipe
+
+#### A. Search by common test naming conventions
+
+```bash
+# Function / method level
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --name-pattern "test_|_test$|Test|it_|describe_|spec_|should_|feature_|scenario_|e2e_|integration_|functional_" \
+  --label Function --limit 80
+
+# Class level (JUnit, TestNG, pytest classes, etc.)
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --name-pattern "Test|Spec|Suite|Feature|Scenario" \
+  --label Class --limit 50
+```
+
+#### B. Search by file / path patterns (very reliable)
+
+```bash
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --file-pattern ".*(test|tests|spec|specs|e2e|integration|functional|features|__tests__|cypress|playwright|selenium).*" \
+  --limit 100
+```
+
+#### C. Text search for framework idioms
+
+```bash
+# Python (pytest, unittest, behave, robot)
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'def test_|@pytest\.|unittest\.|@given|@when|@then|Feature:|Scenario:'
+
+# JavaScript / TypeScript (Jest, Vitest, Mocha, Cypress, Playwright, Testing Library)
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'describe\(|it\(|test\(|expect\(|cy\.|test\(|page\.|@playwright|render\('
+
+# Java / Kotlin (JUnit, TestNG, Spock, Cucumber)
+codebase-memory-mcp cli search_code --project PROJECT --pattern '@Test|@ParameterizedTest|@Given|@When|@Then|def ".*"'
+
+# Go
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'func Test|t\.Run\(|testify|gomock'
+
+# Rust
+codebase-memory-mcp cli search_code --project PROJECT --pattern '#\[test\]|#\[tokio::test\]|mod tests'
+
+# C# / .NET
+codebase-memory-mcp cli search_code --project PROJECT --pattern '\[Fact\]|\[Theory\]|\[TestMethod\]|\[Test\]'
+
+# Ruby
+codebase-memory-mcp cli search_code --project PROJECT --pattern 'RSpec\.|describe |it |feature |scenario '
+```
+
+#### D. Use the TESTS relationship when present
+
+```bash
+# Functions that have TESTS edges (CBM already linked them)
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --relationship TESTS --limit 50
+```
+
+#### E. Distinguish functional vs pure unit tests (heuristic)
+
+| Signal | More likely **functional / integration / e2e** | More likely **unit** |
+|--------|-----------------------------------------------|----------------------|
+| File path | `e2e/`, `integration/`, `functional/`, `features/`, `cypress/`, `playwright/`, `selenium/` | `unit/`, `__tests__` next to source, `*_test.go` next to file |
+| Name | `test_end_to_end`, `test_api_flow`, `test_user_journey`, `Feature`, `Scenario` | `test_add`, `test_parse`, `test_helper` |
+| Imports / setup | Starts real server, browser, database, message broker, HTTP client to real port | Mocks, stubs, in-memory fakes only |
+| Calls real entry points | Calls `main`, route handlers, agent `invoke`, CLI runner | Calls pure functions / private methods |
+
+Practical filter after you have candidates:
+
+```bash
+# Keep only tests that live under typical functional folders
+codebase-memory-mcp cli search_graph --project PROJECT \
+  --file-pattern ".*(e2e|integration|functional|features|cypress|playwright|selenium|acceptance).*" \
+  --name-pattern "test_|it_|describe_|spec_|feature_|scenario_" \
+  --limit 60
+```
+
+### 4.3 Linking tests back to entry points & business flows
+
+Once you have both entry points and tests:
+
+```bash
+# From a known entry point, see what tests cover it (if TESTS edges exist)
+codebase-memory-mcp cli trace_path --project PROJECT \
+  --function-name "YourEntryPoint" --direction inbound --depth 2
+
+# Or the other way: from a test, see what it exercises
+codebase-memory-mcp cli trace_path --project PROJECT \
+  --function-name "test_user_registration_flow" --direction outbound --depth 4
+```
+
+This is the fastest way to answer:
+
+- “Which functional tests exercise this API / agent / page?”
+- “Which business flows have no functional coverage?”
+
+### 4.4 App-type notes for tests
+
+| App kind              | Typical functional-test locations / frameworks                      | Extra patterns |
+|-----------------------|---------------------------------------------------------------------|----------------|
+| **API / backend**     | `tests/integration`, `tests/e2e`, `*_test.go`, Testcontainers       | `TestClient`, `APITestCase`, `supertest`, `rest-assured` |
+| **Frontend**          | Cypress, Playwright, Testing Library, Jest + MSW                    | `cy.`, `page.`, `render(`, `screen.` |
+| **Agentic**           | Often custom; look for `test_agent`, `test_graph`, `test_tool`      | `invoke`, `ainvoke`, `stream`, mock LLM responses |
+| **CLI**               | CliRunner (Click), `go test`, snapshot tests                        | `CliRunner`, `runner.invoke` |
+| **Mobile**            | Detox, Espresso, XCUITest, Flutter integration_test                 | `integration_test`, `espresso`, `XCUITest` |
+| **Monolith**          | Usually has both unit + a smaller set of integration/e2e suites     | Look under `tests/integration` + `tests/e2e` |
+| **Serverless**        | Local emulators + integration tests against deployed stages         | `serverless-offline`, `sam local`, `test_handler` |
+
+---
+
+## 5. App-type-specific pattern cheatsheet
+
+### Entry points
+
+| App kind                     | Extra name patterns / labels                                      | Extra `search_code` patterns                                      |
+|-----------------------------|-------------------------------------------------------------------|-------------------------------------------------------------------|
+| **CLI**                     | `cli`, `command`, `main`, `app`, `group`                          | `@click.command`, `typer.run`, `argparse`, `cobra.Command`        |
+| **REST / GraphQL API**      | `handler`, `controller`, `router`, `route`, `endpoint`, `resolver`| `@app.get`, `@router.`, `app.use`, `@GetMapping`, `r.GET`         |
+| **Full-stack / SSR**        | `page`, `loader`, `action`, `getServerSideProps`, `handler`       | `export default`, `createBrowserRouter`, `defineEventHandler`     |
+| **Worker / Job**            | `worker`, `consumer`, `process`, `job`, `task`, `perform`         | `@celery.task`, `sidekiq`, `Bull.Queue`                           |
+| **Event-driven**            | `handler`, `listener`, `consumer`, `on_message`, `handle_event`   | `on('message'`, `@KafkaListener`, `subscribe`                     |
+| **Serverless**              | `handler`, `lambda_handler`, `main`, `run`                        | `exports.handler`, `def handler`                                  |
+| **Desktop / Electron**      | `main`, `createWindow`, `app.whenReady`                           | `app.on('ready'`, `BrowserWindow`                                 |
+| **Mobile**                  | `main`, `App`, `runApp`, `onCreate`                               | `void main()`, `runApp(`, `onCreate(`                             |
+| **Library / SDK**           | Public exports, zero-inbound, high fan-in                         | `__init__.py`, `index.ts`, `mod.rs`, `lib.go`                     |
+| **Batch / ETL**             | `main`, `run`, `execute`, `transform`, `pipeline`                 | `DAG(`, `if __name__`                                             |
+| **Agentic systems**         | `run`, `invoke`, `ainvoke`, `stream`, `agent`, `tool`, `node`     | `@tool`, `StateGraph`, `add_node`, `create_react_agent`           |
+| **Frontend**                | `main`, `App`, `createRoot`, `page`, `layout`, `loader`, `action` | `createRoot`, `hydrateRoot`, `useEffect`, `cy.`, `page.`          |
+
+### Functional tests (quick add-ons)
+
+| App kind          | High-value test patterns / folders                          |
+|-------------------|-------------------------------------------------------------|
+| API               | `tests/integration`, `tests/e2e`, `TestClient`, `supertest` |
+| Frontend          | `cypress/`, `playwright/`, `e2e/`, `*.spec.ts`              |
+| Agentic           | `test_agent`, `test_graph`, `test_tool`, `test_invoke`      |
+| CLI               | `CliRunner`, `runner.invoke`, `tests/cli`                   |
+| Monolith          | `tests/integration` + `tests/e2e` + feature folders         |
+
+---
+
+## 6. Recommended permanent workflow (copy-paste)
+
+```bash
+PROJECT=your-project-name
+
+# ──────────────────────────────────────────────
+# PART 1 – Entry points & business flows
+# ──────────────────────────────────────────────
+
+# 1. Architecture + hotspots + routes
+codebase-memory-mcp cli get_architecture --project $PROJECT \
+  --aspects '["hotspots","routes","structure"]'
+
+# 2. Structural roots
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --label Function --max-degree 0 --limit 40
+
+# 3. Broad name sweep
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --name-pattern "main|cli|app|server|start|run|handler|router|controller|worker|consumer|job|task|lambda|entrypoint|bootstrap|init|listen|serve|invoke|agent" \
+  --label Function --limit 50
+
+# 4. Routes & processes
+codebase-memory-mcp cli search_graph --project $PROJECT --label Route
+codebase-memory-mcp cli search_graph --project $PROJECT --label Process
+
+# 5. Language idiom search (pick what matches your stack)
+codebase-memory-mcp cli search_code --project $PROJECT --pattern '__name__\s*==\s*[\'"]__main__[\'"]'
+codebase-memory-mcp cli search_code --project $PROJECT --pattern 'func\s+main\s*\('
+codebase-memory-mcp cli search_code --project $PROJECT --pattern 'public\s+static\s+void\s+main'
+codebase-memory-mcp cli search_code --project $PROJECT --pattern 'fn\s+main\s*\('
+
+# 6. Trace interesting flows
+codebase-memory-mcp cli trace_path --project $PROJECT \
+  --function-name "CandidateName" --direction outbound --depth 4
+
+
+# ──────────────────────────────────────────────
+# PART 2 – Functional / integration / e2e tests
+# ──────────────────────────────────────────────
+
+# 7. Test functions by name
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --name-pattern "test_|_test$|Test|it_|describe_|spec_|feature_|scenario_|e2e_|integration_" \
+  --label Function --limit 80
+
+# 8. Test classes
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --name-pattern "Test|Spec|Suite|Feature|Scenario" \
+  --label Class --limit 40
+
+# 9. By typical test folders / files
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --file-pattern ".*(test|tests|spec|specs|e2e|integration|functional|features|__tests__|cypress|playwright).*" \
+  --limit 100
+
+# 10. Framework idioms (adjust to your stack)
+codebase-memory-mcp cli search_code --project $PROJECT --pattern 'def test_|@pytest\.|describe\(|it\(|@Test|func Test|#\[test\]'
+
+# 11. Prefer functional-style locations
+codebase-memory-mcp cli search_graph --project $PROJECT \
+  --file-pattern ".*(e2e|integration|functional|features|cypress|playwright|selenium|acceptance).*" \
+  --limit 50
+
+# 12. Link tests ↔ entry points (when edges exist)
+codebase-memory-mcp cli search_graph --project $PROJECT --relationship TESTS --limit 40
+```
+
+---
+
+## 7. Key principles
+
+1. **Never trust only `get_architecture`** for entry points or test discovery.
+2. **Combine four signals** for entry points:
+   - Name patterns
+   - Structural (zero / low inbound degree)
+   - Route / Process labels
+   - Source-text idioms
+3. **Combine three signals** for functional tests:
+   - Naming conventions (`test_`, `it(`, `describe(`, …)
+   - File / folder location (`e2e/`, `integration/`, `cypress/`, …)
+   - Framework idioms + `TESTS` edges
+4. **Entry points ≠ business logic**. Always `trace_path` outbound.
+5. **Functional tests should call real (or near-real) entry points**. Use `trace_path` both ways to verify coverage.
+6. **Libraries** have no single main — treat public high-fan-in / zero-inbound symbols as the entry surface; their tests are often the best documentation of intended use.
+7. **Monorepos** → index once, then filter by path or run the recipe per package.
+8. **Hybrid / agentic / frontend** apps will surface multiple independent roots and multiple test styles — that is expected.
+9. Prefer a few focused searches over one giant catch-all pattern.
+
+---
+
+## 8. How `name-pattern` works
+
+`--name-pattern` is a **regex** matched against the **symbol name** (function/method/class name), not the full file path.
+
+Useful examples:
+
+```bash
+# Single word
+--name-pattern "main"
+
+# Alternation (OR)
+--name-pattern "main|cli|app|handler|run|start"
+
+# Test-oriented
+--name-pattern "test_|it_|describe_|spec_|feature_"
+
+# Starts with
+--name-pattern "^handle"
+
+# Combined with label
+--name-pattern "main|cli" --label Function
+--name-pattern "Test|Spec" --label Class
+```
+
+You do **not** need every possible word. Use short lists of common entry-style and test-style words and run 2–4 targeted searches.
+
+---
+
+## 9. Copilot / Agent prompt to keep this document updated
+
+Copy-paste the prompt below into GitHub Copilot Chat, Cursor, Claude, or any coding agent when you want this playbook refreshed or extended.
+
+```text
+You are updating the file CBM-Entry-Points-Playbook.md (codebase-memory-mcp guide for entry points, business flows, and functional tests).
+
+Goals:
+1. Keep the taxonomy of application kinds complete. Add any new major categories (AI agents, edge functions, WASM modules, new frontend meta-frameworks, etc.) if missing.
+2. Keep the Universal CBM recipe and the Functional-tests recipe accurate for the current version of codebase-memory-mcp. Verify flag names and tool names against the latest CLI help (`codebase-memory-mcp cli <tool> --help`) if possible.
+3. Expand both the entry-point and the functional-test cheatsheets with new frameworks or common idioms.
+4. Preserve the overall structure: taxonomy → entry-point recipe → functional-test recipe → cheatsheet → copy-paste workflow → principles → name-pattern explanation → this update prompt.
+5. Do not remove existing solid content unless it is factually wrong. Prefer additive updates.
+6. Keep all commands as copy-pasteable bash blocks.
+7. At the top, update the “Last updated” date to today.
+8. If new CBM tools, labels, or relationships become available for entry-point or test discovery, document them clearly.
+9. Keep the distinction between unit tests and functional/integration/e2e tests clear; focus recommendations on functional-style tests while still showing how to surface the broader test surface.
+
+After updating, briefly summarize what you changed.
+```
+
+---
+
+## Quick reference – most useful CBM tools
+
+| Tool                    | Purpose                                              |
+|-------------------------|------------------------------------------------------|
+| `index_repository`      | Build / refresh the knowledge graph                  |
+| `list_projects`         | See indexed projects                                 |
+| `get_architecture`      | Overview, hotspots, routes, structure                |
+| `search_graph`          | Find symbols by name, label, degree, relationship    |
+| `search_code`           | Regex / text search across source                    |
+| `trace_path`            | Expand call / data flow from a root (or from a test) |
+| `query_graph`           | Raw Cypher for advanced queries                      |
+| `index_status`          | Check index health                                   |
+
+---
+
+*End of playbook.*
