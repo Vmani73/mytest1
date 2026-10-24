@@ -1,0 +1,130 @@
+TASK: Change-aware repository sync for the scan pipeline (GitHub REST API only, runs in OCP)
+
+GOAL
+1. Skip repos whose default branch has not changed since the last SUCCESSFUL scan.
+2. For changed repos, produce an exact change set (added/modified/deleted/moved files)
+   and a verified workspace of the exact commit, without git or GitPython.
+3. Record a repo's new state only after its scan succeeds.
+
+RULES FOR YOU
+- Do not assume anything about our environment. Every fact below marked [VERIFY]
+  must be confirmed from code, config, manifests, or a live read-only API call, and
+  reported with evidence (file:line, command output). If you cannot confirm one, say so.
+- Do not start Phase 2 until I approve the Phase 1 report.
+
+PHASE 1 — ANALYZE AND MEASURE (read-only)
+A. Current implementation
+  1. Where the zipball download happens (file:line) and every caller.
+  2. How the download is pinned: commit SHA or branch name.
+  3. Retry, timeout, rate-limit, and redirect handling as written.
+  4. What the scanner reads from the extracted directory (full tree, or specific files)
+     and the directory layout it expects.
+  5. Where per-repo state (last scanned SHA, etc.) is stored today, if anywhere.
+B. Environment [VERIFY]
+  6. GitHub host and version (GET /meta or the /api/v3 root), and whether rate limiting
+     is enabled (GET /rate_limit).
+  7. Auth type: PAT or GitHub App. If App: how tokens are refreshed, given they expire in 1 hour.
+  8. Proxy and CA bundle configuration used by the existing HTTP client.
+  9. Pod topology: number of pods, clusters, data centres; how repos are assigned to pods;
+     whether two pods can process the same repo at the same time.
+ 10. The ephemeral storage available to scan pods (emptyDir sizeLimit, node ephemeral storage).
+C. Measurements (sample at least 200 repos, read-only API calls)
+ 11. Distribution (p50/p95/max) of: file count, zipball size, download time,
+     extraction time.
+ 12. Percentage of repos whose default branch changed in the last 7 days.
+ 13. Repos with truncated trees, LFS (filter=lfs in .gitattributes), export-ignore
+     or export-subst attributes, or submodules.
+ 14. Current end-to-end time per repo, split into download / extract / scan.
+Deliver: a report with evidence, the list of files you plan to change, and any finding
+that contradicts this spec.
+
+PHASE 2 — IMPLEMENT
+State (MongoDB, one doc per repo+branch):
+  repo, branch, last_scanned_commit_sha, last_scanned_tree_sha, scan_config_hash,
+  branch_etag, snapshot (gzip-compressed JSON {path: blob_sha}; store it in GridFS
+  if it exceeds 15 MB), updated_at, and lease fields (lease_owner, lease_expires_at).
+
+Flow per repo:
+  1. Acquire a lease: atomic findOneAndUpdate where the lease is absent or expired;
+     TTL 15 min, renewed by a heartbeat. If you cannot acquire it, skip the repo
+     (another pod owns it).
+  2. Resolve the default branch from GET /repos/{o}/{r} (do not hardcode main/master), then
+     GET /repos/{o}/{r}/branches/{branch} with If-None-Match: branch_etag.
+     If 304, or the commit SHA equals last_scanned_commit_sha AND scan_config_hash is
+     unchanged, stop and report "unchanged".
+     Handle these explicitly, each with its own result status: 404 (repo deleted or access lost),
+     409 (empty repo), 301 (renamed/transferred: update stored name), branch missing.
+  3. Fetch the tree: GET /git/trees/{tree_sha}?recursive=1. If truncated=true, walk it
+     with non-recursive calls, descending only into subtrees. Keep type=="blob";
+     record and skip symlinks (mode 120000) and submodules (type "commit").
+  4. Diff against the stored snapshot:
+       added / deleted / modified (same path, different SHA) / moved (a deleted path and
+       an added path with the same SHA; with duplicate SHAs, pair deterministically by
+       sorted path). No snapshot, or scan_config_hash changed -> full scope (all files).
+  5. Download the zipball of the pinned commit SHA (never the branch name), streamed to an
+     emptyDir. Guards: abort if size > configured max; before extracting, check total
+     uncompressed size and entry count against limits and free disk space. Extract
+     with the root folder stripped; reject absolute paths, "..", and symlink entries.
+  6. Verify: for every tree blob, compute the git blob SHA of the local file:
+     sha1(b"blob " + str(len(data)).encode() + b"\0" + data).
+     Missing or mismatched -> fetch GET /git/blobs/{sha} with
+     Accept: application/vnd.github.raw+json, streamed to disk, and re-verify.
+     If it still mismatches (e.g. LFS pointer), record it in an "unverified" list and
+     exclude it from the scan scope. Never fail silently.
+  7. Return: status, commit_sha, previous_commit_sha, added, modified, deleted, moved,
+     unverified, skipped_symlinks, skipped_submodules, workspace_path, reason.
+  8. Expose a separate commit_scanned(result) called by the pipeline ONLY after the
+     scan succeeds: conditional update (filter on the previous
+     last_scanned_commit_sha) writing the new SHAs, snapshot, etag, scan_config_hash.
+     If the conditional update matches nothing, log a conflict and do not overwrite.
+  9. Always delete the workspace and release the lease in a finally block.
+
+Rate limits and HTTP:
+  - One shared budget per token across all pods (a Mongo-backed token bucket, or our
+    existing limiter if one exists [VERIFY]). Read X-RateLimit-Remaining / Reset from
+    every response and slow down before hitting zero.
+  - 403/429 with Remaining=0: wait until Reset (cap is configurable). Secondary limit:
+    honor Retry-After. 5xx and connection errors: exponential backoff with jitter, max 5.
+  - Use conditional requests (ETag) where possible; 304s cost less rate limit.
+  - Connect and read timeouts on every call; streamed downloads with a stall timeout.
+  - Refresh GitHub App tokens before expiry if the auth type is App.
+
+Configuration (env, no hardcoded values): API URL, auth, max zip size, max
+uncompressed size, max entries, lease TTL, blob fetch concurrency, rate-limit caps.
+
+Observability (Prometheus): syncs_total{status}, api_calls_total{endpoint,code},
+bytes_downloaded_total, sync_duration_seconds, verify_mismatches_total{reason},
+rate_limit_wait_seconds_total. One structured log line per repo with the same fields.
+
+PHASE 3 — TESTS (required before PR)
+Mock GitHub API served from a local git repo (ls-tree / cat-file / archive), plus a
+real test MongoDB. Cases:
+  1. First run -> full scope; workspace content == tree blobs (verify step passes).
+  2. No new commit -> unchanged; 1 API call; 304 path exercised.
+  3. Edit + delete + move + add -> exact change set.
+  4. Scan fails after sync -> commit_scanned not called -> next run reports the same
+     change set again.
+  5. Two workers on the same repo -> exactly one acquires the lease; stale lease
+     (expired) is taken over.
+  6. Conditional commit conflict -> no overwrite, conflict logged.
+  7. export-ignore file -> missing from zip, fetched via blob, verified.
+  8. export-subst file -> mismatch, refetched, verified.
+  9. LFS pointer / unresolvable mismatch -> in "unverified", excluded, counted.
+ 10. Truncated tree -> subtree walk produces the same file map as recursive.
+ 11. Malicious zip entries ("../x", absolute, symlink) -> rejected, nothing written
+     outside the workspace.
+ 12. Zip over size / entry limits -> aborted before extraction, clear status.
+ 13. Rate limit (primary and secondary) -> waits and succeeds; budget shared across
+     two simulated workers.
+ 14. 404 / 409 / 301 / missing branch -> correct status, no crash, state updated as specified.
+ 15. scan_config_hash change with no new commit -> full scope.
+ 16. Pod killed mid-download (simulate) -> no state written; next run is correct.
+Then one run against a real test repo on our GitHub host, with results in the PR.
+
+DELIVERABLE
+One PR: the Phase 1 report, the implementation, the tests, manifest changes (emptyDir sizeLimit),
+config docs, and a before/after table from the 200-repo sample: API calls, bytes
+downloaded, and wall time per repo for changed and unchanged repos.
+Do NOT add a persistent on-disk workspace cache. If the Phase 1 measurements show
+download time is a material share of per-repo time, report the numbers and stop;
+that is a separate decision.
